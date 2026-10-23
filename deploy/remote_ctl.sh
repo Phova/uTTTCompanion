@@ -219,7 +219,17 @@ cmd_train() {
 
     log_ok "Training started in background on remote RTX 5090."
     log_info "Streaming real-time training loss from ${LOG_FILE} (Press Ctrl+C to detach local log view; remote training will continue)..."
-    remote_exec_tty "tail -n 50 -f '${LOG_FILE}'" || true
+    remote_exec_tty "bash -c \"
+        sleep 1;
+        tail -n +1 -f '${LOG_FILE}' &
+        TAIL_PID=\\\$!;
+        while tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null; do
+            sleep 1;
+        done;
+        sleep 1;
+        kill \\\${TAIL_PID} 2>/dev/null || true;
+        echo '[Remote] Training session (${TMUX_TRAIN_SESSION}) finished.';
+    \"" || true
 }
 
 # ------------------------------------------------------------------------------

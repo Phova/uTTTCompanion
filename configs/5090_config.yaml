@@ -11,7 +11,7 @@ hardware:
   precision: "bfloat16"                # Native Blackwell Tensor Core BF16
   tf32_matmul: true                    # Enable TF32 for FP32 fallback ops
   torch_compile: true                  # Compile analytical inner-loop TTT kernel
-  compile_mode: "reduce-overhead"      # Options: default, reduce-overhead, max-autotune
+  compile_mode: "default"              # Triton kernel fusion (compatible with gradient checkpointing)
 
 model:
   name: "uTTT-500M-Base"

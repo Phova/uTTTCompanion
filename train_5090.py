@@ -202,12 +202,16 @@ def configure_rtx5090_environment(hw_cfg: Dict[str, Any]) -> Tuple[torch.device,
     return device, dtype
 
 
-def maybe_compile_inner_loop(hw_cfg: Dict[str, Any], device: torch.device) -> None:
+def maybe_compile_inner_loop(
+    hw_cfg: Dict[str, Any],
+    device: torch.device,
+    gradient_checkpointing: bool = True,
+) -> None:
     """
     Compile the analytical chunk-wise SwiGLU gradient kernel using `torch.compile`
     for fused Tensor Core execution on RTX 5090.
-    Automatically checks Triton availability so native Windows hosts without Triton
-    cleanly fall back to eager cuBLAS Tensor Core execution.
+    Automatically checks Triton availability and avoids CUDAGraph mode ('reduce-overhead')
+    when Gradient Checkpointing is active.
     """
     if not hw_cfg.get("torch_compile", True) or device.type != "cuda":
         return
@@ -221,7 +225,11 @@ def maybe_compile_inner_loop(hw_cfg: Dict[str, Any], device: torch.device) -> No
         )
         return
 
-    compile_mode = hw_cfg.get("compile_mode", "reduce-overhead")
+    compile_mode = hw_cfg.get("compile_mode", "default")
+    if gradient_checkpointing and compile_mode == "reduce-overhead":
+        # CUDAGraphs in 'reduce-overhead' conflict with activation recomputation inside checkpoint()
+        compile_mode = "default"
+
     try:
         uttt_layer_mod.analytical_swiglu_chunk_grad = torch.compile(
             uttt_layer_mod.analytical_swiglu_chunk_grad,
@@ -334,7 +342,9 @@ def train(
         torch.cuda.manual_seed_all(seed)
 
     device, amp_dtype = configure_rtx5090_environment(hw_cfg)
-    maybe_compile_inner_loop(hw_cfg, device)
+    maybe_compile_inner_loop(
+        hw_cfg, device, gradient_checkpointing=model_cfg.gradient_checkpointing
+    )
 
     # Instantiate uTTT Model
     model = uTTTModel(model_cfg).to(device=device)
@@ -403,8 +413,14 @@ def train(
     print(
         f"[Train] Starting Meta-Training for {max_steps} steps | "
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
-        f"ChunkSize={model_cfg.chunk_size}, Precision={amp_dtype}"
+        f"ChunkSize={model_cfg.chunk_size}, Precision={amp_dtype}",
+        flush=True,
     )
+    if hw_cfg.get("torch_compile", True) and device.type == "cuda":
+        print(
+            "[Train] Step 1 includes one-time Triton kernel compilation (~5-15s on RTX 5090)...",
+            flush=True,
+        )
 
     running_loss = 0.0
     running_ce = 0.0
