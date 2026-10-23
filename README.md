@@ -27,9 +27,10 @@ uTTT/
 │   └── app.py                                # FastAPI + WebSocket 流式推理与实时 TTT 个性化演化服务端
 ├── deploy/
 │   ├── Dockerfile                            # 面向 Blackwell sm_120 / CUDA 12.8+ / PyTorch 2.6+ 的容器镜像定义
+│   ├── prepare_dataset.py                    # 公开数据集 (Google Persona-Chat + BELLE 中文多轮) 自动拉取与格式化脚本
 │   ├── setup_5090.sh                         # Linux / WSL2 远端 RTX 5090 驱动检测、环境构建与算子冒烟测试脚本
 │   ├── setup_5090.ps1                        # Windows 10/11 原生远端 RTX 5090 环境构建与算子冒烟测试脚本
-│   ├── remote_ctl.sh                         # Linux / WSL2 一键远端同步、tmux 训练、权重拉取与 SSH 隧道推理运维脚本
+│   ├── remote_ctl.sh                         # Linux / WSL2 一键远端同步、数据集准备、tmux 训练、权重拉取与 SSH 隧道脚本
 │   ├── remote_ctl.ps1                        # Windows 原生 PowerShell 一键远端同步、后台训练、权重拉取与隧道运维脚本
 │   └── WIN10_WSL2_TAILSCALE_GUIDE.md         # 远端 Win10 专业版 (32GB RAM + RTX 5090) + WSL2 + Tailscale 专项部署指南
 ├── train_5090.py                             # RTX 5090 元训练脚本 (BF16 Autocast + torch.compile + 梯度累积 + Base Ckpt 导出)
@@ -135,7 +136,8 @@ DOCKER_IMAGE=uttt-rtx5090:latest     # USE_DOCKER=1 时的镜像名称
 | 子命令 | 完整调用示例 | 功能说明 |
 | :--- | :--- | :--- |
 | `init-env` | `./deploy/remote_ctl.sh init-env` | 自动探测远端 RTX 5090 驱动与 `sm_120` 架构、同步代码，并执行 `setup_5090.sh`（或构建 Docker 镜像）完成算子冒烟验证 |
-| `sync` | `./deploy/remote_ctl.sh sync` | 基于 `rsync` 增量同步本地代码到远端（自动排除 `checkpoints/`、`personas/`、`logs/`、`.git/`、`.venv/`） |
+| `sync` | `./deploy/remote_ctl.sh sync` | 基于 `rsync` 增量同步本地代码到远端（自动排除 `checkpoints/`、`personas/`、`data/`、`logs/`、`.git/`、`.venv/`） |
+| `prepare-data` | `./deploy/remote_ctl.sh prepare-data` | 在远端服务器自动拉取并格式化公开数据集（`google/Synthetic-Persona-Chat` + `BelleGroup/multiturn_chat_0.8M`）至 `~/uTTT/data/uttt_persona_train.jsonl` |
 | `train` | `./deploy/remote_ctl.sh train [额外参数]` | 同步最新代码，在远端后台 `tmux` 会话 `uttt_train` 启动 `train_5090.py`，并自动流式回传实时训练日志（按 `Ctrl+C` 仅断开本地日志查看，不中断远端训练） |
 | `pull-ckpt` | `./deploy/remote_ctl.sh pull-ckpt` | 将远端训练产出的 `checkpoints/base_uttt.pt` 拉取回本地 `checkpoints/base_uttt.pt`，并自动比对远端与本地 SHA256 校验值 |
 | `serve` | `./deploy/remote_ctl.sh serve [额外参数]` | 在远端后台 `tmux` 会话 `uttt_serve` 启动 `server.app`，等待 `/health` 就绪后自动建立本地 `localhost:8000 -> 远端:8000` 的 SSH 隧道 |
