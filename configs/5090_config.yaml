@@ -1,0 +1,71 @@
+# ==============================================================================
+# uTTT (Universal Test-Time Training) Configuration for NVIDIA RTX 5090 (32GB)
+# Target Architecture: Blackwell (sm_120) | CUDA 12.8+ | PyTorch 2.6+ | BF16
+# ==============================================================================
+
+hardware:
+  device: "cuda"
+  gpu_name: "NVIDIA GeForce RTX 5090"
+  arch: "sm_120"                       # Blackwell compute capability 12.0
+  vram_limit_gb: 28.0                  # Strict cap (< 32GB GDDR7) for inner+outer grads
+  precision: "bfloat16"                # Native Blackwell Tensor Core BF16
+  tf32_matmul: true                    # Enable TF32 for FP32 fallback ops
+  torch_compile: true                  # Compile analytical inner-loop TTT kernel
+  compile_mode: "reduce-overhead"      # Options: default, reduce-overhead, max-autotune
+
+model:
+  name: "uTTT-500M-Base"
+  vocab_size: 32000
+  d_model: 1024                        # Hidden dimension D
+  n_layers: 16                         # Number of uTTTBlocks sharing the Fast-Weight Pool
+  n_heads: 16                          # Query heads for Sliding Window Attention
+  n_kv_heads: 4                        # GQA KV heads (4:1 ratio for low KV-cache footprint)
+  d_ff_fast: 2816                      # SwiGLU intermediate dim for Shared Fast-Weight Pool
+  sliding_window_size: 512             # Local SWA causal window size
+  max_seq_len: 4096                    # Maximum sequence context length
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-5
+  dropout: 0.0
+
+uttt:
+  chunk_size: 64                       # Chunk-wise parallel TTT step size C
+  base_inner_lr: 0.015                 # Base dynamic learning rate scale (eta_base)
+  base_weight_decay: 0.005             # Base dynamic forget gate scale (alpha_base)
+  momentum_beta: 0.90                  # Inner-loop momentum factor (beta)
+  max_inner_grad_norm: 1.0             # Max Frobenius norm clipping for inner-loop grads
+  normalize_loss_by_dim: false         # Keep exact L = 1/2 ||f_W(k) - v||_2^2 formula
+  surprise_threshold: 0.25             # Gate threshold (tau): skip update if loss <= tau
+  elastic_anchor_lambda: 0.02          # Slow-anchor elastic pull (lambda) toward W_0
+  max_weight_drift_ratio: 0.35         # Safety ceiling on ||W_user - W_0||_F / ||W_0||_F
+
+training:
+  seed: 42
+  micro_batch_size: 4                  # Per-step micro-batch size on single RTX 5090
+  grad_accum_steps: 8                  # Effective batch size = 32 sequences
+  seq_len: 1024                        # Training sequence length (16 chunks of C=64)
+  max_steps: 2000
+  warmup_steps: 100
+  outer_lr: 3.0e-4                     # AdamW learning rate for Slow Weights
+  meta_fast_lr: 1.5e-4                 # AdamW learning rate for Meta-Init Fast Weights W_0
+  weight_decay: 0.1
+  max_outer_grad_norm: 1.0
+  surprise_aux_loss_weight: 0.10       # Weight for auxiliary inner-loop reconstruction loss
+  gradient_checkpointing: true         # Recompute activations across layers to stay < 28GB
+  log_interval: 10
+  save_interval: 200
+  base_checkpoint_path: "checkpoints/base_uttt.pt"
+
+personalization:
+  personas_dir: "personas"
+  max_gpu_users: 16                    # Max concurrent user fast-weight states in 5090 VRAM
+  max_cpu_users: 128                   # Secondary LRU cache capacity in host RAM
+  auto_save_every_turn: true           # Persist personas/{user_id}_state.pt after updates
+  default_max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  ws_heartbeat_sec: 30
+  log_level: "info"

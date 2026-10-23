@@ -1,0 +1,26 @@
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.cache/
+
+# Checkpoints, User Personas & Logs (large binary weights / runtime states)
+checkpoints/*.pt
+checkpoints/*.tmp.pt
+personas/*.pt
+personas/snapshots/*.pt
+logs/
+
+# Local secrets & environment variables
+.env
+.env.local
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
