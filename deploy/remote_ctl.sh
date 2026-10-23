@@ -38,7 +38,9 @@ fi
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_DIR="${REMOTE_DIR:-/workspace/uTTT}"
+REMOTE_DIR="${REMOTE_DIR:-/root/uTTT}"
+# Expand leading ~/ to /root/ for remote root shell compatibility
+REMOTE_DIR="${REMOTE_DIR/#\~\///root/}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519}"
 
 LOCAL_TUNNEL_PORT="${LOCAL_TUNNEL_PORT:-8000}"
@@ -65,6 +67,7 @@ Usage:
 Core Commands:
   init-env              Auto-detect remote RTX 5090 driver/CUDA and build environment
   sync                  Incremental rsync of local workspace (excludes checkpoints/ & .git/)
+  prepare-data [args]   Download & format public Persona-Chat + Belle multi-turn dataset on remote
   train [extra_args]    Start train_5090.py in remote tmux session and stream live loss
   pull-ckpt             Pull remote checkpoints/base_uttt.pt to local checkpoints/base_uttt.pt
   serve                 Launch remote FastAPI+WebSocket server & map SSH tunnel to localhost:${LOCAL_TUNNEL_PORT}
@@ -130,7 +133,7 @@ cmd_sync() {
     validate_config
     log_info "Syncing local workspace '${LOCAL_ROOT}' -> '${REMOTE_TARGET}:${REMOTE_DIR}'..."
 
-    remote_exec "mkdir -p '${REMOTE_DIR}/checkpoints' '${REMOTE_DIR}/personas/snapshots' '${REMOTE_DIR}/logs'"
+    remote_exec "mkdir -p '${REMOTE_DIR}/checkpoints' '${REMOTE_DIR}/personas/snapshots' '${REMOTE_DIR}/logs' '${REMOTE_DIR}/data'"
 
     RSYNC_SSH_CMD="ssh ${SSH_OPTS[*]}"
     rsync -avz --progress --delete \
@@ -138,6 +141,7 @@ cmd_sync() {
         --exclude=".git/" \
         --exclude="checkpoints/" \
         --exclude="personas/" \
+        --exclude="data/" \
         --exclude="logs/" \
         --exclude=".venv/" \
         --exclude="venv/" \
@@ -184,6 +188,18 @@ REMOTEEOF
         remote_exec "cd '${REMOTE_DIR}' && bash deploy/setup_5090.sh"
         log_ok "Remote bare-metal virtualenv provisioned and verified for RTX 5090."
     fi
+}
+
+# ------------------------------------------------------------------------------
+# 4.5 Subcommand: prepare-data (Download Public Persona Dataset on Remote Host)
+# ------------------------------------------------------------------------------
+cmd_prepare_data() {
+    validate_config
+    cmd_sync
+    EXTRA_DATA_ARGS="$*"
+    log_info "Downloading & formatting public Persona + Multi-Turn dataset on ${REMOTE_TARGET}..."
+    remote_exec "cd '${REMOTE_DIR}' && python3 deploy/prepare_dataset.py ${EXTRA_DATA_ARGS}"
+    log_ok "Remote public dataset prepared at ${REMOTE_DIR}/data/uttt_persona_train.jsonl"
 }
 
 # ------------------------------------------------------------------------------
@@ -372,6 +388,9 @@ case "${COMMAND}" in
         ;;
     sync)
         cmd_sync "$@"
+        ;;
+    prepare-data)
+        cmd_prepare_data "$@"
         ;;
     train)
         cmd_train "$@"

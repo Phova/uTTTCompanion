@@ -8,11 +8,14 @@ ENV/
 .pytest_cache/
 .cache/
 
-# Checkpoints, User Personas & Logs (large binary weights / runtime states)
+# Checkpoints, User Personas, Datasets & Logs (large binary weights / runtime states)
 checkpoints/*.pt
 checkpoints/*.tmp.pt
 personas/*.pt
 personas/snapshots/*.pt
+data/*.jsonl
+data/*.csv
+data/*.txt
 logs/
 
 # Local secrets & environment variables
