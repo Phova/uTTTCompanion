@@ -218,7 +218,7 @@ cmd_train() {
     if [[ "${USE_DOCKER}" == "1" ]]; then
         TRAIN_CMD="docker run --rm --gpus all --ipc=host -v '${REMOTE_DIR}/checkpoints:/workspace/uTTT/checkpoints' -v '${REMOTE_DIR}/logs:/workspace/uTTT/logs' ${DOCKER_IMAGE} python -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
     else
-        TRAIN_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && export TORCH_CUDA_ARCH_LIST='12.0' && export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True,max_split_size_mb:512' && python3 -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
+        TRAIN_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && export TORCH_CUDA_ARCH_LIST='12.0' && export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True,max_split_size_mb:512' && '${REMOTE_DIR}/.venv/bin/python3' -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
     fi
 
     remote_exec "bash -c \"
@@ -236,7 +236,7 @@ cmd_train() {
 
     log_ok "Training started in background on remote RTX 5090."
     log_info "Streaming real-time training loss from ${LOG_FILE} (Press Ctrl+C to detach local log view; remote training will continue)..."
-    remote_exec_tty "bash -c \"
+    remote_exec "bash -c \"
         sleep 1;
         tail -n +1 -f '${LOG_FILE}' &
         TAIL_PID=\\\$!;
@@ -298,7 +298,7 @@ cmd_serve() {
     if [[ "${USE_DOCKER}" == "1" ]]; then
         SERVE_CMD="docker run --rm --gpus all --ipc=host -p ${REMOTE_SERVICE_PORT}:${REMOTE_SERVICE_PORT} -v '${REMOTE_DIR}/checkpoints:/workspace/uTTT/checkpoints' -v '${REMOTE_DIR}/personas:/workspace/uTTT/personas' ${DOCKER_IMAGE} python -u -m server.app --host 0.0.0.0 --port ${REMOTE_SERVICE_PORT} --config configs/5090_config.yaml ${EXTRA_SERVE_ARGS} 2>&1 | tee '${SERVE_LOG}'"
     else
-        SERVE_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && python3 -u -m server.app --host 0.0.0.0 --port ${REMOTE_SERVICE_PORT} --config configs/5090_config.yaml ${EXTRA_SERVE_ARGS} 2>&1 | tee '${SERVE_LOG}'"
+        SERVE_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && '${REMOTE_DIR}/.venv/bin/python3' -u -m server.app --host 0.0.0.0 --port ${REMOTE_SERVICE_PORT} --config configs/5090_config.yaml ${EXTRA_SERVE_ARGS} 2>&1 | tee '${SERVE_LOG}'"
     fi
 
     remote_exec "bash -c \"
@@ -360,7 +360,7 @@ cmd_logs() {
         LOG_PATH="${REMOTE_DIR}/logs/train_5090.log"
     fi
     log_info "Tailing remote log: ${LOG_PATH}..."
-    remote_exec_tty "tail -n 100 -f '${LOG_PATH}'"
+    remote_exec "tail -n 100 -f '${LOG_PATH}'"
 }
 
 cmd_stop() {
