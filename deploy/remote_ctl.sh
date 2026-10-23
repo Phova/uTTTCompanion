@@ -97,6 +97,16 @@ validate_config() {
         -o ServerAliveCountMax=3
     )
     if [[ -n "${SSH_KEY}" ]] && [[ -f "${SSH_KEY}" ]]; then
+        # If SSH_KEY resides on a Windows /mnt/* mount with 0777 permissions, stage to ~/.ssh with 0600
+        if [[ "${SSH_KEY}" == /mnt/* ]]; then
+            mkdir -p "${HOME}/.ssh" && chmod 700 "${HOME}/.ssh"
+            SAFE_KEY="${HOME}/.ssh/$(basename "${SSH_KEY}")"
+            cp -f "${SSH_KEY}" "${SAFE_KEY}"
+            chmod 600 "${SAFE_KEY}"
+            SSH_KEY="${SAFE_KEY}"
+        else
+            chmod 600 "${SSH_KEY}" 2>/dev/null || true
+        fi
         SSH_OPTS+=(-i "${SSH_KEY}")
     elif [[ -n "${SSH_KEY}" ]]; then
         log_warn "SSH_KEY '${SSH_KEY}' not found on disk; relying on ssh-agent / default keys."
