@@ -206,8 +206,19 @@ def maybe_compile_inner_loop(hw_cfg: Dict[str, Any], device: torch.device) -> No
     """
     Compile the analytical chunk-wise SwiGLU gradient kernel using `torch.compile`
     for fused Tensor Core execution on RTX 5090.
+    Automatically checks Triton availability so native Windows hosts without Triton
+    cleanly fall back to eager cuBLAS Tensor Core execution.
     """
     if not hw_cfg.get("torch_compile", True) or device.type != "cuda":
+        return
+
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        print(
+            "[Compiler] Triton not detected (common on native Windows); "
+            "using eager cuBLAS BF16 Tensor Core bmm kernels."
+        )
         return
 
     compile_mode = hw_cfg.get("compile_mode", "reduce-overhead")
