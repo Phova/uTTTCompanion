@@ -58,7 +58,7 @@ training:
 personalization:
   personas_dir: "personas"
   max_gpu_users: 16                    # Max concurrent user fast-weight states in 5090 VRAM
-  max_cpu_users: 128                   # Secondary LRU cache capacity in host RAM
+  max_cpu_users: 64                    # Secondary LRU cache capacity in 32GB host RAM (~2.1GB)
   auto_save_every_turn: true           # Persist personas/{user_id}_state.pt after updates
   default_max_new_tokens: 128
   temperature: 0.7
