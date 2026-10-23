@@ -2,127 +2,127 @@
 """
 deploy/prepare_dataset.py
 =========================
-Public Dataset Downloader & Formatter for uTTT (Universal Test-Time Training).
+High-Speed Public Dataset Downloader & Formatter for uTTT (Universal Test-Time Training).
 
-Downloads and formats real open-source Persona & Multi-Turn Dialogue datasets
-into `/root/uTTT/data/uttt_persona_train.jsonl` (using standard `<|user|>` and
-`<|assistant|>` tags compatible with `train_5090.py --data-path`).
+Downloads and formats real open-source Multi-Turn Dialogue & Persona datasets from
+Alibaba Cloud ModelScope CDN (`https://www.modelscope.cn`) — with fallback to
+`hf-mirror.com` / `huggingface.co` — into `data/uttt_persona_train.jsonl` using
+standard `<|user|>` and `<|assistant|>` tags compatible with `train_5090.py --data-path`.
 
-Supported Public Datasets:
-1. `google/Synthetic-Persona-Chat` (English Persona-Memory Multi-Turn Dialogues):
-   Each conversation begins with explicit User Persona facts followed by a 10-20 turn
-   dialogue, directly training uTTT's SharedFastWeightPool to compress user profiles
-   in early chunks and recall them in later chunks.
-2. `BelleGroup/multiturn_chat_0.8M` (Chinese Multi-Turn Instruction & Dialogue):
-   Stream-downloads the first N multi-turn Chinese dialogues for bilingual capability.
-3. `mixed` (Default): Combines both datasets into a unified shuffled JSONL corpus.
-
-Automatically uses `https://hf-mirror.com` for high-speed domestic downloads with
-automatic fallback to `https://huggingface.co`.
+Primary Dataset Source (`AI-ModelScope/ShareGPT-Chinese-English-90k` on ModelScope):
+- `sharegpt_jsonl/common_zh_70k.jsonl`   (70,000 Chinese multi-turn dialogues)
+- `sharegpt_jsonl/computer_zh_26k.jsonl` (26,000 Chinese CS/programming multi-turn dialogues)
+- `sharegpt_jsonl/common_en_70k.jsonl`   (70,000 English multi-turn dialogues)
+- `sharegpt_jsonl/computer_en_26k.jsonl` (26,000 English CS/programming multi-turn dialogues)
+Total capacity: > 192,000 multi-turn conversations streamed over domestic CDN.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import io
 import json
-import os
 import random
-import re
+import socket
 import urllib.request
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
-HF_MIRRORS = [
-    "https://hf-mirror.com",
-    "https://huggingface.co",
-]
+# Force IPv4 resolution first to avoid WSL2 broken IPv6 [Errno 101] Network is unreachable
+_orig_getaddrinfo = socket.getaddrinfo
 
 
-def open_url_with_fallback(rel_path: str, timeout: int = 30):
-    """Open a dataset URL trying hf-mirror.com first, then huggingface.co."""
-    headers = {"User-Agent": "uTTT-Dataset-Downloader/1.0"}
-    last_err: Optional[Exception] = None
-    for base in HF_MIRRORS:
-        url = f"{base.rstrip('/')}/{rel_path.lstrip('/')}"
-        try:
-            print(f"[Dataset] Connecting to: {url} ...", flush=True)
-            req = urllib.request.Request(url, headers=headers)
-            return urllib.request.urlopen(req, timeout=timeout)
-        except Exception as exc:
-            print(f"[Dataset] Mirror {base} failed ({exc}), trying next...", flush=True)
-            last_err = exc
-    raise RuntimeError(f"Failed to download {rel_path} from all mirrors: {last_err}")
+def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4 = [r for r in res if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else res
 
 
-def fetch_google_persona_chat(max_samples: int = 5000) -> List[Dict[str, str]]:
+socket.getaddrinfo = _ipv4_first_getaddrinfo
+
+
+MODELSCOPE_BASE = (
+    "https://www.modelscope.cn/api/v1/datasets/"
+    "AI-ModelScope/ShareGPT-Chinese-English-90k/repo?Revision=master&FilePath="
+)
+
+MODELSCOPE_SPLITS: Dict[str, List[Tuple[str, float]]] = {
+    "mixed": [
+        ("sharegpt_jsonl/common_zh_70k.jsonl", 0.35),
+        ("sharegpt_jsonl/computer_zh_26k.jsonl", 0.15),
+        ("sharegpt_jsonl/common_en_70k.jsonl", 0.35),
+        ("sharegpt_jsonl/computer_en_26k.jsonl", 0.15),
+    ],
+    "zh": [
+        ("sharegpt_jsonl/common_zh_70k.jsonl", 0.73),
+        ("sharegpt_jsonl/computer_zh_26k.jsonl", 0.27),
+    ],
+    "en": [
+        ("sharegpt_jsonl/common_en_70k.jsonl", 0.73),
+        ("sharegpt_jsonl/computer_en_26k.jsonl", 0.27),
+    ],
+    "code": [
+        ("sharegpt_jsonl/computer_zh_26k.jsonl", 0.50),
+        ("sharegpt_jsonl/computer_en_26k.jsonl", 0.50),
+    ],
+}
+
+
+def format_sharegpt_conversation(obj: Dict[str, object]) -> Optional[str]:
     """
-    Download and format `google/Synthetic-Persona-Chat` (`Synthetic-Persona-Chat_train.csv`).
+    Convert a ShareGPT JSON object (`{"conversation": [{"human": ..., "assistant": ...}]}`)
+    into uTTT's `<|user|> ... \n<|assistant|> ...` sequence format.
     """
-    rel_path = "datasets/google/Synthetic-Persona-Chat/resolve/main/Synthetic-Persona-Chat_train.csv"
+    conv = obj.get("conversation")
+    if not isinstance(conv, list) or not conv:
+        return None
+
+    category = str(obj.get("category") or "").strip()
+    lines: List[str] = []
+    if category:
+        lines.append(f"<|user|> [Context Category: {category}]")
+
+    valid_turns = 0
+    for turn in conv:
+        if not isinstance(turn, dict):
+            continue
+        human_msg = str(turn.get("human") or "").strip()
+        assistant_msg = str(turn.get("assistant") or "").strip()
+        if not human_msg or not assistant_msg:
+            continue
+        lines.append(f"<|user|> {human_msg}")
+        lines.append(f"<|assistant|> {assistant_msg}")
+        valid_turns += 1
+
+    if valid_turns == 0:
+        return None
+
+    full_text = "\n".join(lines)
+    return full_text if len(full_text) >= 100 else None
+
+
+def stream_modelscope_split(
+    file_path: str,
+    target_count: int,
+    timeout: int = 30,
+) -> List[Dict[str, str]]:
+    """
+    Stream-download up to `target_count` multi-turn conversations from a ModelScope
+    JSONL file over HTTP without buffering the entire archive in memory.
+    """
+    url = f"{MODELSCOPE_BASE}{file_path}"
+    headers = {"User-Agent": "Mozilla/5.0 (uTTT-Dataset-Streamer/1.0)"}
     samples: List[Dict[str, str]] = []
 
-    with open_url_with_fallback(rel_path, timeout=60) as resp:
-        text_stream = io.TextIOWrapper(resp, encoding="utf-8", errors="replace")
-        reader = csv.DictReader(text_stream)
-        for row in reader:
-            persona_1 = (row.get("user 1 personas") or "").strip()
-            persona_2 = (row.get("user 2 personas") or "").strip()
-            conv = (row.get("Best Generated Conversation") or "").strip()
-            if not conv:
-                continue
-
-            # Format persona header + multi-turn conversation with <|user|> / <|assistant|>
-            formatted_lines: List[str] = []
-            if persona_1:
-                persona_clean = " ".join(persona_1.splitlines())
-                formatted_lines.append(
-                    f"<|user|> [User Persona Profile] {persona_clean}"
-                )
-                formatted_lines.append(
-                    "<|assistant|> I have noted your personal profile and preferences in my fast weights."
-                )
-
-            for raw_turn in conv.splitlines():
-                turn = raw_turn.strip()
-                if not turn:
-                    continue
-                if turn.startswith("User 1:"):
-                    msg = turn[len("User 1:") :].strip()
-                    formatted_lines.append(f"<|user|> {msg}")
-                elif turn.startswith("User 2:"):
-                    msg = turn[len("User 2:") :].strip()
-                    formatted_lines.append(f"<|assistant|> {msg}")
-                else:
-                    formatted_lines.append(turn)
-
-            full_text = "\n".join(formatted_lines)
-            if len(full_text) >= 128:
-                samples.append(
-                    {
-                        "source": "google/Synthetic-Persona-Chat",
-                        "text": full_text,
-                    }
-                )
-            if len(samples) >= max_samples:
-                break
-
-    print(f"[Dataset] Loaded {len(samples)} samples from google/Synthetic-Persona-Chat.", flush=True)
-    return samples
-
-
-def fetch_belle_multiturn_zh(max_samples: int = 5000) -> List[Dict[str, str]]:
-    """
-    Stream-download the first `max_samples` Chinese multi-turn dialogues from
-    `BelleGroup/multiturn_chat_0.8M` without needing to download the entire 800k file.
-    """
-    rel_path = "datasets/BelleGroup/multiturn_chat_0.8M/resolve/main/multiturn_chat_0.8M.json"
-    samples: List[Dict[str, str]] = []
-
-    with open_url_with_fallback(rel_path, timeout=60) as resp:
+    print(
+        f"[Dataset] Streaming up to {target_count:,} dialogues from ModelScope: {file_path} ...",
+        flush=True,
+    )
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw_line in resp:
+            if len(samples) >= target_count:
+                break
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -131,44 +131,43 @@ def fetch_belle_multiturn_zh(max_samples: int = 5000) -> List[Dict[str, str]]:
             except json.JSONDecodeError:
                 continue
 
-            instruction = (obj.get("instruction") or "").strip()
-            output = (obj.get("output") or "").strip()
-            if not instruction or not output:
-                continue
-
-            # Convert "Human: ... Assistant: ..." into "<|user|> ... <|assistant|> ..."
-            conv_text = re.sub(r"\bHuman:\s*", "\n<|user|> ", instruction)
-            conv_text = re.sub(r"\bAssistant:\s*", "\n<|assistant|> ", conv_text).strip()
-            full_text = f"{conv_text}\n{output}\n"
-
-            if len(full_text) >= 128:
+            formatted = format_sharegpt_conversation(obj)
+            if formatted is not None:
                 samples.append(
                     {
-                        "source": "BelleGroup/multiturn_chat_0.8M",
-                        "text": full_text,
+                        "source": f"AI-ModelScope/ShareGPT-Chinese-English-90k/{file_path}",
+                        "text": formatted,
                     }
                 )
-            if len(samples) >= max_samples:
-                break
+                if len(samples) % 5000 == 0:
+                    print(
+                        f"  -> Progress ({file_path}): {len(samples):,} / {target_count:,} samples",
+                        flush=True,
+                    )
 
-    print(f"[Dataset] Streamed {len(samples)} samples from BelleGroup/multiturn_chat_0.8M.", flush=True)
+    print(
+        f"[Dataset] Finished {file_path}: collected {len(samples):,} multi-turn dialogues.",
+        flush=True,
+    )
     return samples
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download & Format Public Persona Datasets for uTTT")
+    parser = argparse.ArgumentParser(
+        description="Download & Format Public Multi-Turn Datasets for uTTT (ModelScope CDN)"
+    )
     parser.add_argument(
         "--preset",
         type=str,
-        choices=["mixed", "personachat", "belle_zh"],
+        choices=["mixed", "zh", "en", "code", "personachat", "belle_zh"],
         default="mixed",
-        help="Dataset preset: 'mixed' (EN Persona-Chat + ZH Multi-Turn), 'personachat', or 'belle_zh'.",
+        help="Dataset preset: 'mixed' (ZH+EN General & CS), 'zh', 'en', or 'code'.",
     )
     parser.add_argument(
         "--max-samples",
         type=int,
-        default=8000,
-        help="Total number of multi-turn dialogue samples to prepare.",
+        default=10000,
+        help="Total number of multi-turn dialogue samples to prepare (up to 192,000).",
     )
     parser.add_argument(
         "--output",
@@ -178,24 +177,35 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Map legacy preset aliases cleanly
+    preset_key = args.preset
+    if preset_key == "personachat":
+        preset_key = "en"
+    elif preset_key == "belle_zh":
+        preset_key = "zh"
+
+    splits = MODELSCOPE_SPLITS[preset_key]
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     all_samples: List[Dict[str, str]] = []
-    if args.preset == "personachat":
-        all_samples.extend(fetch_google_persona_chat(max_samples=args.max_samples))
-    elif args.preset == "belle_zh":
-        all_samples.extend(fetch_belle_multiturn_zh(max_samples=args.max_samples))
-    else:
-        half = max(1, args.max_samples // 2)
+    remaining = max(1, int(args.max_samples))
+
+    for idx, (file_path, ratio) in enumerate(splits):
+        if remaining <= 0:
+            break
+        if idx == len(splits) - 1:
+            quota = remaining
+        else:
+            quota = max(1, int(round(args.max_samples * ratio)))
+            quota = min(quota, remaining)
+
         try:
-            all_samples.extend(fetch_google_persona_chat(max_samples=half))
+            chunk = stream_modelscope_split(file_path=file_path, target_count=quota)
+            all_samples.extend(chunk)
+            remaining = args.max_samples - len(all_samples)
         except Exception as exc:
-            print(f"[WARN] Could not fetch google/Synthetic-Persona-Chat: {exc}")
-        try:
-            all_samples.extend(fetch_belle_multiturn_zh(max_samples=args.max_samples - len(all_samples)))
-        except Exception as exc:
-            print(f"[WARN] Could not fetch BelleGroup/multiturn_chat_0.8M: {exc}")
+            print(f"[WARN] Error while streaming {file_path}: {exc}", flush=True)
 
     if not all_samples:
         raise RuntimeError("No samples were downloaded. Please check network connectivity.")
@@ -209,12 +219,14 @@ def main() -> None:
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(
-        f"\n[Dataset Ready] Saved {len(all_samples)} multi-turn persona dialogues -> "
-        f"{out_path} ({size_mb:.2f} MB)"
+        f"\n[Dataset Ready] Saved {len(all_samples):,} multi-turn dialogues -> "
+        f"{out_path} ({size_mb:.2f} MB)",
+        flush=True,
     )
     print(
         f"[Next Step] Train with this dataset using:\n"
-        f"  ./deploy/remote_ctl.sh train --data-path {out_path}"
+        f"  ./deploy/remote_ctl.sh train --data-path {out_path}",
+        flush=True,
     )
 
 

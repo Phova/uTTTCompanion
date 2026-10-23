@@ -139,6 +139,7 @@ cmd_sync() {
     rsync -avz --progress --delete \
         -e "${RSYNC_SSH_CMD}" \
         --exclude=".git/" \
+        --exclude=".env" \
         --exclude="checkpoints/" \
         --exclude="personas/" \
         --exclude="data/" \
