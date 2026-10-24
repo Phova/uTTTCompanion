@@ -342,14 +342,21 @@ cmd_serve() {
         exit 1
     fi
 
-    log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
+    # Resolve remote internal IP (essential when remote sshd runs on Windows 10 host forwarding into WSL2 VM)
+    local REMOTE_INTERNAL_IP
+    REMOTE_INTERNAL_IP="$(remote_exec "hostname -I 2>/dev/null | cut -d' ' -f1" | tr -d '\r\n ')"
+    if [[ -z "${REMOTE_INTERNAL_IP}" ]]; then
+        REMOTE_INTERNAL_IP="127.0.0.1"
+    fi
+
+    log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST} (${REMOTE_INTERNAL_IP}:${REMOTE_SERVICE_PORT})"
     log_info "In another terminal, connect the interactive CLI client with:"
     log_info "  python3 client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}   (WSL / Linux)"
     log_info "  python  client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}   (Windows PowerShell)"
     log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
 
     ssh "${SSH_OPTS[@]}" \
-        -N -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
+        -N -L "${LOCAL_TUNNEL_PORT}:${REMOTE_INTERNAL_IP}:${REMOTE_SERVICE_PORT}" \
         "${REMOTE_TARGET}"
 }
 
