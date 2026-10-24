@@ -253,8 +253,8 @@ def maybe_compile_inner_loop(
         compile_mode = "default"
 
     try:
-        uttt_layer_mod.analytical_swiglu_chunk_grad = torch.compile(
-            uttt_layer_mod.analytical_swiglu_chunk_grad,
+        uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
+            uttt_layer_mod.fused_chunk_ttt_step,
             mode=compile_mode,
             fullgraph=False,
         )
@@ -263,7 +263,15 @@ def maybe_compile_inner_loop(
             mode=compile_mode,
             fullgraph=False,
         )
-        print(f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for inner-loop TTT kernels.")
+        uttt_layer_mod.apply_rope = torch.compile(
+            uttt_layer_mod.apply_rope,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        print(
+            f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
+            "swiglu_fast_forward & apply_rope."
+        )
     except Exception as exc:
         print(f"[Compiler] torch.compile fallback to eager mode: {exc}")
 
@@ -543,9 +551,17 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                model.gradient_checkpointing = True
-                model_cfg.gradient_checkpointing = True
-                if micro_batch_size > 1:
+                if not model.gradient_checkpointing:
+                    # Stage 1: Enable Layer Gradient Checkpointing while keeping full MicroBatch=8
+                    model.gradient_checkpointing = True
+                    model_cfg.gradient_checkpointing = True
+                    print(
+                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM with GradCkpt=False! "
+                        f"Automatically enabled GradCkpt=True at MicroBatch={micro_batch_size}. Retrying step...",
+                        flush=True,
+                    )
+                elif micro_batch_size > 1:
+                    # Stage 2: Halve MicroBatch and double GradAccum (preserving EffectiveBatch)
                     micro_batch_size = max(1, micro_batch_size // 2)
                     grad_accum_steps = grad_accum_steps * 2
                     loader = _build_loader(micro_batch_size)
@@ -557,6 +573,7 @@ def train(
                         flush=True,
                     )
                 else:
+                    # Stage 3: Enable 2-level Intra-Layer Chunk Segment Checkpointing
                     for blk in model.layers:
                         blk.uttt.chunk_checkpoint_segments = max(
                             4, blk.uttt.chunk_checkpoint_segments * 2
