@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ==============================================================================
@@ -202,8 +203,11 @@ def swiglu_fast_forward(
         out:       (B, T, D) reconstructed representations
     """
     orig_dtype = x.dtype
-    u = torch.bmm(x, w_up)                                      # (B, T, d_ff)
-    g = torch.bmm(x, w_gate)                                    # (B, T, d_ff)
+    # DeepGEMM-style Gate+Up Fused Batched GEMM:
+    # Combine w_up and w_gate along the last dimension so one Tensor Core bmm computes both.
+    w_up_gate = torch.cat([w_up, w_gate], dim=-1)               # (B, D, 2 * d_ff)
+    ug = torch.bmm(x, w_up_gate)                                # (B, T, 2 * d_ff)
+    u, g = ug.chunk(2, dim=-1)                                  # each (B, T, d_ff)
     h = F.silu(g) * u                                           # (B, T, d_ff)
     z = torch.bmm(h, w_down)                                    # (B, T, D)
 
@@ -281,9 +285,10 @@ def analytical_swiglu_chunk_grad(
     orig_dtype = k_chunk.dtype
     bsz, chunk_len, dim = k_chunk.shape
 
-    # --- 1. Batched Forward Pass through SwiGLU Fast Weights ---
-    u = torch.bmm(k_chunk, w_up)                                # (B, C, d_ff)
-    g = torch.bmm(k_chunk, w_gate)                              # (B, C, d_ff)
+    # --- 1. Batched Forward Pass through SwiGLU Fast Weights (Fused Gate+Up GEMM) ---
+    w_up_gate = torch.cat([w_up, w_gate], dim=-1)               # (B, D, 2 * d_ff)
+    ug = torch.bmm(k_chunk, w_up_gate)                          # (B, C, 2 * d_ff)
+    u, g = ug.chunk(2, dim=-1)                                  # each (B, C, d_ff)
 
     # Compute activation in FP32 to preserve precision during derivative calculation
     g_fp32 = g.float()
@@ -343,13 +348,10 @@ def analytical_swiglu_chunk_grad(
     dsilu_fp32 = sigma_g * (1.0 + g_fp32 * (1.0 - sigma_g))
     delta_g_fp32 = delta_h_fp32 * u_fp32 * dsilu_fp32
 
-    delta_u = delta_u_fp32.to(orig_dtype)                       # (B, C, d_ff)
-    delta_g = delta_g_fp32.to(orig_dtype)                       # (B, C, d_ff)
-
-    # --- 6. Analytical Backward through W_up and W_gate ---
-    k_t = k_chunk.transpose(1, 2)                               # (B, D, C)
-    grad_w_up = torch.bmm(k_t, delta_u)                         # (B, D, d_ff)
-    grad_w_gate = torch.bmm(k_t, delta_g)                       # (B, D, d_ff)
+    # --- 6. Fused Analytical Backward through W_up and W_gate ---
+    delta_ug = torch.cat([delta_u_fp32, delta_g_fp32], dim=-1).to(orig_dtype)  # (B, C, 2 * d_ff)
+    grad_w_up_gate = torch.bmm(k_chunk.transpose(1, 2), delta_ug)              # (B, D, 2 * d_ff)
+    grad_w_up, grad_w_gate = grad_w_up_gate.chunk(2, dim=-1)
 
     return grad_w_up, grad_w_gate, grad_w_down, surprise_loss
 
@@ -733,8 +735,13 @@ def apply_rope(
 
 class SlidingWindowAttention(nn.Module):
     """
-    Local Sliding Window Grouped-Query Attention (SWA).
-    Handles exact local context matching while uTTT handles global long-range memory.
+    Local Sliding Window Grouped-Query Attention (SWA) with DeepInfer Optimizations:
+        1. Fused QKV Projection (`F.linear` over concatenated [wq, wk, wv]).
+        2. Native GQA (`enable_gqa=True`) avoiding 4x KV `repeat_interleave` VRAM copies.
+        3. Hardware FlashAttention-2 fast-path (`is_causal=True` when within window) +
+           cached sliding-window mask buffer.
+        4. DeepInfer `SWA Bounded Replay`: caps KV replay tail to `window_size` during
+           long-context prefill/decoding while earlier chunks reside in `SharedFastWeightPool`.
     """
 
     def __init__(
@@ -765,6 +772,19 @@ class SlidingWindowAttention(nn.Module):
         self.wo = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
+        self._cached_mask: Optional[torch.Tensor] = None
+        self._cached_mask_key: Optional[Tuple[int, int, torch.device]] = None
+
+    def _get_sliding_causal_mask(
+        self, seq_len: int, kv_len: int, device: torch.device
+    ) -> torch.Tensor:
+        key = (seq_len, kv_len, device)
+        if self._cached_mask is None or self._cached_mask_key != key:
+            q_idx = torch.arange(kv_len - seq_len, kv_len, device=device).unsqueeze(1)
+            k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+            self._cached_mask = (q_idx >= k_idx) & ((q_idx - k_idx) < self.window_size)
+            self._cached_mask_key = key
+        return self._cached_mask
 
     def forward(
         self,
@@ -774,9 +794,16 @@ class SlidingWindowAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         bsz, seq_len, _ = x.shape
 
-        q = self.wq(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.wk(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Fused QKV GEMM launch (preserves individual wq/wk/wv state_dict keys)
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv_heads * self.head_dim
+        w_qkv = torch.cat([self.wq.weight, self.wk.weight, self.wv.weight], dim=0)
+        qkv = F.linear(x, w_qkv)
+        q_raw, k_raw, v_raw = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=-1)
+
+        q = q_raw.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_raw.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_raw.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rope(q, start_pos=start_pos)
         q, k = apply_rope(q, k, cos, sin)
@@ -785,41 +812,53 @@ class SlidingWindowAttention(nn.Module):
             k_prev, v_prev = kv_cache
             k = torch.cat([k_prev, k], dim=2)
             v = torch.cat([v_prev, v], dim=2)
-            # Evict tokens older than sliding window size to bound KV-cache memory
+            # DeepInfer SWA Bounded Replay: strictly cap cached KV state to window_size
             if k.shape[2] > self.window_size:
                 k = k[:, :, -self.window_size :, :]
                 v = v[:, :, -self.window_size :, :]
 
-        new_kv_cache = (k, v)
-
-        # Repeat KV heads for GQA if needed
-        if self.n_rep > 1:
-            k_attn = k.repeat_interleave(self.n_rep, dim=1)
-            v_attn = v.repeat_interleave(self.n_rep, dim=1)
+        # Bound stored KV cache to window_size even on initial long-context prefill
+        if not self.training and k.shape[2] > self.window_size:
+            new_kv_cache = (k[:, :, -self.window_size :, :], v[:, :, -self.window_size :, :])
         else:
-            k_attn, v_attn = k, v
+            new_kv_cache = (k, v)
 
-        kv_len = k_attn.shape[2]
-        if seq_len == 1:
-            # Single-token decoding attends to all cached keys within the window
-            attn_out = F.scaled_dot_product_attention(
-                q, k_attn, v_attn, attn_mask=None, dropout_p=0.0, is_causal=False
-            )
-        else:
-            # Construct causal + sliding window boolean mask of shape (seq_len, kv_len)
-            q_idx = torch.arange(kv_len - seq_len, kv_len, device=x.device).unsqueeze(1)
-            k_idx = torch.arange(kv_len, device=x.device).unsqueeze(0)
-            causal_mask = q_idx >= k_idx
-            window_mask = (q_idx - k_idx) < self.window_size
-            attn_mask = causal_mask & window_mask
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k_attn,
-                v_attn,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False,
-            )
+        kv_len = k.shape[2]
+        drop_p = self.dropout if self.training else 0.0
+
+        # Native PyTorch 2.5+ GQA (zero KV memory duplication) with fallback
+        try:
+            if seq_len == 1:
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, enable_gqa=(self.n_rep > 1)
+                )
+            elif kv_cache is None and kv_len <= self.window_size:
+                # Native FlashAttention-2 causal fast-path when sequence fits within window
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=drop_p, is_causal=True, enable_gqa=(self.n_rep > 1)
+                )
+            else:
+                attn_mask = self._get_sliding_causal_mask(seq_len, kv_len, x.device)
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=drop_p, is_causal=False, enable_gqa=(self.n_rep > 1)
+                )
+        except TypeError:
+            # Fallback for older PyTorch without enable_gqa
+            k_attn = k.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else k
+            v_attn = v.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else v
+            if seq_len == 1:
+                attn_out = F.scaled_dot_product_attention(
+                    q, k_attn, v_attn, attn_mask=None, dropout_p=0.0, is_causal=False
+                )
+            elif kv_cache is None and kv_len <= self.window_size:
+                attn_out = F.scaled_dot_product_attention(
+                    q, k_attn, v_attn, attn_mask=None, dropout_p=drop_p, is_causal=True
+                )
+            else:
+                attn_mask = self._get_sliding_causal_mask(seq_len, kv_len, x.device)
+                attn_out = F.scaled_dot_product_attention(
+                    q, k_attn, v_attn, attn_mask=attn_mask, dropout_p=drop_p, is_causal=False
+                )
 
         out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
         return self.wo(out), new_kv_cache
@@ -845,12 +884,14 @@ class uTTTLayer(nn.Module):
         base_inner_lr: float = 0.015,
         base_weight_decay: float = 0.005,
         rms_norm_eps: float = 1e-5,
+        chunk_checkpoint_segments: int = 0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.chunk_size = chunk_size
         self.base_inner_lr = base_inner_lr
         self.base_weight_decay = base_weight_decay
+        self.chunk_checkpoint_segments = chunk_checkpoint_segments
 
         # Slow Weights Theta_slow^(l)
         self.w_q = nn.Linear(d_model, d_model, bias=False)
@@ -886,15 +927,20 @@ class uTTTLayer(nn.Module):
         """
         bsz, seq_len, dim = x.shape
 
-        # Project Q, K, V and dynamic gates via layer-specific Slow Weights
-        q = self.q_norm(self.w_q(x))                                # (B, T, D)
-        k = self.k_norm(self.w_k(x))                                # (B, T, D)
-        v_raw = self.w_v(x)
+        # Fused Slow-Weight Projections: 1 GEMM for (Q, K, V) and 1 GEMM for (eta, alpha)
+        w_qkv = torch.cat([self.w_q.weight, self.w_k.weight, self.w_v.weight], dim=0)
+        q_raw, k_raw, v_raw = F.linear(x, w_qkv).chunk(3, dim=-1)
+        q = self.q_norm(q_raw)                                      # (B, T, D)
+        k = self.k_norm(k_raw)                                      # (B, T, D)
         # Unit-RMS normalize V targets so inner-loop reconstruction loss cannot scale-explode
         v = (v_raw.float() * torch.rsqrt(v_raw.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5)).to(x.dtype)
 
-        eta = self.base_inner_lr * torch.sigmoid(self.w_eta(x))     # (B, T, 1)
-        alpha = self.base_weight_decay * torch.sigmoid(self.w_alpha(x))  # (B, T, 1)
+        w_gates = torch.cat([self.w_eta.weight, self.w_alpha.weight], dim=0)
+        b_gates = torch.cat([self.w_eta.bias, self.w_alpha.bias], dim=0)
+        gates = torch.sigmoid(F.linear(x, w_gates, b_gates))        # (B, T, 2)
+        eta_sig, alpha_sig = gates.chunk(2, dim=-1)
+        eta = self.base_inner_lr * eta_sig                          # (B, T, 1)
+        alpha = self.base_weight_decay * alpha_sig                  # (B, T, 1)
 
         # Fast path when fast weights are frozen (e.g. token generation Step 1)
         if not update_fast_weights:
@@ -916,29 +962,148 @@ class uTTTLayer(nn.Module):
         cur_state = fast_state
 
         num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
-        for c_idx in range(num_chunks):
-            start = c_idx * self.chunk_size
-            end = min(start + self.chunk_size, seq_len)
+        use_seg_ckpt = (
+            self.chunk_checkpoint_segments > 1
+            and self.training
+            and torch.is_grad_enabled()
+            and num_chunks > 1
+        )
 
-            q_c = q[:, start:end, :]
-            k_c = k[:, start:end, :]
-            v_c = v[:, start:end, :]
-            eta_c = eta[:, start:end, :]
-            alpha_c = alpha[:, start:end, :]
-            mask_c = attention_mask[:, start:end] if attention_mask is not None else None
+        if use_seg_ckpt:
+            seg_size = max(1, (num_chunks + self.chunk_checkpoint_segments - 1) // self.chunk_checkpoint_segments)
+            for seg_start in range(0, num_chunks, seg_size):
+                seg_end = min(seg_start + seg_size, num_chunks)
+                tok_start = seg_start * self.chunk_size
+                tok_end = min(seg_end * self.chunk_size, seq_len)
 
-            out_c, cur_state, loss_c = fast_pool.chunk_step(
-                state=cur_state,
-                q_chunk=q_c,
-                k_chunk=k_c,
-                v_chunk=v_c,
-                eta_chunk=eta_c,
-                alpha_chunk=alpha_c,
-                token_mask=mask_c,
-                update_fast_weights=True,
-            )
-            chunk_outputs.append(out_c)
-            chunk_losses.append(loss_c)
+                q_seg = q[:, tok_start:tok_end, :]
+                k_seg = k[:, tok_start:tok_end, :]
+                v_seg = v[:, tok_start:tok_end, :]
+                eta_seg = eta[:, tok_start:tok_end, :]
+                alpha_seg = alpha[:, tok_start:tok_end, :]
+                mask_seg = attention_mask[:, tok_start:tok_end] if attention_mask is not None else None
+                step_before = cur_state.step
+
+                def _run_segment(
+                    q_s: torch.Tensor,
+                    k_s: torch.Tensor,
+                    v_s: torch.Tensor,
+                    eta_s: torch.Tensor,
+                    alpha_s: torch.Tensor,
+                    w_up_s: torch.Tensor,
+                    w_gate_s: torch.Tensor,
+                    w_down_s: torch.Tensor,
+                    s_up_s: torch.Tensor,
+                    s_gate_s: torch.Tensor,
+                    s_down_s: torch.Tensor,
+                    _mask_s: Optional[torch.Tensor] = mask_seg,
+                    _step_b: int = step_before,
+                ) -> Tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ]:
+                    st = FastWeightState(
+                        w_up=w_up_s,
+                        w_gate=w_gate_s,
+                        w_down=w_down_s,
+                        s_up=s_up_s,
+                        s_gate=s_gate_s,
+                        s_down=s_down_s,
+                        ln_weight=cur_state.ln_weight,
+                        ln_bias=cur_state.ln_bias,
+                        step=_step_b,
+                    )
+                    seg_outs: List[torch.Tensor] = []
+                    seg_losses: List[torch.Tensor] = []
+                    s_len = q_s.shape[1]
+                    n_c = (s_len + self.chunk_size - 1) // self.chunk_size
+                    for ci in range(n_c):
+                        cs = ci * self.chunk_size
+                        ce = min(cs + self.chunk_size, s_len)
+                        mc = _mask_s[:, cs:ce] if _mask_s is not None else None
+                        oc, st, lc = fast_pool.chunk_step(
+                            state=st,
+                            q_chunk=q_s[:, cs:ce, :],
+                            k_chunk=k_s[:, cs:ce, :],
+                            v_chunk=v_s[:, cs:ce, :],
+                            eta_chunk=eta_s[:, cs:ce, :],
+                            alpha_chunk=alpha_s[:, cs:ce, :],
+                            token_mask=mc,
+                            update_fast_weights=True,
+                        )
+                        seg_outs.append(oc)
+                        seg_losses.append(lc)
+                    return (
+                        torch.cat(seg_outs, dim=1),
+                        st.w_up,
+                        st.w_gate,
+                        st.w_down,
+                        st.s_up.detach(),
+                        st.s_gate.detach(),
+                        st.s_down.detach(),
+                        torch.stack(seg_losses).mean(),
+                    )
+
+                seg_out, wu, wg, wd, su, sg, sd, seg_loss = checkpoint(
+                    _run_segment,
+                    q_seg,
+                    k_seg,
+                    v_seg,
+                    eta_seg,
+                    alpha_seg,
+                    cur_state.w_up,
+                    cur_state.w_gate,
+                    cur_state.w_down,
+                    cur_state.s_up.detach(),
+                    cur_state.s_gate.detach(),
+                    cur_state.s_down.detach(),
+                    use_reentrant=False,
+                )
+                cur_state = FastWeightState(
+                    w_up=wu,
+                    w_gate=wg,
+                    w_down=wd,
+                    s_up=su,
+                    s_gate=sg,
+                    s_down=sd,
+                    ln_weight=cur_state.ln_weight,
+                    ln_bias=cur_state.ln_bias,
+                    step=step_before + (seg_end - seg_start),
+                    last_surprise_loss=cur_state.last_surprise_loss,
+                    surprise_history=cur_state.surprise_history,
+                )
+                chunk_outputs.append(seg_out)
+                chunk_losses.append(seg_loss)
+        else:
+            for c_idx in range(num_chunks):
+                start = c_idx * self.chunk_size
+                end = min(start + self.chunk_size, seq_len)
+
+                q_c = q[:, start:end, :]
+                k_c = k[:, start:end, :]
+                v_c = v[:, start:end, :]
+                eta_c = eta[:, start:end, :]
+                alpha_c = alpha[:, start:end, :]
+                mask_c = attention_mask[:, start:end] if attention_mask is not None else None
+
+                out_c, cur_state, loss_c = fast_pool.chunk_step(
+                    state=cur_state,
+                    q_chunk=q_c,
+                    k_chunk=k_c,
+                    v_chunk=v_c,
+                    eta_chunk=eta_c,
+                    alpha_chunk=alpha_c,
+                    token_mask=mask_c,
+                    update_fast_weights=True,
+                )
+                chunk_outputs.append(out_c)
+                chunk_losses.append(loss_c)
 
         out = torch.cat(chunk_outputs, dim=1)                       # (B, T, D)
         mean_surprise_loss = torch.stack(chunk_losses).mean()

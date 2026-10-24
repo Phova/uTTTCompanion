@@ -66,9 +66,12 @@ class uTTTConfig:
     elastic_anchor_lambda: float = 0.02
     max_weight_drift_ratio: float = 0.35
 
-    # Training memory optimization
+    # Training memory & schedule optimization
     gradient_checkpointing: bool = True
     tie_word_embeddings: bool = True
+    write_schedule: str = "sequential"          # "sequential" (Eq. 14/17) or "aggregated" (Eq. 2)
+    dspark_speculative_k: int = 0               # DeepInfer DSpark speculative draft length (0=off)
+    dspark_conf_threshold: float = 0.82         # Confidence gate for DSpark draft token proposal
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -404,9 +407,9 @@ class uTTTModel(nn.Module):
                 st_out.w_up,
                 st_out.w_gate,
                 st_out.w_down,
-                st_out.s_up,
-                st_out.s_gate,
-                st_out.s_down,
+                st_out.s_up.detach(),
+                st_out.s_gate.detach(),
+                st_out.s_down.detach(),
                 s_loss,
             )
 
@@ -416,9 +419,9 @@ class uTTTModel(nn.Module):
             fast_state.w_up,
             fast_state.w_gate,
             fast_state.w_down,
-            fast_state.s_up,
-            fast_state.s_gate,
-            fast_state.s_down,
+            fast_state.s_up.detach(),
+            fast_state.s_gate.detach(),
+            fast_state.s_down.detach(),
             fast_state.ln_weight,
             fast_state.ln_bias,
             use_reentrant=False,
@@ -557,14 +560,28 @@ class uTTTModel(nn.Module):
         temperature: float = 0.7,
         top_p: float = 0.9,
         eos_token_id: Optional[int] = SimpleUTF8Tokenizer.EOS_ID,
+        speculative_draft_k: Optional[int] = None,
+        dspark_conf_threshold: Optional[float] = None,
     ) -> Iterator[int]:
         """
         Step 1 of `interact_and_evolve`:
         Freeze `fast_state` (update_fast_weights=False) and stream-generate reply tokens
-        autoregressively using Sliding-Window KV caching.
+        autoregressively using Sliding-Window KV caching and optional DeepInfer DSpark
+        Confidence-Scheduled Self-Speculative Decoding.
         """
         was_training = self.training
         self.eval()
+
+        draft_k = (
+            speculative_draft_k
+            if speculative_draft_k is not None
+            else int(getattr(self.config, "dspark_speculative_k", 0))
+        )
+        conf_thresh = (
+            dspark_conf_threshold
+            if dspark_conf_threshold is not None
+            else float(getattr(self.config, "dspark_conf_threshold", 0.82))
+        )
 
         try:
             # Prefill prompt with frozen fast weights
@@ -578,17 +595,106 @@ class uTTTModel(nn.Module):
             kv_caches = prefill_out.kv_caches
             next_token_logits = prefill_out.logits[:, -1, :]
             cur_pos = input_ids.shape[1]
+            generated_count = 0
 
-            for _ in range(max_new_tokens):
+            while generated_count < max_new_tokens:
                 next_token = self._sample_next_token(
                     next_token_logits, temperature=temperature, top_p=top_p
                 )
                 token_id = int(next_token.item())
                 yield token_id
+                generated_count += 1
 
                 if eos_token_id is not None and token_id == eos_token_id:
                     break
+                if generated_count >= max_new_tokens:
+                    break
 
+                # DeepInfer DSpark Confidence-Scheduled Self-Speculative Decoding:
+                # When draft_k > 0 and top-1 confidence >= conf_thresh, use the universal
+                # SharedFastWeightPool readout head to propose up to `draft_k` tokens and
+                # verify them in a single batched forward pass.
+                if draft_k > 0:
+                    probs = F.softmax(next_token_logits.float(), dim=-1)
+                    top_conf = float(probs.max().item())
+                else:
+                    top_conf = 0.0
+
+                if draft_k > 0 and top_conf >= conf_thresh:
+                    draft_tokens: List[int] = [token_id]
+                    cur_tok_tensor = next_token.view(1, 1)
+                    for _ in range(min(draft_k, max_new_tokens - generated_count)):
+                        emb = self.tok_embeddings(cur_tok_tensor)
+                        fast_feat = self.fast_weight_pool.forward_readout(emb, fast_state)
+                        draft_logits = self.lm_head(self.norm(fast_feat))[:, -1, :]
+                        draft_probs = F.softmax(draft_logits.float(), dim=-1)
+                        if float(draft_probs.max().item()) < conf_thresh:
+                            break
+                        cand_tok = torch.argmax(draft_logits, dim=-1)
+                        cand_id = int(cand_tok.item())
+                        draft_tokens.append(cand_id)
+                        if eos_token_id is not None and cand_id == eos_token_id:
+                            break
+                        cur_tok_tensor = cand_tok.view(1, 1)
+
+                    if len(draft_tokens) > 1:
+                        verify_input = torch.tensor(
+                            [draft_tokens], dtype=torch.long, device=input_ids.device
+                        )
+                        verify_out = self.forward(
+                            input_ids=verify_input,
+                            fast_state=fast_state,
+                            kv_caches=kv_caches,
+                            start_pos=cur_pos,
+                            update_fast_weights=False,
+                        )
+                        # Verify proposed draft tokens against full model predictions
+                        accepted = 0
+                        hit_eos = False
+                        for idx in range(len(draft_tokens) - 1):
+                            target_tok = self._sample_next_token(
+                                verify_out.logits[:, idx, :],
+                                temperature=temperature,
+                                top_p=top_p,
+                            )
+                            target_id = int(target_tok.item())
+                            if target_id == draft_tokens[idx + 1]:
+                                yield target_id
+                                generated_count += 1
+                                accepted += 1
+                                if eos_token_id is not None and target_id == eos_token_id:
+                                    hit_eos = True
+                                    break
+                                if generated_count >= max_new_tokens:
+                                    break
+                            else:
+                                # Accept the corrected token from the verifier and stop
+                                yield target_id
+                                generated_count += 1
+                                accepted += 1
+                                next_token_logits = verify_out.logits[:, idx, :]
+                                if eos_token_id is not None and target_id == eos_token_id:
+                                    hit_eos = True
+                                break
+
+                        if hit_eos or generated_count >= max_new_tokens:
+                            break
+
+                        # Trim KV caches to match the exact number of accepted tokens (1 + accepted)
+                        valid_steps = 1 + accepted
+                        trim_drop = len(draft_tokens) - valid_steps
+                        if trim_drop > 0 and verify_out.kv_caches is not None:
+                            kv_caches = [
+                                (k_c[:, :, :-trim_drop, :], v_c[:, :, :-trim_drop, :])
+                                for (k_c, v_c) in verify_out.kv_caches
+                            ]
+                        else:
+                            kv_caches = verify_out.kv_caches
+                        cur_pos += valid_steps
+                        next_token_logits = verify_out.logits[:, valid_steps - 1, :]
+                        continue
+
+                # Standard 1-token autoregressive decoding step
                 step_input = next_token.view(1, 1)
                 step_out = self.forward(
                     input_ids=step_input,

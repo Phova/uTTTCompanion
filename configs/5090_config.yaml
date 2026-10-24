@@ -51,6 +51,7 @@ training:
   max_outer_grad_norm: 1.0
   surprise_aux_loss_weight: 0.10       # Weight for auxiliary inner-loop reconstruction loss
   gradient_checkpointing: true         # Required across 16 layers to bound 256-step fast-weight states < 20GB
+  pack_sequences: true                 # Multi-dialogue sequence packing (eliminates PAD token compute waste)
   log_interval: 10
   save_interval: 200
   base_checkpoint_path: "checkpoints/base_uttt.pt"

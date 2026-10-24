@@ -89,11 +89,13 @@ class PersonaMetaDataset(Dataset):
         seq_len: int = 1024,
         num_samples: int = 4096,
         data_path: Optional[str] = None,
+        pack_sequences: bool = True,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.num_samples = num_samples
+        self.pack_sequences = pack_sequences
         self.external_texts: List[str] = []
 
         if data_path and os.path.exists(data_path):
@@ -138,8 +140,28 @@ class PersonaMetaDataset(Dataset):
         return turn_text * repeats
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        text = self.external_texts[idx] if self.external_texts else self._synthesize_dialogue(idx)
-        token_ids = self.tokenizer.encode(text, add_bos=True, add_eos=True, max_length=self.seq_len)
+        if self.external_texts:
+            n_ext = len(self.external_texts)
+            text = self.external_texts[idx % n_ext]
+            token_ids = self.tokenizer.encode(
+                text, add_bos=True, add_eos=True, max_length=self.seq_len
+            )
+            # Multi-Dialogue Sequence Packing: pack consecutive short dialogues to eliminate PAD waste
+            if self.pack_sequences and len(token_ids) < self.seq_len and n_ext > 1:
+                pack_Step = 1
+                while len(token_ids) < self.seq_len and pack_Step <= 6:
+                    next_text = self.external_texts[(idx + pack_Step * 131) % n_ext]
+                    remain = self.seq_len - len(token_ids)
+                    more_ids = self.tokenizer.encode(
+                        next_text, add_bos=True, add_eos=True, max_length=remain
+                    )
+                    token_ids.extend(more_ids)
+                    pack_Step += 1
+        else:
+            text = self._synthesize_dialogue(idx)
+            token_ids = self.tokenizer.encode(
+                text, add_bos=True, add_eos=True, max_length=self.seq_len
+            )
 
         if len(token_ids) < self.seq_len:
             pad_len = self.seq_len - len(token_ids)
@@ -393,22 +415,28 @@ def train(
     ckpt_path = output_ckpt or train_cfg.get("base_checkpoint_path", "checkpoints/base_uttt.pt")
 
     tokenizer = SimpleUTF8Tokenizer(vocab_size=model_cfg.vocab_size)
+    pack_sequences = bool(train_cfg.get("pack_sequences", True))
     dataset = PersonaMetaDataset(
         tokenizer=tokenizer,
         seq_len=seq_len,
         num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
         data_path=data_path,
+        pack_sequences=pack_sequences,
     )
     use_workers = device.type == "cuda" and os.name != "nt"
-    loader = DataLoader(
-        dataset,
-        batch_size=micro_batch_size,
-        shuffle=True,
-        drop_last=True,
-        pin_memory=(device.type == "cuda"),
-        num_workers=2 if use_workers else 0,
-        persistent_workers=use_workers,
-    )
+
+    def _build_loader(mb_size: int) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=mb_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            num_workers=2 if use_workers else 0,
+            persistent_workers=use_workers,
+        )
+
+    loader = _build_loader(micro_batch_size)
     data_iter = iter(loader)
 
     start_step = 1
@@ -473,38 +501,71 @@ def train(
 
         optimizer.zero_grad(set_to_none=True)
 
-        step_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
-        step_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
-        step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
-
-        for _ in range(grad_accum_steps):
+        # Runtime Elastic OOM Self-Healing Guard:
+        # If any step exceeds VRAM, automatically halve micro_batch_size, double grad_accum_steps,
+        # enable 2-level hierarchical chunk checkpointing, and retry the step without crashing.
+        while True:
             try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                batch = next(data_iter)
+                step_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
+                step_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
+                step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                for _ in range(grad_accum_steps):
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        data_iter = iter(loader)
+                        batch = next(data_iter)
 
-            # Native BF16 mixed precision forward + analytical inner-loop TTT update
-            with torch.amp.autocast(autocast_device_type, dtype=amp_dtype):
-                out = model(
-                    input_ids=input_ids,
-                    fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
-                    labels=labels,
-                    attention_mask=attention_mask,
-                    update_fast_weights=True,
-                    surprise_aux_weight=surprise_aux_weight,
-                )
-                scaled_loss = out.loss / float(grad_accum_steps)
+                    input_ids = batch["input_ids"].to(device, non_blocking=True)
+                    labels = batch["labels"].to(device, non_blocking=True)
+                    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-            scaled_loss.backward()
+                    # Native BF16 mixed precision forward + analytical inner-loop TTT update
+                    with torch.amp.autocast(autocast_device_type, dtype=amp_dtype):
+                        out = model(
+                            input_ids=input_ids,
+                            fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
+                            labels=labels,
+                            attention_mask=attention_mask,
+                            update_fast_weights=True,
+                            surprise_aux_weight=surprise_aux_weight,
+                        )
+                        scaled_loss = out.loss / float(grad_accum_steps)
 
-            step_loss_gpu += out.loss.detach().float() / float(grad_accum_steps)
-            step_ce_gpu += out.ce_loss.detach().float() / float(grad_accum_steps)
-            step_surprise_gpu += out.surprise_loss.detach().float() / float(grad_accum_steps)
+                    scaled_loss.backward()
+
+                    step_loss_gpu += out.loss.detach().float() / float(grad_accum_steps)
+                    step_ce_gpu += out.ce_loss.detach().float() / float(grad_accum_steps)
+                    step_surprise_gpu += out.surprise_loss.detach().float() / float(grad_accum_steps)
+                break
+            except torch.OutOfMemoryError:
+                optimizer.zero_grad(set_to_none=True)
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                model.gradient_checkpointing = True
+                model_cfg.gradient_checkpointing = True
+                if micro_batch_size > 1:
+                    micro_batch_size = max(1, micro_batch_size // 2)
+                    grad_accum_steps = grad_accum_steps * 2
+                    loader = _build_loader(micro_batch_size)
+                    data_iter = iter(loader)
+                    print(
+                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM! Dynamically scaled to "
+                        f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps} "
+                        f"(EffectiveBatch={micro_batch_size * grad_accum_steps} preserved). Retrying step...",
+                        flush=True,
+                    )
+                else:
+                    for blk in model.layers:
+                        blk.uttt.chunk_checkpoint_segments = max(
+                            4, blk.uttt.chunk_checkpoint_segments * 2
+                        )
+                    print(
+                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM at MicroBatch=1! Enabled 2-level "
+                        f"Chunk Segment Checkpointing (segments={model.layers[0].uttt.chunk_checkpoint_segments}). Retrying...",
+                        flush=True,
+                    )
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_outer_grad_norm, error_if_nonfinite=False

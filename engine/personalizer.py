@@ -136,6 +136,10 @@ class uTTTPersonalizer:
         self.default_max_new_tokens = default_max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        # DeepInfer Asynchronous CUDA Stream for background TTT fast-weight updates
+        self._ttt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
 
     # --------------------------------------------------------------------------
     # Slash Command Execution (/save, /reset, /snapshot, /restore, /diff)
@@ -329,12 +333,23 @@ class uTTTPersonalizer:
         interaction_tensor = torch.tensor([padded_ids], dtype=torch.long, device=self.device)
         mask_tensor = torch.tensor([attn_mask], dtype=torch.float32, device=self.device)
 
-        with torch.amp.autocast(autocast_dev, dtype=self.dtype):
-            candidate_state, surprise_loss, layer_surprises = self.model.test_time_update(
-                interaction_ids=interaction_tensor,
-                fast_state=user_state,
-                attention_mask=mask_tensor,
-            )
+        # DeepInfer Async Stream Execution: isolate TTT inner-loop update on dedicated CUDA stream
+        if self._ttt_stream is not None:
+            self._ttt_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._ttt_stream), torch.amp.autocast(autocast_dev, dtype=self.dtype):
+                candidate_state, surprise_loss, layer_surprises = self.model.test_time_update(
+                    interaction_ids=interaction_tensor,
+                    fast_state=user_state,
+                    attention_mask=mask_tensor,
+                )
+            torch.cuda.current_stream(self.device).wait_stream(self._ttt_stream)
+        else:
+            with torch.amp.autocast(autocast_dev, dtype=self.dtype):
+                candidate_state, surprise_loss, layer_surprises = self.model.test_time_update(
+                    interaction_ids=interaction_tensor,
+                    fast_state=user_state,
+                    attention_mask=mask_tensor,
+                )
 
         # ======================================================================
         # Step 3 (Stability Guard): Surprise Threshold Gate + Elastic Anchor Pull
