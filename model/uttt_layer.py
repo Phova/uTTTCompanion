@@ -914,6 +914,47 @@ class SlidingWindowAttention(nn.Module):
 # 5. Layer-Specific Slow-Weight uTTT Projection Layer & uTTTBlock
 # ==============================================================================
 
+def fused_slow_projections(
+    x: torch.Tensor,
+    wq_w: torch.Tensor,
+    wk_w: torch.Tensor,
+    wv_w: torch.Tensor,
+    q_norm_w: torch.Tensor,
+    k_norm_w: torch.Tensor,
+    w_eta_w: torch.Tensor,
+    w_eta_b: torch.Tensor,
+    w_alpha_w: torch.Tensor,
+    w_alpha_b: torch.Tensor,
+    base_inner_lr: float,
+    base_weight_decay: float,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Pure-tensor slow-weight projection + RMSNorm + gate activation kernel for `uTTTLayer`,
+    compiled by `torch.compile` to eliminate eager launch gaps between SWA and TTT chunks.
+    """
+    dim = x.shape[-1]
+    q_raw = F.linear(x, wq_w)
+    k_raw = F.linear(x, wk_w)
+    v_raw = F.linear(x, wv_w)
+
+    if hasattr(F, "rms_norm"):
+        q = F.rms_norm(q_raw, (dim,), q_norm_w.to(x.dtype), eps)
+        k = F.rms_norm(k_raw, (dim,), k_norm_w.to(x.dtype), eps)
+        v = F.rms_norm(v_raw, (dim,), None, eps)
+    else:
+        q_fp32 = q_raw.float()
+        q = (q_norm_w.float() * q_fp32 * torch.rsqrt(q_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+        k_fp32 = k_raw.float()
+        k = (k_norm_w.float() * k_fp32 * torch.rsqrt(k_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+        v_fp32 = v_raw.float()
+        v = (v_fp32 * torch.rsqrt(v_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+
+    eta = base_inner_lr * torch.sigmoid(F.linear(x, w_eta_w, w_eta_b))
+    alpha = base_weight_decay * torch.sigmoid(F.linear(x, w_alpha_w, w_alpha_b))
+    return q, k, v, eta, alpha
+
+
 class uTTTLayer(nn.Module):
     """
     Layer-l Slow-Weight Projection & Chunk-wise Parallel TTT Controller.
@@ -973,18 +1014,22 @@ class uTTTLayer(nn.Module):
         """
         bsz, seq_len, dim = x.shape
 
-        # Project Q, K, V and dynamic gates via layer-specific Slow Weights
-        q = self.q_norm(self.w_q(x))                                # (B, T, D)
-        k = self.k_norm(self.w_k(x))                                # (B, T, D)
-        v_raw = self.w_v(x)
-        # Unit-RMS normalize V targets via fused F.rms_norm
-        if hasattr(F, "rms_norm"):
-            v = F.rms_norm(v_raw, (dim,), None, 1e-5)
-        else:
-            v = (v_raw.float() * torch.rsqrt(v_raw.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5)).to(x.dtype)
-
-        eta = self.base_inner_lr * torch.sigmoid(self.w_eta(x))     # (B, T, 1)
-        alpha = self.base_weight_decay * torch.sigmoid(self.w_alpha(x))  # (B, T, 1)
+        # Compiled Slow-Weight Projections + Fused RMSNorm + Gate Sigmoids
+        q, k, v, eta, alpha = fused_slow_projections(
+            x=x,
+            wq_w=self.w_q.weight,
+            wk_w=self.w_k.weight,
+            wv_w=self.w_v.weight,
+            q_norm_w=self.q_norm.weight,
+            k_norm_w=self.k_norm.weight,
+            w_eta_w=self.w_eta.weight,
+            w_eta_b=self.w_eta.bias,
+            w_alpha_w=self.w_alpha.weight,
+            w_alpha_b=self.w_alpha.bias,
+            base_inner_lr=self.base_inner_lr,
+            base_weight_decay=self.base_weight_decay,
+            eps=self.q_norm.eps,
+        )
 
         # Fast path when fast weights are frozen (e.g. token generation Step 1)
         if not update_fast_weights:

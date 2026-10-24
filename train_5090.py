@@ -258,6 +258,11 @@ def maybe_compile_inner_loop(
             mode=compile_mode,
             fullgraph=False,
         )
+        uttt_layer_mod.fused_slow_projections = torch.compile(
+            uttt_layer_mod.fused_slow_projections,
+            mode=compile_mode,
+            fullgraph=False,
+        )
         uttt_layer_mod.swiglu_fast_forward = torch.compile(
             uttt_layer_mod.swiglu_fast_forward,
             mode=compile_mode,
@@ -270,7 +275,7 @@ def maybe_compile_inner_loop(
         )
         print(
             f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
-            "swiglu_fast_forward & apply_rope."
+            "fused_slow_projections, swiglu_fast_forward & apply_rope."
         )
     except Exception as exc:
         print(f"[Compiler] torch.compile fallback to eager mode: {exc}")
@@ -585,7 +590,10 @@ def train(
                     )
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_outer_grad_norm, error_if_nonfinite=False
+            model.parameters(),
+            max_outer_grad_norm,
+            error_if_nonfinite=False,
+            foreach=(device.type == "cuda"),
         )
         # Single GPU->CPU synchronization point per outer step
         metrics_cpu = torch.stack([step_loss_gpu, step_ce_gpu, step_surprise_gpu, grad_norm.detach().float()]).tolist()

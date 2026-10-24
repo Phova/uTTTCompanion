@@ -528,10 +528,11 @@ class uTTTModel(nn.Module):
         total_loss: Optional[torch.Tensor] = None
 
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+            # Zero-copy shifted labels: avoids allocating 512MB+ for `logits[:, :-1, :].contiguous()`
+            shift_labels = torch.full_like(labels, -100)
+            shift_labels[:, :-1] = labels[:, 1:]
             ce_loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
+                logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
