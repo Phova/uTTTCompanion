@@ -89,6 +89,18 @@ def get_personalizer() -> uTTTPersonalizer:
             temperature = float(p_cfg.get("temperature", temperature))
             top_p = float(p_cfg.get("top_p", top_p))
 
+        if os.environ.get("UTTT_MAX_GPU_USERS"):
+            max_gpu_users = int(os.environ["UTTT_MAX_GPU_USERS"])
+        if os.environ.get("UTTT_MAX_NEW_TOKENS"):
+            max_new_tokens = int(os.environ["UTTT_MAX_NEW_TOKENS"])
+        if os.environ.get("UTTT_TEMPERATURE"):
+            temperature = float(os.environ["UTTT_TEMPERATURE"])
+        surprise_threshold: Optional[float] = (
+            float(os.environ["UTTT_SURPRISE_THRESHOLD"])
+            if os.environ.get("UTTT_SURPRISE_THRESHOLD")
+            else None
+        )
+
         ckpt_manager = DualTrackCheckpointManager(
             base_checkpoint_path=base_ckpt,
             personas_dir=personas_dir,
@@ -101,6 +113,7 @@ def get_personalizer() -> uTTTPersonalizer:
         _personalizer = uTTTPersonalizer(
             checkpoint_manager=ckpt_manager,
             config_path=config_path,
+            surprise_threshold=surprise_threshold,
             auto_save_every_turn=auto_save,
             default_max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -113,6 +126,8 @@ def get_personalizer() -> uTTTPersonalizer:
 async def lifespan(app: FastAPI):
     # Initialize shared Slow Weights & LRU Fast-Weight Pool on startup
     engine = get_personalizer()
+    compile_kernels = os.environ.get("UTTT_NO_COMPILE", "0") != "1"
+    engine.warmup(compile_kernels=compile_kernels)
     prewarm_user = os.environ.get("UTTT_DEFAULT_USER", "").strip()
     if prewarm_user:
         engine.ckpt_manager.get_user_state(prewarm_user)
@@ -280,13 +295,18 @@ def main() -> None:
     import uvicorn
 
     parser = argparse.ArgumentParser(description="uTTT FastAPI + WebSocket Personalization Server")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--config", type=str, default="configs/5090_config.yaml")
-    parser.add_argument("--base-ckpt", type=str, default="checkpoints/base_uttt.pt")
-    parser.add_argument("--personas-dir", type=str, default="personas")
-    parser.add_argument("--user-id", type=str, default="", help="Optional default user ID to pre-warm in GPU VRAM.")
-    parser.add_argument("--lightweight", action="store_true")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server bind address")
+    parser.add_argument("--port", type=int, default=8000, help="Server listen port")
+    parser.add_argument("--config", type=str, default="configs/5090_config.yaml", help="YAML config path")
+    parser.add_argument("--base-ckpt", type=str, default="checkpoints/base_uttt.pt", help="Base checkpoint path")
+    parser.add_argument("--personas-dir", type=str, default="personas", help="User persona fast-weight directory")
+    parser.add_argument("--user-id", type=str, default="", help="Optional default user ID to pre-warm in GPU VRAM")
+    parser.add_argument("--max-gpu-users", type=int, default=None, help="Override Tier-1 GPU VRAM LRU pool size")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Override default max generated tokens per turn")
+    parser.add_argument("--temperature", type=float, default=None, help="Override default sampling temperature")
+    parser.add_argument("--surprise-threshold", type=float, default=None, help="Override Surprise Gate threshold tau")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile kernel fusion on startup")
+    parser.add_argument("--lightweight", action="store_true", help="Use lightweight fallback model when cold-starting")
     args, _ = parser.parse_known_args()
 
     os.environ["UTTT_CONFIG"] = args.config
@@ -294,6 +314,16 @@ def main() -> None:
     os.environ["UTTT_PERSONAS_DIR"] = args.personas_dir
     if args.user_id:
         os.environ["UTTT_DEFAULT_USER"] = args.user_id
+    if args.max_gpu_users is not None:
+        os.environ["UTTT_MAX_GPU_USERS"] = str(args.max_gpu_users)
+    if args.max_new_tokens is not None:
+        os.environ["UTTT_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
+    if args.temperature is not None:
+        os.environ["UTTT_TEMPERATURE"] = str(args.temperature)
+    if args.surprise_threshold is not None:
+        os.environ["UTTT_SURPRISE_THRESHOLD"] = str(args.surprise_threshold)
+    if args.no_compile:
+        os.environ["UTTT_NO_COMPILE"] = "1"
     if args.lightweight:
         os.environ["UTTT_LIGHTWEIGHT"] = "1"
 

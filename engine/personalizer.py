@@ -29,8 +29,11 @@ from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 import torch
 
 from engine.checkpoint_manager import DualTrackCheckpointManager
+import model.uttt_layer as uttt_layer_mod
 from model.uttt_layer import FastWeightState
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
+
+_INFERENCE_KERNELS_COMPILED = False
 
 
 @dataclass
@@ -144,6 +147,61 @@ class uTTTPersonalizer:
         self._ttt_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         )
+
+    def warmup(self, compile_kernels: bool = True) -> None:
+        """
+        Compile high-throughput RTX 5090 inference & TTT kernels with `dynamic=True`
+        (matching training performance) and pre-warm Triton caches so the first chat
+        turn experiences zero JIT compilation latency.
+        """
+        global _INFERENCE_KERNELS_COMPILED
+        if self.device.type == "cuda" and compile_kernels and hasattr(torch, "compile") and not _INFERENCE_KERNELS_COMPILED:
+            try:
+                uttt_layer_mod.swiglu_fast_forward = torch.compile(
+                    uttt_layer_mod.swiglu_fast_forward, dynamic=True
+                )
+                uttt_layer_mod.fused_fast_q_proj = torch.compile(
+                    uttt_layer_mod.fused_fast_q_proj, dynamic=True
+                )
+                uttt_layer_mod.fused_slow_projections = torch.compile(
+                    uttt_layer_mod.fused_slow_projections, dynamic=True
+                )
+                uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
+                    uttt_layer_mod.fused_chunk_ttt_step, dynamic=True
+                )
+                uttt_layer_mod.apply_rope = torch.compile(
+                    uttt_layer_mod.apply_rope, dynamic=True
+                )
+                _INFERENCE_KERNELS_COMPILED = True
+                print("[Personalizer] Enabled torch.compile (dynamic=True) for RTX 5090 inference & TTT kernels.")
+            except Exception as exc:
+                print(f"[Personalizer] Warning: torch.compile fallback to eager ({exc})")
+
+        if self.device.type == "cuda":
+            t0 = time.perf_counter()
+            autocast_dev = "cuda"
+            dummy_state = self.model.init_fast_state(
+                batch_size=1, device=self.device, dtype=self.dtype, detach=True
+            )
+            dummy_prompt = torch.ones((1, 16), dtype=torch.long, device=self.device)
+            dummy_turn = torch.ones((1, 64), dtype=torch.long, device=self.device)
+            dummy_mask = torch.ones((1, 64), dtype=torch.float32, device=self.device)
+            with torch.no_grad(), torch.amp.autocast(autocast_dev, dtype=self.dtype):
+                for _ in self.model.stream_generate(
+                    input_ids=dummy_prompt,
+                    fast_state=dummy_state,
+                    max_new_tokens=2,
+                    temperature=0.0,
+                ):
+                    pass
+                self.model.test_time_update(
+                    interaction_ids=dummy_turn,
+                    fast_state=dummy_state,
+                    attention_mask=dummy_mask,
+                )
+            torch.cuda.synchronize(self.device)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"[Personalizer] RTX 5090 inference & TTT kernels warmed up in {dt_ms:.1f} ms.")
 
     # --------------------------------------------------------------------------
     # Slash Command Execution (/save, /reset, /snapshot, /restore, /diff)
@@ -309,7 +367,7 @@ class uTTTPersonalizer:
                 generated_ids.append(tok_id)
                 decoded_so_far = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 # Hold back trailing incomplete UTF-8 multi-byte character (\ufffd) until next byte arrives
-                clean_so_far = decoded_so_far.rstrip("\ufffd")
+                clean_so_far = decoded_so_far.rstrip("\ufffd").replace("\ufffd", "")
                 if len(clean_so_far) > emitted_len:
                     piece = clean_so_far[emitted_len:]
                     emitted_len = len(clean_so_far)
@@ -332,10 +390,11 @@ class uTTTPersonalizer:
             add_eos=True,
             max_length=self.config.max_seq_len,
         )
-        # Pad up to a multiple of chunk_size if shorter than chunk_size for optimal GEMM alignment
-        chunk_sz = self.config.chunk_size
+        # Align sequence length to a multiple of 64 (Tensor Core tile boundary) without
+        # over-padding short chat turns up to 512 tokens
+        align_sz = min(self.config.chunk_size, 64)
         valid_len = len(turn_ids)
-        padded_len = ((valid_len + chunk_sz - 1) // chunk_sz) * chunk_sz
+        padded_len = ((valid_len + align_sz - 1) // align_sz) * align_sz
         pad_count = padded_len - valid_len
 
         padded_ids = turn_ids + [self.tokenizer.PAD_ID] * pad_count

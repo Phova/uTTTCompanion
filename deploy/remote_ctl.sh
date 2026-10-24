@@ -70,7 +70,18 @@ Core Commands:
   prepare-data [args]   Download & format public Persona-Chat + Belle multi-turn dataset on remote
   train [extra_args]    Start train_5090.py in remote tmux session and stream live loss
   pull-ckpt             Pull remote checkpoints/base_uttt.pt to local checkpoints/base_uttt.pt
-  serve                 Launch remote FastAPI+WebSocket server & map SSH tunnel to localhost:${LOCAL_TUNNEL_PORT}
+  serve [extra_args]    Launch remote FastAPI+WebSocket server & map SSH tunnel to localhost:${LOCAL_TUNNEL_PORT}
+                        Supported [extra_args]:
+                          --user-id <id>             Pre-warm user persona FastWeightState in GPU VRAM on startup
+                          --config <path>            YAML config path (default: configs/5090_config.yaml)
+                          --base-ckpt <path>         Base checkpoint path (default: checkpoints/base_uttt.pt)
+                          --personas-dir <dir>       Persona state directory (default: personas)
+                          --max-gpu-users <int>      Tier-1 GPU VRAM LRU pool size (default: 16)
+                          --max-new-tokens <int>     Default max generated tokens per turn (default: 96)
+                          --temperature <float>      Default sampling temperature (default: 0.7)
+                          --surprise-threshold <f>   Override Surprise Gate threshold tau (default: 0.015)
+                          --no-compile               Disable torch.compile kernel fusion on startup
+                          --lightweight              Use lightweight fallback model when cold-starting
   status                Show remote RTX 5090 GPU utilization, tmux sessions, and checkpoint info
   logs [train|serve]    Attach to real-time remote log stream
   stop [train|serve|all] Terminate remote background training/serving sessions
@@ -270,9 +281,9 @@ cmd_pull_ckpt() {
     rsync -avz --progress -e "${RSYNC_SSH_CMD}" \
         "${REMOTE_TARGET}:${REMOTE_CKPT}" "${LOCAL_CKPT}"
 
-    REMOTE_HASH="$(remote_exec "sha256sum '${REMOTE_CKPT}' | awk '{print \$1}'")"
+    REMOTE_HASH="$(remote_exec "sha256sum '${REMOTE_CKPT}' | cut -d' ' -f1" | tr -d '\r\n ')"
     if command -v sha256sum >/dev/null 2>&1; then
-        LOCAL_HASH="$(sha256sum "${LOCAL_CKPT}" | awk '{print $1}')"
+        LOCAL_HASH="$(sha256sum "${LOCAL_CKPT}" | cut -d' ' -f1 | tr -d '\r\n ')"
         if [[ "${REMOTE_HASH}" != "${LOCAL_HASH}" ]]; then
             log_error "SHA256 mismatch! Remote=${REMOTE_HASH} vs Local=${LOCAL_HASH}"
             exit 1
@@ -284,21 +295,11 @@ cmd_pull_ckpt() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. Subcommand: serve & chat (Start Remote FastAPI+WS Service & Interactive CLI)
+# 7. Subcommand: serve (Start Remote FastAPI+WS Service & Map Local SSH Tunnel)
 # ------------------------------------------------------------------------------
 cmd_serve() {
     validate_config
     cmd_sync
-
-    local CHAT_USER_ID=""
-    local ARGS=("$@")
-    for (( i=0; i<${#ARGS[@]}; i++ )); do
-        if [[ "${ARGS[$i]}" == "--user-id" && $((i+1)) -lt ${#ARGS[@]} ]]; then
-            CHAT_USER_ID="${ARGS[$((i+1))]}"
-        elif [[ "${ARGS[$i]}" == --user-id=* ]]; then
-            CHAT_USER_ID="${ARGS[$i]#--user-id=}"
-        fi
-    done
 
     EXTRA_SERVE_ARGS="$*"
     SERVE_LOG="${REMOTE_DIR}/logs/serve_5090.log"
@@ -324,9 +325,9 @@ cmd_serve() {
         fi
     \""
 
-    log_info "Waiting for remote FastAPI server on port ${REMOTE_SERVICE_PORT} to become ready..."
+    log_info "Waiting for remote FastAPI server on port ${REMOTE_SERVICE_PORT} to become ready (includes kernel warmup)..."
     local READY=0
-    for _ in {1..30}; do
+    for _ in {1..45}; do
         if remote_exec "curl -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
             log_ok "Remote uTTT Personalization Server is healthy!"
             READY=1
@@ -336,43 +337,19 @@ cmd_serve() {
     done
 
     if [[ "${READY}" -eq 0 ]]; then
-        log_error "Server did not become ready within 30s. Check logs:"
+        log_error "Server did not become ready within 45s. Check logs:"
         remote_exec "cat '${SERVE_LOG}' 2>/dev/null || true"
         exit 1
     fi
 
-    if [[ -n "${CHAT_USER_ID}" ]]; then
-        log_ok "Launching Interactive Personalization Chat for user_id='${CHAT_USER_ID}' (Tunnel localhost:${LOCAL_TUNNEL_PORT} -> :${REMOTE_SERVICE_PORT} active)..."
-        ssh -tt "${SSH_OPTS[@]}" \
-            -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
-            "${REMOTE_TARGET}" \
-            "cd '${REMOTE_DIR}' && '${REMOTE_DIR}/.venv/bin/python3' -u client_chat.py --user-id '${CHAT_USER_ID}' --ws-url ws://localhost:${REMOTE_SERVICE_PORT}"
-    else
-        log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
-        log_info "In another terminal, start chatting with: ./deploy/remote_ctl.sh chat --user-id Phova"
-        log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
+    log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
+    log_info "In another terminal, connect the interactive CLI client with:"
+    log_info "  python client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}"
+    log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
 
-        ssh "${SSH_OPTS[@]}" \
-            -N -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
-            "${REMOTE_TARGET}"
-    fi
-}
-
-cmd_chat() {
-    validate_config
-    local CHAT_ARGS="$*"
-    if [[ -z "${CHAT_ARGS}" ]]; then
-        CHAT_ARGS="--user-id Phova"
-    fi
-    if ! remote_exec "curl -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
-        log_warn "Remote server is not running yet; starting 'serve' automatically..."
-        cmd_serve ${CHAT_ARGS}
-        return
-    fi
-    log_ok "Connecting to remote uTTT Personalization Server (${CHAT_ARGS})..."
-    ssh -tt "${SSH_OPTS[@]}" \
-        "${REMOTE_TARGET}" \
-        "cd '${REMOTE_DIR}' && '${REMOTE_DIR}/.venv/bin/python3' -u client_chat.py ${CHAT_ARGS} --ws-url ws://localhost:${REMOTE_SERVICE_PORT}"
+    ssh "${SSH_OPTS[@]}" \
+        -N -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
+        "${REMOTE_TARGET}"
 }
 
 # ------------------------------------------------------------------------------
@@ -489,9 +466,6 @@ case "${COMMAND}" in
         ;;
     serve)
         cmd_serve "$@"
-        ;;
-    chat)
-        cmd_chat "$@"
         ;;
     status)
         cmd_status "$@"

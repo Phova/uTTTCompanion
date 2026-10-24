@@ -454,6 +454,7 @@ class uTTTModel(nn.Module):
         start_pos: int = 0,
         update_fast_weights: bool = True,
         surprise_aux_weight: float = 0.10,
+        logits_to_keep: int = 0,
     ) -> uTTTModelOutput:
         """
         Forward pass through all uTTTBlocks with sequential cross-layer FastWeightState passing.
@@ -471,7 +472,7 @@ class uTTTModel(nn.Module):
         bsz, seq_len = input_ids.shape
         h = self.tok_embeddings(input_ids)
         if torch.is_autocast_enabled():
-            h = h.to(torch.get_autocast_gpu_dtype())
+            h = h.to(torch.get_autocast_dtype("cuda" if h.is_cuda else "cpu"))
 
         if fast_state is None:
             fast_state = self.init_fast_state(
@@ -516,19 +517,24 @@ class uTTTModel(nn.Module):
                 new_kv_caches.append(updated_kv)
 
             layer_surprise_tensors.append(s_loss)
-            if not self.training:
-                layer_surprise_floats.append(float(s_loss.detach().item()))
 
-        h = self.norm(h)
-
-        mean_surprise_loss = torch.stack(layer_surprise_tensors).mean()
-        if not self.training:
-            cur_fast_state.last_surprise_loss = float(mean_surprise_loss.detach().item())
+        stacked_surprises = torch.stack(layer_surprise_tensors)
+        mean_surprise_loss = stacked_surprises.mean()
+        if (not self.training and update_fast_weights) or not input_ids.is_cuda:
+            # Single vectorized GPU->CPU sync for all layers at the end of TTT update
+            layer_surprise_floats = [float(x) for x in stacked_surprises.detach().float().tolist()]
+            mean_val = sum(layer_surprise_floats) / max(len(layer_surprise_floats), 1)
+            cur_fast_state.last_surprise_loss = mean_val
+            if not self.training and update_fast_weights:
+                cur_fast_state.surprise_history = list(cur_fast_state.surprise_history[-(100 - len(layer_surprise_floats)):]) + layer_surprise_floats
+        else:
+            layer_surprise_floats = [0.0] * len(layer_surprise_tensors)
 
         ce_loss: Optional[torch.Tensor] = None
         total_loss: Optional[torch.Tensor] = None
 
         if labels is not None and self.training and bsz > 2:
+            h = self.norm(h)
             # Memory-efficient sliced LM-Head + Cross-Entropy (saves ~3.0 GiB Peak VRAM
             # and prevents CUDACachingAllocator page-unmap stalls at the 28GB boundary)
             h_shift = h[:, :-1, :]
@@ -551,6 +557,7 @@ class uTTTModel(nn.Module):
             total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
             logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)
         elif labels is not None:
+            h = self.norm(h)
             logits = self.lm_head(h)
             shift_labels = torch.full_like(labels, -100)
             shift_labels[:, :-1] = labels[:, 1:]
@@ -560,7 +567,15 @@ class uTTTModel(nn.Module):
                 ignore_index=-100,
             )
             total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
+        elif logits_to_keep < 0:
+            # Skip final norm and lm_head when logits are not needed (e.g. test_time_update)
+            logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)
+        elif logits_to_keep > 0 and seq_len > logits_to_keep:
+            # Project only the last `logits_to_keep` tokens (e.g. prefill last-token logits)
+            h_last = self.norm(h[:, -logits_to_keep:, :])
+            logits = self.lm_head(h_last)
         else:
+            h = self.norm(h)
             logits = self.lm_head(h)
 
         return uTTTModelOutput(
@@ -610,13 +625,14 @@ class uTTTModel(nn.Module):
         )
 
         try:
-            # Prefill prompt with frozen fast weights
+            # Prefill prompt with frozen fast weights (only compute last token's logits)
             prefill_out = self.forward(
                 input_ids=input_ids,
                 fast_state=fast_state,
                 kv_caches=None,
                 start_pos=0,
                 update_fast_weights=False,
+                logits_to_keep=1,
             )
             kv_caches = prefill_out.kv_caches
             next_token_logits = prefill_out.logits[:, -1, :]
@@ -785,9 +801,10 @@ class uTTTModel(nn.Module):
                 fast_state=cloned_input_state,
                 attention_mask=attention_mask,
                 update_fast_weights=True,
+                logits_to_keep=-1,
             )
             candidate_state = out.fast_state.detach()
-            mean_surprise = float(out.surprise_loss.detach().item())
+            mean_surprise = float(candidate_state.last_surprise_loss)
             return candidate_state, mean_surprise, out.layer_surprise_losses
         finally:
             if was_training:

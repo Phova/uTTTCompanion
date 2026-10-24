@@ -74,11 +74,17 @@ class DualTrackCheckpointManager:
         else:
             self.dtype = dtype
 
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+
         self.max_gpu_users = max(1, int(max_gpu_users))
         self.max_cpu_users = max(1, int(max_cpu_users))
 
         # Thread-safe LRU caches mapping user_id -> FastWeightState
         self._lock = threading.RLock()
+        self._disk_lock = threading.Lock()
         self._gpu_lru: OrderedDict[str, FastWeightState] = OrderedDict()
         self._cpu_lru: OrderedDict[str, FastWeightState] = OrderedDict()
         self._user_metadata: Dict[str, Dict[str, Any]] = {}
@@ -294,14 +300,41 @@ class DualTrackCheckpointManager:
             meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
             if auto_save:
-                return self._save_state_to_disk(safe_uid, gpu_state)
+                primary_path, _ = self.get_persona_paths(safe_uid)
+                # Write synchronously on first creation; offload subsequent turn saves to background thread
+                async_save = primary_path.exists()
+                return self._save_state_to_disk(safe_uid, gpu_state, async_write=async_save)
             return None
 
-    def _save_state_to_disk(self, user_id: str, state: FastWeightState) -> Path:
+    def _write_payload_files(self, primary_path: Path, alias_path: Path, payload: Dict[str, Any]) -> None:
+        """Thread-safe atomic disk writer with hardlink alias optimization."""
+        with self._disk_lock:
+            tmp_path = primary_path.with_suffix(".tmp.pt")
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, primary_path)
+
+            # Synchronize `{user_id}.pt` via zero-copy hardlink (fallback to copy2 if cross-device)
+            try:
+                if alias_path.exists() or alias_path.is_symlink():
+                    alias_path.unlink()
+                os.link(primary_path, alias_path)
+            except Exception:
+                try:
+                    shutil.copy2(primary_path, alias_path)
+                except Exception:
+                    pass
+
+    def _save_state_to_disk(
+        self, user_id: str, state: FastWeightState, async_write: bool = False
+    ) -> Path:
         """Internal atomic writer for `personas/{user_id}_state.pt` and `{user_id}.pt`."""
         safe_uid = _sanitize_id(user_id)
         primary_path, alias_path = self.get_persona_paths(safe_uid)
         drift_info = self.model.fast_weight_pool.compute_drift(state)
+
+        meta = self._user_metadata.setdefault(safe_uid, {"user_id": safe_uid})
+        meta["_cached_drift"] = dict(drift_info)
+        meta["_cached_drift_step"] = state.step
 
         payload = {
             "checkpoint_type": "uTTT_User_Persona_State",
@@ -310,18 +343,17 @@ class DualTrackCheckpointManager:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "fast_state": state.to_state_dict(),
             "drift_metrics": drift_info,
-            "metadata": self._user_metadata.get(safe_uid, {"user_id": safe_uid}),
+            "metadata": {k: v for k, v in meta.items() if not k.startswith("_")},
         }
 
-        tmp_path = primary_path.with_suffix(".tmp.pt")
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, primary_path)
-
-        # Keep `{user_id}.pt` synchronized so both naming conventions work seamlessly
-        try:
-            shutil.copy2(primary_path, alias_path)
-        except Exception:
-            pass
+        if async_write:
+            threading.Thread(
+                target=self._write_payload_files,
+                args=(primary_path, alias_path, payload),
+                daemon=True,
+            ).start()
+        else:
+            self._write_payload_files(primary_path, alias_path, payload)
 
         return primary_path
 
@@ -400,11 +432,19 @@ class DualTrackCheckpointManager:
         """
         Compute Frobenius norm drift ||W_user - W_0||_F and relative percentage (`/diff`).
         """
+        safe_uid = _sanitize_id(user_id)
         with self._lock:
-            state = self.get_user_state(user_id)
-            drift = self.model.fast_weight_pool.compute_drift(state)
-            primary_path, _ = self.get_persona_paths(user_id)
-            drift["user_id"] = _sanitize_id(user_id)
+            state = self.get_user_state(safe_uid)
+            meta = self._user_metadata.get(safe_uid, {})
+            if meta.get("_cached_drift_step") == state.step and "_cached_drift" in meta:
+                drift = dict(meta["_cached_drift"])
+                drift["last_surprise_loss"] = state.last_surprise_loss
+            else:
+                drift = self.model.fast_weight_pool.compute_drift(state)
+                meta["_cached_drift"] = dict(drift)
+                meta["_cached_drift_step"] = state.step
+            primary_path, _ = self.get_persona_paths(safe_uid)
+            drift["user_id"] = safe_uid
             drift["persona_file"] = str(primary_path)
             drift["file_exists"] = primary_path.exists()
             return drift

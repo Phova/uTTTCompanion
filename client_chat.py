@@ -151,6 +151,8 @@ def run_local_session(
         temperature=temperature,
         lightweight_fallback=lightweight,
     )
+    if not lightweight:
+        personalizer.warmup(compile_kernels=True)
     init_drift = personalizer.ckpt_manager.compute_user_drift(user_id)
     print(
         f"[Local Session Ready] User: {user_id} | "

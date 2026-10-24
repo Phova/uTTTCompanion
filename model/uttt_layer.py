@@ -604,12 +604,10 @@ class SharedFastWeightPool(nn.Module):
         state = state.ensure_batch_size(bsz)
 
         if not update_fast_weights:
-            # Frozen fast-weight inference mode (used during token streaming generation)
-            with torch.no_grad():
-                v_pred = self.forward_readout(k_chunk, state)
-                scale = float(self.d_model) if self.normalize_loss_by_dim else 1.0
-                surprise_loss = 0.5 * (v_pred.float() - v_chunk.float()).pow(2).sum(dim=-1).mean() / scale
+            # Frozen fast-weight inference mode (used during token streaming generation):
+            # Only read out f_{W_t}(q_chunk); skip redundant k_chunk readout & syncs
             out = self.forward_readout(q_chunk, state)
+            surprise_loss = q_chunk.new_zeros((), dtype=torch.float32)
             return out, state, surprise_loss
 
         out_chunk, w_up_new, w_gate_new, w_down_new, s_up_new, s_gate_new, s_down_new, surprise_loss = (
@@ -635,14 +633,7 @@ class SharedFastWeightPool(nn.Module):
             )
         )
 
-        # Avoid synchronous GPU->CPU .item() stall inside the inner loop during training
-        if not torch.is_grad_enabled():
-            loss_val = float(surprise_loss.detach().item())
-            new_history = list(state.surprise_history[-99:]) + [loss_val]
-        else:
-            loss_val = state.last_surprise_loss
-            new_history = state.surprise_history
-
+        # Defer scalar GPU->CPU transfer to uTTTModel.forward end-of-forward vector sync
         new_state = FastWeightState(
             w_up=w_up_new,
             w_gate=w_gate_new,
@@ -653,8 +644,8 @@ class SharedFastWeightPool(nn.Module):
             ln_weight=state.ln_weight,
             ln_bias=state.ln_bias,
             step=state.step + 1,
-            last_surprise_loss=loss_val,
-            surprise_history=new_history,
+            last_surprise_loss=state.last_surprise_loss,
+            surprise_history=state.surprise_history,
         )
         return out_chunk, new_state, surprise_loss
 
@@ -730,13 +721,18 @@ class SharedFastWeightPool(nn.Module):
         w_gate_0 = self.w_gate_init.detach().to(device=dev).float().unsqueeze(0)
         w_down_0 = self.w_down_init.detach().to(device=dev).float().unsqueeze(0)
 
-        d_up = (state.w_up.float() - w_up_0).norm(p="fro").item()
-        d_gate = (state.w_gate.float() - w_gate_0).norm(p="fro").item()
-        d_down = (state.w_down.float() - w_down_0).norm(p="fro").item()
-
-        b_up = w_up_0.norm(p="fro").item()
-        b_gate = w_gate_0.norm(p="fro").item()
-        b_down = w_down_0.norm(p="fro").item()
+        # Single vectorized GPU->CPU sync instead of 6 separate .item() calls
+        norms = torch.stack(
+            [
+                (state.w_up.float() - w_up_0).norm(p="fro"),
+                (state.w_gate.float() - w_gate_0).norm(p="fro"),
+                (state.w_down.float() - w_down_0).norm(p="fro"),
+                w_up_0.norm(p="fro"),
+                w_gate_0.norm(p="fro"),
+                w_down_0.norm(p="fro"),
+            ]
+        ).tolist()
+        d_up, d_gate, d_down, b_up, b_gate, b_down = [float(x) for x in norms]
 
         total_drift = math.sqrt(d_up ** 2 + d_gate ** 2 + d_down ** 2)
         total_base = math.sqrt(b_up ** 2 + b_gate ** 2 + b_down ** 2) + 1e-8
@@ -981,6 +977,24 @@ class SlidingWindowAttention(nn.Module):
 # 5. Layer-Specific Slow-Weight uTTT Projection Layer & uTTTBlock
 # ==============================================================================
 
+def fused_fast_q_proj(
+    x: torch.Tensor,
+    wq_w: torch.Tensor,
+    q_norm_w: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Fast query-only projection + RMSNorm for frozen fast-weight inference (`update_fast_weights=False`),
+    skipping unused K, V, eta, and alpha projections during Step 1 token streaming.
+    """
+    dim = x.shape[-1]
+    q_raw = F.linear(x, wq_w)
+    if hasattr(F, "rms_norm"):
+        return F.rms_norm(q_raw, (dim,), q_norm_w.to(q_raw.dtype), eps)
+    q_fp32 = q_raw.float()
+    return (q_norm_w.float() * q_fp32 * torch.rsqrt(q_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+
+
 def fused_slow_projections(
     x: torch.Tensor,
     wq_w: torch.Tensor,
@@ -1081,6 +1095,19 @@ class uTTTLayer(nn.Module):
         """
         bsz, seq_len, dim = x.shape
 
+        # Fast path when fast weights are frozen (e.g. token generation Step 1):
+        # Compute only Q projection + single Fast-Weight readout (2x faster per token)
+        if not update_fast_weights:
+            q = fused_fast_q_proj(
+                x=x,
+                wq_w=self.w_q.weight,
+                q_norm_w=self.q_norm.weight,
+                eps=self.q_norm.eps,
+            )
+            readout = fast_pool.forward_readout(q, fast_state.ensure_batch_size(bsz))
+            surprise_loss = x.new_zeros((), dtype=torch.float32)
+            return self.w_o(readout), fast_state, surprise_loss
+
         # Compiled Slow-Weight Projections + Fused RMSNorm + Gate Sigmoids
         q, k, v, eta, alpha = fused_slow_projections(
             x=x,
@@ -1097,20 +1124,6 @@ class uTTTLayer(nn.Module):
             base_weight_decay=self.base_weight_decay,
             eps=self.q_norm.eps,
         )
-
-        # Fast path when fast weights are frozen (e.g. token generation Step 1)
-        if not update_fast_weights:
-            readout, fast_state, surprise_loss = fast_pool.chunk_step(
-                state=fast_state,
-                q_chunk=q,
-                k_chunk=k,
-                v_chunk=v,
-                eta_chunk=eta,
-                alpha_chunk=alpha,
-                token_mask=attention_mask,
-                update_fast_weights=False,
-            )
-            return self.w_o(readout), fast_state, surprise_loss
 
         # Chunk-wise Parallel TTT Update across the sequence
         chunk_outputs: List[torch.Tensor] = []

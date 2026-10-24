@@ -236,16 +236,46 @@ python client_chat.py --local --lightweight --demo
 
 ---
 
-### 4.5 个性化推理服务端与 HTTP / WebSocket 接口集 (`server/app.py`)
+### 4.5 个性化推理服务端与 HTTP / WebSocket 接口集 (`server/app.py` & `serve [额外参数]`)
 
-#### A. 直接启动服务端指令
+#### A. 服务端启动参数说明（适用于 `./deploy/remote_ctl.sh serve [额外参数]` 与 `python -m server.app`）
+
+`./deploy/remote_ctl.sh serve` 会将所有额外参数透传给远端 `python -m server.app`，启动后台 `tmux` 会话 `uttt_serve`（自动完成 RTX 5090 `torch.compile` 算子融合与预热），并在前台建立本地 `localhost:8000 -> 远端:8000` 的 SSH 隧道：
+
+| 参数 | 类型 / 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `--user-id` | `str` (`""`) | 启动服务端时预先将指定用户的快权重状态 `personas/{user_id}_state.pt` 预热加载至 GPU 一级 LRU 显存池 |
+| `--config` | `str` (`configs/5090_config.yaml`) | 指定服务端读取的 YAML 配置文件路径 |
+| `--base-ckpt` | `str` (`checkpoints/base_uttt.pt`) | 指定共享慢权重与元初始快权重 $\mathcal{W}_0$ 的 Base Checkpoint 路径 |
+| `--personas-dir` | `str` (`personas`) | 指定多租户个性化快权重持久化目录 |
+| `--max-gpu-users` | `int` (`16`) | 覆盖 GPU 显存一级 LRU 活跃用户池最大并发容量 |
+| `--max-new-tokens` | `int` (`96`) | 覆盖服务端默认单轮最大生成 Token 数 |
+| `--temperature` | `float` (`0.7`) | 覆盖服务端默认采样温度 |
+| `--surprise-threshold` | `float` (`0.015`) | 覆盖 Stability Guard 的惊奇度门控阈值 $\tau$（仅当 `Surprise Loss > τ` 时更新快权重） |
+| `--no-compile` | `flag` (`False`) | 禁用服务端启动时的 `torch.compile(dynamic=True)` 算子融合（默认在 CUDA 上自动开启并预热） |
+| `--lightweight` | `flag` (`False`) | 当无 Base Checkpoint 冷启动时使用轻量级回退模型配置 |
+| `--host` | `str` (`0.0.0.0`) | 服务端监听地址（`remote_ctl.sh serve` 默认传入 `0.0.0.0`） |
+| `--port` | `int` (`8000`) | 服务端监听端口（`remote_ctl.sh serve` 默认传入 `REMOTE_SERVICE_PORT`） |
+
+**常用服务端启动与连接示例**：
 ```bash
+# 1. 一键在远端 5090 启动推理服务（预热用户 Phova 的快权重与 Triton 算子）并建立本地 8000 端口 SSH 隧道
+./deploy/remote_ctl.sh serve --user-id Phova
+
+# 2. 自定义驚奇度门控阈值与单轮生成长度启动远端服务
+./deploy/remote_ctl.sh serve --user-id Phova --surprise-threshold 0.015 --max-new-tokens 128
+
+# 3. 保持上述隧道终端运行，另开一个本地终端启动交互式对话客户端
+python client_chat.py --user-id Phova --ws-url ws://localhost:8000
+
+# 4. 在服务器本地直接启动 FastAPI 服务端
 python -m server.app \
   --host 0.0.0.0 \
   --port 8000 \
   --config configs/5090_config.yaml \
   --base-ckpt checkpoints/base_uttt.pt \
-  --personas-dir personas
+  --personas-dir personas \
+  --user-id Phova
 ```
 
 #### B. REST API 与 WebSocket 接口列表
