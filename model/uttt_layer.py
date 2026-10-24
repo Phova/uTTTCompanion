@@ -513,15 +513,18 @@ class SharedFastWeightPool(nn.Module):
         )
 
         # 2. Max Inner-Loop Gradient Frobenius Norm Clipping per batch element
+        # Compute clipping coefficient under no_grad using fused vector_norm to avoid
+        # allocating 3x 88MB FP32 tensors per chunk and storing them in the autograd graph.
         if self.max_inner_grad_norm is not None and self.max_inner_grad_norm > 0.0:
-            norm_sq = (
-                grad_up.float().pow(2).sum(dim=(1, 2))
-                + grad_gate.float().pow(2).sum(dim=(1, 2))
-                + grad_down.float().pow(2).sum(dim=(1, 2))
-            )
-            grad_norm = torch.sqrt(norm_sq + 1e-8)              # (B,)
-            clip_coef = torch.clamp(self.max_inner_grad_norm / grad_norm, max=1.0)
-            clip_view = clip_coef.to(grad_up.dtype).view(bsz, 1, 1)
+            with torch.no_grad():
+                norm_up = torch.linalg.vector_norm(grad_up, dim=(1, 2), dtype=torch.float32)
+                norm_gate = torch.linalg.vector_norm(grad_gate, dim=(1, 2), dtype=torch.float32)
+                norm_down = torch.linalg.vector_norm(grad_down, dim=(1, 2), dtype=torch.float32)
+                grad_norm = torch.sqrt(
+                    norm_up.square() + norm_gate.square() + norm_down.square() + 1e-8
+                )
+                clip_coef = torch.clamp(self.max_inner_grad_norm / grad_norm, max=1.0)
+                clip_view = clip_coef.to(grad_up.dtype).view(bsz, 1, 1)
             grad_up = grad_up * clip_view
             grad_gate = grad_gate * clip_view
             grad_down = grad_down * clip_view
