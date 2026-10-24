@@ -340,7 +340,7 @@ cmd_status() {
     local MODE="${1:-stream}"
     if [[ "${MODE}" == "--once" || "${MODE}" == "once" ]]; then
         log_info "Querying remote RTX 5090 status snapshot on ${REMOTE_TARGET}..."
-        remote_exec "bash -c \"
+        remote_exec "
             echo '=== [GPU Status] ===';
             nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv;
             echo '';
@@ -352,34 +352,32 @@ cmd_status() {
             ls -lh '${REMOTE_DIR}/personas' 2>/dev/null || true;
             echo '';
             echo '=== [Latest Training Progress] ===';
-            tail -n 5 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || true;
-        \""
+            tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || true;
+        "
     else
         log_info "Streaming real-time RTX 5090 status from ${REMOTE_TARGET} (Refresh: 1s | Press Ctrl+C to exit)..."
-        remote_exec "bash -c \"
+        remote_exec "
             while true; do
-                OUT=\\\$(
-                    echo '================================================================================';
-                    echo \\\"[uTTT-Remote Live Monitor] Host: \\\$(hostname) | Time: \\\$(date '+%Y-%m-%d %H:%M:%S')\\\";
-                    echo '================================================================================';
-                    echo '=== [GPU Real-Time Telemetry (RTX 5090)] ===';
-                    nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv;
-                    echo '';
-                    echo '=== [Active tmux Sessions] ===';
-                    tmux ls 2>/dev/null || echo 'No active tmux sessions.';
-                    echo '';
-                    echo '=== [Checkpoints & Personas] ===';
-                    ls -lh '${REMOTE_DIR}/checkpoints' 2>/dev/null || true;
-                    echo '';
-                    echo '=== [Latest Training Log (tail -n 6)] ===';
-                    tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || echo 'No training log yet.';
-                    echo '--------------------------------------------------------------------------------';
-                    echo 'Press Ctrl+C to stop live status stream (remote tasks continue in background).'
-                );
-                printf '\033[2J\033[H%s\n' \\\"\\\$OUT\\\";
+                printf '\033[2J\033[H';
+                echo '================================================================================';
+                echo -n '[uTTT-Remote Live Monitor] '; date '+%Y-%m-%d %H:%M:%S';
+                echo '================================================================================';
+                echo '=== [GPU Real-Time Telemetry - RTX 5090] ===';
+                nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv;
+                echo '';
+                echo '=== [Active tmux Sessions] ===';
+                tmux ls 2>/dev/null || echo 'No active tmux sessions.';
+                echo '';
+                echo '=== [Checkpoints & Personas] ===';
+                ls -lh '${REMOTE_DIR}/checkpoints' 2>/dev/null || true;
+                echo '';
+                echo '=== [Latest Training Log] ===';
+                tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || echo 'No training log yet.';
+                echo '--------------------------------------------------------------------------------';
+                echo 'Press Ctrl+C to stop live status stream.';
                 sleep 1;
             done
-        \""
+        "
     fi
 }
 
