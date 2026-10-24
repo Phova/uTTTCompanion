@@ -34,7 +34,7 @@ uttt:
   momentum_beta: 0.90                  # Inner-loop momentum factor (beta)
   max_inner_grad_norm: 1.0             # Max Frobenius norm clipping for inner-loop grads
   normalize_loss_by_dim: true          # Normalize L = 1/(2D) ||f_W(k) - v||_2^2 to O(1) scale
-  surprise_threshold: 0.25             # Gate threshold (tau): skip update if loss <= tau
+  surprise_threshold: 0.015            # Gate threshold (tau) calibrated for 1/(2D)-normalized Surprise Loss (~0.025-0.08)
   elastic_anchor_lambda: 0.02          # Slow-anchor elastic pull (lambda) toward W_0
   max_weight_drift_ratio: 0.35         # Safety ceiling on ||W_user - W_0||_F / ||W_0||_F
 

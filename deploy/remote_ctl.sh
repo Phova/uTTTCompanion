@@ -284,11 +284,21 @@ cmd_pull_ckpt() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. Subcommand: serve (Start Remote FastAPI+WS Service & SSH Tunnel to :8000)
+# 7. Subcommand: serve & chat (Start Remote FastAPI+WS Service & Interactive CLI)
 # ------------------------------------------------------------------------------
 cmd_serve() {
     validate_config
     cmd_sync
+
+    local CHAT_USER_ID=""
+    local ARGS=("$@")
+    for (( i=0; i<${#ARGS[@]}; i++ )); do
+        if [[ "${ARGS[$i]}" == "--user-id" && $((i+1)) -lt ${#ARGS[@]} ]]; then
+            CHAT_USER_ID="${ARGS[$((i+1))]}"
+        elif [[ "${ARGS[$i]}" == --user-id=* ]]; then
+            CHAT_USER_ID="${ARGS[$i]#--user-id=}"
+        fi
+    done
 
     EXTRA_SERVE_ARGS="$*"
     SERVE_LOG="${REMOTE_DIR}/logs/serve_5090.log"
@@ -315,21 +325,54 @@ cmd_serve() {
     \""
 
     log_info "Waiting for remote FastAPI server on port ${REMOTE_SERVICE_PORT} to become ready..."
+    local READY=0
     for _ in {1..30}; do
         if remote_exec "curl -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
             log_ok "Remote uTTT Personalization Server is healthy!"
+            READY=1
             break
         fi
         sleep 1
     done
 
-    log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
-    log_info "In another terminal, start chatting with: python client_chat.py --user-id alex --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}"
-    log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
+    if [[ "${READY}" -eq 0 ]]; then
+        log_error "Server did not become ready within 30s. Check logs:"
+        remote_exec "cat '${SERVE_LOG}' 2>/dev/null || true"
+        exit 1
+    fi
 
-    ssh "${SSH_OPTS[@]}" \
-        -N -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
-        "${REMOTE_TARGET}"
+    if [[ -n "${CHAT_USER_ID}" ]]; then
+        log_ok "Launching Interactive Personalization Chat for user_id='${CHAT_USER_ID}' (Tunnel localhost:${LOCAL_TUNNEL_PORT} -> :${REMOTE_SERVICE_PORT} active)..."
+        ssh -tt "${SSH_OPTS[@]}" \
+            -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
+            "${REMOTE_TARGET}" \
+            "cd '${REMOTE_DIR}' && '${REMOTE_DIR}/.venv/bin/python3' -u client_chat.py --user-id '${CHAT_USER_ID}' --ws-url ws://localhost:${REMOTE_SERVICE_PORT}"
+    else
+        log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
+        log_info "In another terminal, start chatting with: ./deploy/remote_ctl.sh chat --user-id Phova"
+        log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
+
+        ssh "${SSH_OPTS[@]}" \
+            -N -L "${LOCAL_TUNNEL_PORT}:localhost:${REMOTE_SERVICE_PORT}" \
+            "${REMOTE_TARGET}"
+    fi
+}
+
+cmd_chat() {
+    validate_config
+    local CHAT_ARGS="$*"
+    if [[ -z "${CHAT_ARGS}" ]]; then
+        CHAT_ARGS="--user-id Phova"
+    fi
+    if ! remote_exec "curl -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
+        log_warn "Remote server is not running yet; starting 'serve' automatically..."
+        cmd_serve ${CHAT_ARGS}
+        return
+    fi
+    log_ok "Connecting to remote uTTT Personalization Server (${CHAT_ARGS})..."
+    ssh -tt "${SSH_OPTS[@]}" \
+        "${REMOTE_TARGET}" \
+        "cd '${REMOTE_DIR}' && '${REMOTE_DIR}/.venv/bin/python3' -u client_chat.py ${CHAT_ARGS} --ws-url ws://localhost:${REMOTE_SERVICE_PORT}"
 }
 
 # ------------------------------------------------------------------------------
@@ -446,6 +489,9 @@ case "${COMMAND}" in
         ;;
     serve)
         cmd_serve "$@"
+        ;;
+    chat)
+        cmd_chat "$@"
         ;;
     status)
         cmd_status "$@"

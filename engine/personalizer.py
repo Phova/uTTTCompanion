@@ -74,8 +74,9 @@ def format_ttt_status_bar(
     else:
         save_label = "In-Memory Updated"
 
+    loss_str = f"{surprise_loss:.4f}" if 0.0 < surprise_loss < 0.1 else f"{surprise_loss:.2f}"
     return (
-        f"[TTT Status] Surprise Loss: {surprise_loss:.2f} | "
+        f"[TTT Status] Surprise Loss: {loss_str} | "
         f"Weight Drift from Base: {weight_drift_pct:.2f}% | {save_label}"
     )
 
@@ -116,12 +117,15 @@ class uTTTPersonalizer:
         self.dtype = self.ckpt_manager.dtype
         self.tokenizer = SimpleUTF8Tokenizer(vocab_size=self.config.vocab_size)
 
-        # Stability Guard hyperparameters
-        self.surprise_threshold = (
+        # Stability Guard hyperparameters (auto-calibrate when normalize_loss_by_dim=True)
+        raw_thresh = (
             float(surprise_threshold)
             if surprise_threshold is not None
             else float(self.config.surprise_threshold)
         )
+        if surprise_threshold is None and self.config.normalize_loss_by_dim and raw_thresh >= 0.15:
+            raw_thresh = 0.015
+        self.surprise_threshold = raw_thresh
         self.elastic_anchor_lambda = (
             float(elastic_anchor_lambda)
             if elastic_anchor_lambda is not None
@@ -290,6 +294,7 @@ class uTTTPersonalizer:
         # Step 1 (Forward): Freeze Fast Weights & Stream-Generate Reply Tokens
         # ======================================================================
         generated_ids: List[int] = []
+        emitted_len = 0
         autocast_dev = "cuda" if self.device.type == "cuda" else "cpu"
 
         with torch.amp.autocast(autocast_dev, dtype=self.dtype):
@@ -302,11 +307,17 @@ class uTTTPersonalizer:
                 eos_token_id=self.tokenizer.EOS_ID,
             ):
                 generated_ids.append(tok_id)
-                piece = self.tokenizer.decode([tok_id], skip_special_tokens=True)
-                if piece:
+                decoded_so_far = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                # Hold back trailing incomplete UTF-8 multi-byte character (\ufffd) until next byte arrives
+                clean_so_far = decoded_so_far.rstrip("\ufffd")
+                if len(clean_so_far) > emitted_len:
+                    piece = clean_so_far[emitted_len:]
+                    emitted_len = len(clean_so_far)
                     yield {"type": "token", "content": piece}
 
-        reply_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        reply_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).replace("\ufffd", "").strip()
+        if len(reply_text) > emitted_len:
+            yield {"type": "token", "content": reply_text[emitted_len:]}
         if not reply_text:
             reply_text = "[Acknowledged]"
             yield {"type": "token", "content": reply_text}

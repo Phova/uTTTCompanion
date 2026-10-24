@@ -113,6 +113,10 @@ def get_personalizer() -> uTTTPersonalizer:
 async def lifespan(app: FastAPI):
     # Initialize shared Slow Weights & LRU Fast-Weight Pool on startup
     engine = get_personalizer()
+    prewarm_user = os.environ.get("UTTT_DEFAULT_USER", "").strip()
+    if prewarm_user:
+        engine.ckpt_manager.get_user_state(prewarm_user)
+        print(f"[Server] Pre-warmed persona state for user_id='{prewarm_user}' in GPU VRAM.")
     print(f"[Server] uTTT Personalization Engine online | Pool: {engine.ckpt_manager.pool_status()}")
     yield
     print("[Server] Shutting down uTTT Personalization Server...")
@@ -281,12 +285,15 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/5090_config.yaml")
     parser.add_argument("--base-ckpt", type=str, default="checkpoints/base_uttt.pt")
     parser.add_argument("--personas-dir", type=str, default="personas")
+    parser.add_argument("--user-id", type=str, default="", help="Optional default user ID to pre-warm in GPU VRAM.")
     parser.add_argument("--lightweight", action="store_true")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     os.environ["UTTT_CONFIG"] = args.config
     os.environ["UTTT_BASE_CKPT"] = args.base_ckpt
     os.environ["UTTT_PERSONAS_DIR"] = args.personas_dir
+    if args.user_id:
+        os.environ["UTTT_DEFAULT_USER"] = args.user_id
     if args.lightweight:
         os.environ["UTTT_LIGHTWEIGHT"] = "1"
 
