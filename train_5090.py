@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +36,8 @@ from torch.utils.data import DataLoader, Dataset
 
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
+
+_ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
 
 
 # ==============================================================================
@@ -148,15 +151,15 @@ class PersonaMetaDataset(Dataset):
             )
             # Multi-Dialogue Sequence Packing: pack consecutive short dialogues to eliminate PAD waste
             if self.pack_sequences and len(token_ids) < self.seq_len and n_ext > 1:
-                pack_Step = 1
-                while len(token_ids) < self.seq_len and pack_Step <= 6:
-                    next_text = self.external_texts[(idx + pack_Step * 131) % n_ext]
+                pack_step = 1
+                while len(token_ids) < self.seq_len and pack_step <= 16:
+                    next_text = self.external_texts[(idx + pack_step * 131) % n_ext]
                     remain = self.seq_len - len(token_ids)
                     more_ids = self.tokenizer.encode(
                         next_text, add_bos=True, add_eos=True, max_length=remain
                     )
                     token_ids.extend(more_ids)
-                    pack_Step += 1
+                    pack_step += 1
         else:
             text = self._synthesize_dialogue(idx)
             token_ids = self.tokenizer.encode(
@@ -223,10 +226,11 @@ def maybe_compile_inner_loop(
     hw_cfg: Dict[str, Any],
     device: torch.device,
     gradient_checkpointing: bool = True,
+    model: Optional[uTTTModel] = None,
 ) -> None:
     """
-    Compile the analytical chunk-wise SwiGLU gradient kernel using `torch.compile`
-    for fused Tensor Core execution on RTX 5090.
+    Compile the analytical chunk-wise SwiGLU gradient kernel and full `uTTTBlock`
+    layers using `torch.compile` for fused Tensor Core execution on RTX 5090.
     Automatically checks Triton availability and avoids CUDAGraph mode ('reduce-overhead')
     when Gradient Checkpointing is active.
     """
@@ -248,30 +252,44 @@ def maybe_compile_inner_loop(
         compile_mode = "default"
 
     try:
-        uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
-            uttt_layer_mod.fused_chunk_ttt_step,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        uttt_layer_mod.fused_slow_projections = torch.compile(
-            uttt_layer_mod.fused_slow_projections,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        uttt_layer_mod.swiglu_fast_forward = torch.compile(
-            uttt_layer_mod.swiglu_fast_forward,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        uttt_layer_mod.apply_rope = torch.compile(
-            uttt_layer_mod.apply_rope,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        print(
-            f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
-            "fused_slow_projections, swiglu_fast_forward & apply_rope."
-        )
+        if model is not None:
+            # Compile each uTTTBlock.forward in-place (preserving clean state_dict parameter names)
+            # so SWA (FlexAttention) + Slow Projections + Chunk Scan + WO fuse into 1 graph per block.
+            for blk in model.layers:
+                blk.forward = torch.compile(  # type: ignore[method-assign]
+                    blk.forward,
+                    mode=compile_mode,
+                    fullgraph=False,
+                )
+            print(
+                f"[Compiler] Enabled whole-block torch.compile (mode='{compile_mode}') across "
+                f"all {len(model.layers)} uTTTBlocks + FlexAttention SWA."
+            )
+        else:
+            uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
+                uttt_layer_mod.fused_chunk_ttt_step,
+                mode=compile_mode,
+                fullgraph=False,
+            )
+            uttt_layer_mod.fused_slow_projections = torch.compile(
+                uttt_layer_mod.fused_slow_projections,
+                mode=compile_mode,
+                fullgraph=False,
+            )
+            uttt_layer_mod.swiglu_fast_forward = torch.compile(
+                uttt_layer_mod.swiglu_fast_forward,
+                mode=compile_mode,
+                fullgraph=False,
+            )
+            uttt_layer_mod.apply_rope = torch.compile(
+                uttt_layer_mod.apply_rope,
+                mode=compile_mode,
+                fullgraph=False,
+            )
+            print(
+                f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
+                "fused_slow_projections, swiglu_fast_forward & apply_rope."
+            )
     except Exception as exc:
         print(f"[Compiler] torch.compile fallback to eager mode: {exc}")
 
@@ -280,6 +298,19 @@ def maybe_compile_inner_loop(
 # 3. Base Checkpoint Export (`checkpoints/base_uttt.pt`)
 # ==============================================================================
 
+def _cpu_copy_nested(obj: Any) -> Any:
+    """Recursively copy tensors in optimizer state_dict to CPU memory for background saving."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _cpu_copy_nested(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cpu_copy_nested(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_cpu_copy_nested(v) for v in obj)
+    return obj
+
+
 def export_base_checkpoint(
     model: uTTTModel,
     optimizer: Optional[torch.optim.Optimizer],
@@ -287,6 +318,7 @@ def export_base_checkpoint(
     save_path: str | Path,
     step: int,
     metrics: Dict[str, Any],
+    async_save: bool = False,
 ) -> Path:
     """
     Export the dual-track Base Checkpoint (`checkpoints/base_uttt.pt`).
@@ -298,6 +330,10 @@ def export_base_checkpoint(
         - `optimizer_state`:   Outer-loop AdamW state (optional for resuming training)
         - `step` & `metrics`:  Training provenance metadata
     """
+    global _ACTIVE_SAVE_THREAD
+    if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
+        _ACTIVE_SAVE_THREAD.join()
+
     out_path = Path(save_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -312,13 +348,20 @@ def export_base_checkpoint(
         "metrics": metrics,
     }
     if optimizer is not None:
-        payload["optimizer_state"] = optimizer.state_dict()
+        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
 
-    tmp_path = out_path.with_suffix(".tmp.pt")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, out_path)
-    size_mb = out_path.stat().st_size / (1024 * 1024)
-    print(f"[Checkpoint] Saved Base Checkpoint -> {out_path} ({size_mb:.2f} MB)")
+    def _write_to_disk() -> None:
+        tmp_path = out_path.with_suffix(".tmp.pt")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, out_path)
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        print(f"[Checkpoint] Saved Base Checkpoint -> {out_path} ({size_mb:.2f} MB)", flush=True)
+
+    if async_save:
+        _ACTIVE_SAVE_THREAD = threading.Thread(target=_write_to_disk, daemon=False)
+        _ACTIVE_SAVE_THREAD.start()
+    else:
+        _write_to_disk()
     return out_path
 
 
@@ -373,9 +416,6 @@ def train(
         torch.cuda.manual_seed_all(seed)
 
     device, amp_dtype = configure_rtx5090_environment(hw_cfg)
-    maybe_compile_inner_loop(
-        hw_cfg, device, gradient_checkpointing=model_cfg.gradient_checkpointing
-    )
 
     # Instantiate uTTT Model
     model = uTTTModel(model_cfg).to(device=device)
@@ -442,6 +482,7 @@ def train(
             pin_memory=(device.type == "cuda"),
             num_workers=2 if use_workers else 0,
             persistent_workers=use_workers,
+            prefetch_factor=4 if use_workers else None,
         )
 
     loader = _build_loader(micro_batch_size)
@@ -478,6 +519,14 @@ def train(
         except Exception as exc:
             print(f"[Resume] Could not resume from {ckpt_file} ({exc}); starting fresh.", flush=True)
 
+    # Compile full uTTTBlocks after weights are loaded so state_dict keys remain clean
+    maybe_compile_inner_loop(
+        hw_cfg,
+        device,
+        gradient_checkpointing=model_cfg.gradient_checkpointing,
+        model=model,
+    )
+
     model.train()
     autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
 
@@ -494,9 +543,9 @@ def train(
             flush=True,
         )
 
-    running_loss = 0.0
-    running_ce = 0.0
-    running_surprise = 0.0
+    running_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
+    running_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
+    running_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
     steps_since_log = 0
     t_start = time.perf_counter()
 
@@ -510,13 +559,14 @@ def train(
         optimizer.zero_grad(set_to_none=True)
 
         # Runtime Elastic OOM Self-Healing Guard:
-        # If any step exceeds VRAM, automatically halve micro_batch_size, double grad_accum_steps,
-        # enable 2-level hierarchical chunk checkpointing, and retry the step without crashing.
+        # If any step exceeds VRAM, automatically enable Layer Checkpointing (Stage 1),
+        # halve micro_batch_size (Stage 2), or enable 2-level Chunk Checkpointing (Stage 3).
         while True:
             try:
                 step_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
                 step_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
                 step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
+                inv_accum = 1.0 / float(grad_accum_steps)
 
                 for _ in range(grad_accum_steps):
                     try:
@@ -527,7 +577,12 @@ def train(
 
                     input_ids = batch["input_ids"].to(device, non_blocking=True)
                     labels = batch["labels"].to(device, non_blocking=True)
-                    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                    # Elide all-ones attention_mask transfer & reduction when sequences are packed
+                    attention_mask = (
+                        None
+                        if pack_sequences
+                        else batch["attention_mask"].to(device, non_blocking=True)
+                    )
 
                     # Native BF16 mixed precision forward + analytical inner-loop TTT update
                     with torch.amp.autocast(autocast_device_type, dtype=amp_dtype):
@@ -539,13 +594,13 @@ def train(
                             update_fast_weights=True,
                             surprise_aux_weight=surprise_aux_weight,
                         )
-                        scaled_loss = out.loss / float(grad_accum_steps)
+                        scaled_loss = out.loss * inv_accum
 
                     scaled_loss.backward()
 
-                    step_loss_gpu += out.loss.detach().float() / float(grad_accum_steps)
-                    step_ce_gpu += out.ce_loss.detach().float() / float(grad_accum_steps)
-                    step_surprise_gpu += out.surprise_loss.detach().float() / float(grad_accum_steps)
+                    step_loss_gpu += out.loss.detach().float() * inv_accum
+                    step_ce_gpu += out.ce_loss.detach().float() * inv_accum
+                    step_surprise_gpu += out.surprise_loss.detach().float() * inv_accum
                     del out, scaled_loss
                 break
             except torch.OutOfMemoryError:
@@ -591,77 +646,91 @@ def train(
             error_if_nonfinite=False,
             foreach=(device.type == "cuda"),
         )
-        # Single GPU->CPU synchronization point per outer step
-        metrics_cpu = torch.stack([step_loss_gpu, step_ce_gpu, step_surprise_gpu, grad_norm.detach().float()]).tolist()
-        step_loss_accum, step_ce_accum, step_surprise_accum, grad_norm_val = (
-            float(metrics_cpu[0]),
-            float(metrics_cpu[1]),
-            float(metrics_cpu[2]),
-            float(metrics_cpu[3]),
-        )
-        if math.isfinite(grad_norm_val) and math.isfinite(step_loss_accum):
-            optimizer.step()
-        else:
-            print(
-                f"[WARN][Step {step:04d}] Non-finite GradNorm ({grad_norm_val}) or Loss ({step_loss_accum}); "
-                "skipping optimizer.step() to protect weights.",
-                flush=True,
-            )
-            optimizer.zero_grad(set_to_none=True)
+        # Launch fused AdamW step immediately on GPU BEFORE any host synchronization
+        # so the CUDA command stream never drains to 0% between outer steps.
+        optimizer.step()
 
-        running_loss += step_loss_accum
-        running_ce += step_ce_accum
-        running_surprise += step_surprise_accum
+        running_loss_gpu += step_loss_gpu
+        running_ce_gpu += step_ce_gpu
+        running_surprise_gpu += step_surprise_gpu
         steps_since_log += 1
 
-        if step % log_interval == 0 or step == start_step:
-            divisor = max(1, steps_since_log)
-            avg_loss = running_loss / divisor
-            avg_ce = running_ce / divisor
-            avg_surp = running_surprise / divisor
-            running_loss = 0.0
-            running_ce = 0.0
-            running_surprise = 0.0
-            steps_since_log = 0
+        should_log = (step % log_interval == 0) or (step == start_step)
+        should_save = (step % save_interval == 0) or (step == max_steps)
 
-            elapsed = max(1e-6, time.perf_counter() - t_start)
-            tokens_processed = divisor * micro_batch_size * grad_accum_steps * seq_len
-            tok_per_sec = tokens_processed / elapsed
-            vram_gb = (
-                torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                if device.type == "cuda"
-                else 0.0
+        if should_log or should_save:
+            sync_vals = torch.stack(
+                [
+                    running_loss_gpu,
+                    running_ce_gpu,
+                    running_surprise_gpu,
+                    step_loss_gpu,
+                    step_ce_gpu,
+                    step_surprise_gpu,
+                    grad_norm.detach().float(),
+                ]
+            ).tolist()
+            run_loss_val, run_ce_val, run_surp_val, step_loss_accum, step_ce_accum, step_surprise_accum, grad_norm_val = (
+                float(sync_vals[0]),
+                float(sync_vals[1]),
+                float(sync_vals[2]),
+                float(sync_vals[3]),
+                float(sync_vals[4]),
+                float(sync_vals[5]),
+                float(sync_vals[6]),
             )
-            print(
-                f"[Step {step:04d}/{max_steps:04d}] "
-                f"Total Loss: {avg_loss:.4f} | CE Loss: {avg_ce:.4f} | "
-                f"Surprise Loss: {avg_surp:.4f} | GradNorm: {grad_norm_val:.3f} | "
-                f"LR: {cur_slow_lr:.2e} | Speed: {tok_per_sec:,.0f} tok/s | "
-                f"Peak VRAM: {vram_gb:.2f} GB",
-                flush=True,
-            )
-            t_start = time.perf_counter()
 
-        if (step % save_interval == 0 or step == max_steps) and math.isfinite(step_loss_accum):
-            metrics = {
-                "total_loss": step_loss_accum,
-                "ce_loss": step_ce_accum,
-                "surprise_loss": step_surprise_accum,
-                "peak_vram_gb": (
+            if should_log:
+                divisor = max(1, steps_since_log)
+                avg_loss = run_loss_val / divisor
+                avg_ce = run_ce_val / divisor
+                avg_surp = run_surp_val / divisor
+                running_loss_gpu.zero_()
+                running_ce_gpu.zero_()
+                running_surprise_gpu.zero_()
+                steps_since_log = 0
+
+                elapsed = max(1e-6, time.perf_counter() - t_start)
+                tokens_processed = divisor * micro_batch_size * grad_accum_steps * seq_len
+                tok_per_sec = tokens_processed / elapsed
+                vram_gb = (
                     torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                     if device.type == "cuda"
                     else 0.0
-                ),
-            }
-            export_base_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                config=model_cfg,
-                save_path=ckpt_path,
-                step=step,
-                metrics=metrics,
-            )
+                )
+                print(
+                    f"[Step {step:04d}/{max_steps:04d}] "
+                    f"Total Loss: {avg_loss:.4f} | CE Loss: {avg_ce:.4f} | "
+                    f"Surprise Loss: {avg_surp:.4f} | GradNorm: {grad_norm_val:.3f} | "
+                    f"LR: {cur_slow_lr:.2e} | Speed: {tok_per_sec:,.0f} tok/s | "
+                    f"Peak VRAM: {vram_gb:.2f} GB",
+                    flush=True,
+                )
+                t_start = time.perf_counter()
 
+            if should_save and math.isfinite(step_loss_accum):
+                metrics = {
+                    "total_loss": step_loss_accum,
+                    "ce_loss": step_ce_accum,
+                    "surprise_loss": step_surprise_accum,
+                    "peak_vram_gb": (
+                        torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                        if device.type == "cuda"
+                        else 0.0
+                    ),
+                }
+                export_base_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    config=model_cfg,
+                    save_path=ckpt_path,
+                    step=step,
+                    metrics=metrics,
+                    async_save=(step < max_steps),
+                )
+
+    if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
+        _ACTIVE_SAVE_THREAD.join()
     return Path(ckpt_path)
 
 
