@@ -252,44 +252,32 @@ def maybe_compile_inner_loop(
         compile_mode = "default"
 
     try:
-        if model is not None:
-            # Compile each uTTTBlock.forward in-place (preserving clean state_dict parameter names)
-            # so SWA (FlexAttention) + Slow Projections + Chunk Scan + WO fuse into 1 graph per block.
-            for blk in model.layers:
-                blk.forward = torch.compile(  # type: ignore[method-assign]
-                    blk.forward,
-                    mode=compile_mode,
-                    fullgraph=False,
-                )
-            print(
-                f"[Compiler] Enabled whole-block torch.compile (mode='{compile_mode}') across "
-                f"all {len(model.layers)} uTTTBlocks + FlexAttention SWA."
-            )
-        else:
-            uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
-                uttt_layer_mod.fused_chunk_ttt_step,
-                mode=compile_mode,
-                fullgraph=False,
-            )
-            uttt_layer_mod.fused_slow_projections = torch.compile(
-                uttt_layer_mod.fused_slow_projections,
-                mode=compile_mode,
-                fullgraph=False,
-            )
-            uttt_layer_mod.swiglu_fast_forward = torch.compile(
-                uttt_layer_mod.swiglu_fast_forward,
-                mode=compile_mode,
-                fullgraph=False,
-            )
-            uttt_layer_mod.apply_rope = torch.compile(
-                uttt_layer_mod.apply_rope,
-                mode=compile_mode,
-                fullgraph=False,
-            )
-            print(
-                f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
-                "fused_slow_projections, swiglu_fast_forward & apply_rope."
-            )
+        uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
+            uttt_layer_mod.fused_chunk_ttt_step,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        uttt_layer_mod.fused_slow_projections = torch.compile(
+            uttt_layer_mod.fused_slow_projections,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        uttt_layer_mod.swiglu_fast_forward = torch.compile(
+            uttt_layer_mod.swiglu_fast_forward,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        uttt_layer_mod.apply_rope = torch.compile(
+            uttt_layer_mod.apply_rope,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        if getattr(uttt_layer_mod, "_HAS_FLEX_ATTENTION", False) and uttt_layer_mod.flex_attention is not None:
+            uttt_layer_mod._COMPILED_FLEX_ATTN = torch.compile(uttt_layer_mod.flex_attention)
+        print(
+            f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
+            "fused_slow_projections, FlexAttention SWA, swiglu_fast_forward & apply_rope."
+        )
     except Exception as exc:
         print(f"[Compiler] torch.compile fallback to eager mode: {exc}")
 
@@ -492,7 +480,7 @@ def train(
     ckpt_file = Path(ckpt_path)
     if resume and not lightweight_preset and ckpt_file.exists():
         try:
-            saved = torch.load(ckpt_file, map_location=device, weights_only=False)
+            saved = torch.load(ckpt_file, map_location="cpu", weights_only=False)
             saved_cfg = saved.get("config", {})
             saved_step = int(saved.get("step", 0))
             saved_loss = float(saved.get("metrics", {}).get("total_loss", 0.0))
@@ -516,6 +504,9 @@ def train(
                     f"(Last Loss: {saved_loss:.4f})",
                     flush=True,
                 )
+            del saved
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         except Exception as exc:
             print(f"[Resume] Could not resume from {ckpt_file} ({exc}); starting fresh.", flush=True)
 
