@@ -939,8 +939,8 @@ def fused_slow_projections(
     v_raw = F.linear(x, wv_w)
 
     if hasattr(F, "rms_norm"):
-        q = F.rms_norm(q_raw, (dim,), q_norm_w.to(x.dtype), eps)
-        k = F.rms_norm(k_raw, (dim,), k_norm_w.to(x.dtype), eps)
+        q = F.rms_norm(q_raw, (dim,), q_norm_w.to(q_raw.dtype), eps)
+        k = F.rms_norm(k_raw, (dim,), k_norm_w.to(k_raw.dtype), eps)
         v = F.rms_norm(v_raw, (dim,), None, eps)
     else:
         q_fp32 = q_raw.float()

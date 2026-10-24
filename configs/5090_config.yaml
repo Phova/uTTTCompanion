@@ -7,7 +7,7 @@ hardware:
   device: "cuda"
   gpu_name: "NVIDIA GeForce RTX 5090"
   arch: "sm_120"                       # Blackwell compute capability 12.0
-  vram_limit_gb: 28.0                  # Strict cap (< 32GB GDDR7) for inner+outer grads
+  vram_limit_gb: 29.5                  # Safe cap (< 32GB GDDR7) preventing allocator page-unmap thrashing
   precision: "bfloat16"                # Native Blackwell Tensor Core BF16
   tf32_matmul: true                    # Enable TF32 for FP32 fallback ops
   torch_compile: true                  # Compile analytical inner-loop TTT kernel
@@ -50,7 +50,7 @@ training:
   weight_decay: 0.1
   max_outer_grad_norm: 1.0
   surprise_aux_loss_weight: 0.10       # Weight for auxiliary inner-loop reconstruction loss
-  gradient_checkpointing: false        # With C=256 (64 total steps), fits <22GB without recomputation (VRAM-Guard auto-enables if needed)
+  gradient_checkpointing: true         # Layer checkpointing with C=256 keeps VRAM ~22GB (zero allocator stalls)
   pack_sequences: true                 # Multi-dialogue sequence packing (eliminates PAD token compute waste)
   log_interval: 10
   save_interval: 200

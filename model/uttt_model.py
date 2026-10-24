@@ -470,6 +470,8 @@ class uTTTModel(nn.Module):
         """
         bsz, seq_len = input_ids.shape
         h = self.tok_embeddings(input_ids)
+        if torch.is_autocast_enabled():
+            h = h.to(torch.get_autocast_gpu_dtype())
 
         if fast_state is None:
             fast_state = self.init_fast_state(
@@ -518,7 +520,6 @@ class uTTTModel(nn.Module):
                 layer_surprise_floats.append(float(s_loss.detach().item()))
 
         h = self.norm(h)
-        logits = self.lm_head(h)
 
         mean_surprise_loss = torch.stack(layer_surprise_tensors).mean()
         if not self.training:
@@ -527,8 +528,30 @@ class uTTTModel(nn.Module):
         ce_loss: Optional[torch.Tensor] = None
         total_loss: Optional[torch.Tensor] = None
 
-        if labels is not None:
-            # Zero-copy shifted labels: avoids allocating 512MB+ for `logits[:, :-1, :].contiguous()`
+        if labels is not None and self.training and bsz > 2:
+            # Memory-efficient sliced LM-Head + Cross-Entropy (saves ~3.0 GiB Peak VRAM
+            # and prevents CUDACachingAllocator page-unmap stalls at the 28GB boundary)
+            h_shift = h[:, :-1, :]
+            lbl_shift = labels[:, 1:]
+            ce_sums: List[torch.Tensor] = []
+            ce_counts: List[torch.Tensor] = []
+            for b_start in range(0, bsz, 2):
+                b_end = min(b_start + 2, bsz)
+                h_sub = h_shift[b_start:b_end].reshape(-1, self.config.d_model)
+                l_sub = lbl_shift[b_start:b_end].reshape(-1)
+                logits_sub = self.lm_head(h_sub)
+                ce_sums.append(
+                    F.cross_entropy(
+                        logits_sub, l_sub, ignore_index=-100, reduction="sum"
+                    )
+                )
+                ce_counts.append((l_sub != -100).sum())
+            total_valid = torch.stack(ce_counts).sum().clamp_min(1)
+            ce_loss = torch.stack(ce_sums).sum() / total_valid
+            total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
+            logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)
+        elif labels is not None:
+            logits = self.lm_head(h)
             shift_labels = torch.full_like(labels, -100)
             shift_labels[:, :-1] = labels[:, 1:]
             ce_loss = F.cross_entropy(
@@ -537,6 +560,8 @@ class uTTTModel(nn.Module):
                 ignore_index=-100,
             )
             total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
+        else:
+            logits = self.lm_head(h)
 
         return uTTTModelOutput(
             logits=logits,

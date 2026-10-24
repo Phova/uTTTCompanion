@@ -255,20 +255,19 @@ Write-Host "[Remote] Personalization Server launched (PID: `$(`$Proc.Id)) on por
 # ------------------------------------------------------------------------------
 function Invoke-Status {
     Assert-Config
-    Invoke-RemotePS @"
+    $Once = ($ExtraArgs -contains "--once") -or ($ExtraArgs -contains "once")
+    if ($Once) {
+        Invoke-RemotePS @"
 Write-Host "=== [GPU Status] ==="
-nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv
-Write-Host "`n=== [Background Processes] ==="
-foreach (`$name in @('train', 'serve')) {
-    `$pf = "$RemoteDir/logs/`$name.pid"
-    if (Test-Path `$pf) {
-        `$p = Get-Process -Id (Get-Content `$pf) -ErrorAction SilentlyContinue
-        if (`$p) { Write-Host "[RUNNING] `$name (PID: `$(`$p.Id))" } else { Write-Host "[STOPPED] `$name" }
-    } else { Write-Host "[NONE] `$name" }
-}
+nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv
 Write-Host "`n=== [Checkpoints] ==="
 Get-ChildItem "$RemoteDir/checkpoints" -ErrorAction SilentlyContinue | Select-Object Name, Length, LastWriteTime
 "@
+    } else {
+        Write-Host "[uTTT-Remote] Streaming real-time RTX 5090 status (Press Ctrl+C to exit)..." -ForegroundColor Cyan
+        $sshArgs = Get-SshArgs
+        & ssh.exe @sshArgs "${RemoteUser}@${RemoteHost}" "while true; do clear; echo '=== [GPU Real-Time Telemetry] ==='; nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv; echo ''; echo '=== [Active tmux Sessions] ==='; tmux ls 2>/dev/null || true; echo ''; echo '=== [Checkpoints] ==='; ls -lh '$RemoteDir/checkpoints' 2>/dev/null || true; echo ''; echo '=== [Latest Training Log] ==='; tail -n 6 '$RemoteDir/logs/train_5090.log' 2>/dev/null || true; sleep 1; done"
+    }
 }
 
 function Invoke-Logs {
