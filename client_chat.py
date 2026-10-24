@@ -22,11 +22,143 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
+import os
+import socket
+import struct
 import sys
 from typing import List, Optional
+from urllib.parse import urlsplit
 
-from engine.personalizer import format_ttt_status_bar, uTTTPersonalizer
+
+def format_ttt_status_bar(
+    surprise_loss: float,
+    weight_drift_pct: float,
+    persona_saved: bool = True,
+    gate_triggered: bool = True,
+) -> str:
+    """Format the canonical single-line CLI status bar without requiring torch on thin clients."""
+    if persona_saved:
+        save_label = "Persona Saved"
+    elif not gate_triggered:
+        save_label = "Gate Skipped (Low Surprise)"
+    else:
+        save_label = "In-Memory Updated"
+
+    loss_str = f"{surprise_loss:.4f}" if 0.0 < surprise_loss < 0.1 else f"{surprise_loss:.2f}"
+    return (
+        f"[TTT Status] Surprise Loss: {loss_str} | "
+        f"Weight Drift from Base: {weight_drift_pct:.2f}% | {save_label}"
+    )
+
+
+class _StdlibWebSocket:
+    """
+    Zero-dependency RFC 6455 WebSocket client built on Python's standard library (`socket`),
+    allowing `client_chat.py` to run on any local Windows/WSL Python installation without
+    requiring `pip install websockets` or `torch`.
+    """
+
+    def __init__(self, url: str, timeout: float = 120.0) -> None:
+        parsed = urlsplit(url)
+        self.host = parsed.hostname or "localhost"
+        self.port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        self.path = parsed.path or "/"
+        if parsed.query:
+            self.path += f"?{parsed.query}"
+        self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self._handshake()
+
+    def _handshake(self) -> None:
+        raw_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {self.path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {raw_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(req.encode("ascii"))
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket handshake closed unexpectedly by server.")
+            resp += chunk
+        header_block, self._buf = resp.split(b"\r\n\r\n", 1)
+        status_line = header_block.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
+        if "101" not in status_line:
+            raise ConnectionError(f"WebSocket handshake failed: {status_line}")
+
+    def _recv_exact(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(self._buf)))
+            if not chunk:
+                raise ConnectionError("WebSocket connection closed by server.")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        fin_and_op = 0x80 | (opcode & 0x0F)
+        mask_key = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", fin_and_op, 0x80 | length)
+        elif length < 65536:
+            header = struct.pack("!BBH", fin_and_op, 0x80 | 126, length)
+        else:
+            header = struct.pack("!BBQ", fin_and_op, 0x80 | 127, length)
+        masked = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+        self.sock.sendall(header + mask_key + masked)
+
+    async def send(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    async def recv(self) -> str:
+        fragments: List[bytes] = []
+        while True:
+            b1, b2 = struct.unpack("!BB", self._recv_exact(2))
+            fin = bool(b1 & 0x80)
+            opcode = b1 & 0x0F
+            masked = bool(b2 & 0x80)
+            length = b2 & 0x7F
+            if length == 126:
+                (length,) = struct.unpack("!H", self._recv_exact(2))
+            elif length == 127:
+                (length,) = struct.unpack("!Q", self._recv_exact(8))
+            mask_key = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(length)
+            if masked:
+                payload = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+
+            if opcode == 0x8:  # Close
+                raise ConnectionError("Server closed WebSocket connection.")
+            if opcode == 0x9:  # Ping -> Pong
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:  # Pong
+                continue
+            if opcode in (0x0, 0x1, 0x2):
+                fragments.append(payload)
+                if fin:
+                    return b"".join(fragments).decode("utf-8", errors="replace")
+
+    async def __aenter__(self) -> "_StdlibWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 BANNER = """================================================================================
@@ -56,13 +188,17 @@ async def run_websocket_session(
     demo_prompts: Optional[List[str]] = None,
 ) -> None:
     """Connect to the remote/tunneled FastAPI WebSocket endpoint and stream chat + TTT updates."""
-    import websockets
-
     endpoint = f"{ws_url.rstrip('/')}/ws/chat/{user_id}"
     print(BANNER)
     print(f"[Client] Connecting to {endpoint} (user_id='{user_id}')...")
 
-    async with websockets.connect(endpoint, ping_interval=25) as ws:
+    try:
+        import websockets  # type: ignore
+        ws_ctx = websockets.connect(endpoint, ping_interval=25)
+    except ImportError:
+        ws_ctx = _StdlibWebSocket(endpoint)
+
+    async with ws_ctx as ws:
         # Receive initial session_ready frame
         init_raw = await ws.recv()
         init_msg = json.loads(init_raw)
@@ -142,6 +278,8 @@ def run_local_session(
     demo_prompts: Optional[List[str]] = None,
 ) -> None:
     """Run interactive chat directly against an in-process `uTTTPersonalizer`."""
+    from engine.personalizer import uTTTPersonalizer
+
     print(BANNER)
     personalizer = uTTTPersonalizer(
         base_checkpoint_path=base_ckpt,
@@ -297,20 +435,34 @@ def main() -> None:
                 )
             )
         except Exception as exc:
-            print(
-                f"\n[Client] Could not reach WebSocket server at {args.ws_url} ({exc}).\n"
-                "[Client] Falling back to in-process local Personalizer mode (--local)...\n"
-            )
-            run_local_session(
-                user_id=args.user_id,
-                config_path=args.config,
-                base_ckpt=args.base_ckpt,
-                personas_dir=args.personas_dir,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                lightweight=args.lightweight,
-                demo_prompts=demo_script,
-            )
+            try:
+                import torch as _  # noqa: F401
+                has_local_torch = True
+            except ImportError:
+                has_local_torch = False
+
+            if has_local_torch:
+                print(
+                    f"\n[Client] Could not reach WebSocket server at {args.ws_url} ({exc}).\n"
+                    "[Client] Falling back to in-process local Personalizer mode (--local)...\n"
+                )
+                run_local_session(
+                    user_id=args.user_id,
+                    config_path=args.config,
+                    base_ckpt=args.base_ckpt,
+                    personas_dir=args.personas_dir,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    lightweight=args.lightweight,
+                    demo_prompts=demo_script,
+                )
+            else:
+                print(
+                    f"\n[Client Error] Could not connect to WebSocket server at {args.ws_url} ({exc}).\n"
+                    "Please make sure the remote server & SSH tunnel are running in another terminal:\n"
+                    f"  ./deploy/remote_ctl.sh serve --user-id {args.user_id}\n"
+                )
+                sys.exit(1)
 
 
 if __name__ == "__main__":

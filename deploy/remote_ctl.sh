@@ -344,7 +344,8 @@ cmd_serve() {
 
     log_ok "Establishing SSH Tunnel: localhost:${LOCAL_TUNNEL_PORT} -> ${REMOTE_HOST}:${REMOTE_SERVICE_PORT}"
     log_info "In another terminal, connect the interactive CLI client with:"
-    log_info "  python client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}"
+    log_info "  python3 client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}   (WSL / Linux)"
+    log_info "  python  client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}   (Windows PowerShell)"
     log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
 
     ssh "${SSH_OPTS[@]}" \
