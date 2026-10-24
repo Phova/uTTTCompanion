@@ -469,8 +469,19 @@ def train(
             step_ce_accum += float(out.ce_loss.detach().item()) / float(grad_accum_steps)
             step_surprise_accum += float(out.surprise_loss.detach().item()) / float(grad_accum_steps)
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_outer_grad_norm)
-        optimizer.step()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_outer_grad_norm, error_if_nonfinite=False
+        )
+        grad_norm_val = float(grad_norm)
+        if math.isfinite(grad_norm_val) and math.isfinite(step_loss_accum):
+            optimizer.step()
+        else:
+            print(
+                f"[WARN][Step {step:04d}] Non-finite GradNorm ({grad_norm_val}) or Loss ({step_loss_accum}); "
+                "skipping optimizer.step() to protect weights.",
+                flush=True,
+            )
+            optimizer.zero_grad(set_to_none=True)
 
         running_loss += step_loss_accum
         running_ce += step_ce_accum
@@ -496,14 +507,14 @@ def train(
             print(
                 f"[Step {step:04d}/{max_steps:04d}] "
                 f"Total Loss: {avg_loss:.4f} | CE Loss: {avg_ce:.4f} | "
-                f"Surprise Loss: {avg_surp:.4f} | GradNorm: {float(grad_norm):.3f} | "
+                f"Surprise Loss: {avg_surp:.4f} | GradNorm: {grad_norm_val:.3f} | "
                 f"LR: {cur_slow_lr:.2e} | Speed: {tok_per_sec:,.0f} tok/s | "
                 f"Peak VRAM: {vram_gb:.2f} GB",
                 flush=True,
             )
             t_start = time.perf_counter()
 
-        if step % save_interval == 0 or step == max_steps:
+        if (step % save_interval == 0 or step == max_steps) and math.isfinite(step_loss_accum):
             metrics = {
                 "total_loss": step_loss_accum,
                 "ce_loss": step_ce_accum,

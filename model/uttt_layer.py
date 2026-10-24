@@ -495,15 +495,18 @@ class SharedFastWeightPool(nn.Module):
             return out, state, surprise_loss
 
         # 1. Analytical Chunk-wise Gradient (already weighted by eta_chunk)
+        # Use First-Order Meta-Approximation (detach W inside the inner derivative operator
+        # while keeping W attached in the recurrence W_t = (1-alpha)*W_{t-1} + S_t and readout)
+        # to prevent 2nd-order Hessian-vector explosion across 16 layers x 16 chunks (256 steps).
         grad_up, grad_gate, grad_down, surprise_loss = analytical_swiglu_chunk_grad(
             k_chunk=k_chunk,
             v_chunk=v_chunk,
             eta_chunk=eta_chunk,
-            w_up=state.w_up,
-            w_gate=state.w_gate,
-            w_down=state.w_down,
-            ln_weight=state.ln_weight,
-            ln_bias=state.ln_bias,
+            w_up=state.w_up.detach(),
+            w_gate=state.w_gate.detach(),
+            w_down=state.w_down.detach(),
+            ln_weight=state.ln_weight.detach(),
+            ln_bias=state.ln_bias.detach(),
             token_mask=token_mask,
             normalize_by_dim=self.normalize_loss_by_dim,
             eps=self.eps,
@@ -527,9 +530,9 @@ class SharedFastWeightPool(nn.Module):
         #    S_t = beta * S_{t-1} - eta_t * grad_W
         #    W_t = (1 - alpha_t) * W_{t-1} + S_t
         beta = self.momentum_beta
-        s_up_new = beta * state.s_up - grad_up
-        s_gate_new = beta * state.s_gate - grad_gate
-        s_down_new = beta * state.s_down - grad_down
+        s_up_new = beta * state.s_up.detach() - grad_up
+        s_gate_new = beta * state.s_gate.detach() - grad_gate
+        s_down_new = beta * state.s_down.detach() - grad_down
 
         # Mean chunk forget gate alpha_t in (B, 1, 1)
         alpha_bar = alpha_chunk.mean(dim=1, keepdim=True).to(state.w_up.dtype)
@@ -878,7 +881,9 @@ class uTTTLayer(nn.Module):
         # Project Q, K, V and dynamic gates via layer-specific Slow Weights
         q = self.q_norm(self.w_q(x))                                # (B, T, D)
         k = self.k_norm(self.w_k(x))                                # (B, T, D)
-        v = self.w_v(x)                                             # (B, T, D)
+        v_raw = self.w_v(x)
+        # Unit-RMS normalize V targets so inner-loop reconstruction loss cannot scale-explode
+        v = (v_raw.float() * torch.rsqrt(v_raw.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5)).to(x.dtype)
 
         eta = self.base_inner_lr * torch.sigmoid(self.w_eta(x))     # (B, T, 1)
         alpha = self.base_weight_decay * torch.sigmoid(self.w_alpha(x))  # (B, T, 1)

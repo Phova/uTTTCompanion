@@ -61,7 +61,7 @@ class uTTTConfig:
     base_weight_decay: float = 0.005
     momentum_beta: float = 0.90
     max_inner_grad_norm: float = 1.0
-    normalize_loss_by_dim: bool = False
+    normalize_loss_by_dim: bool = True
     surprise_threshold: float = 0.25
     elastic_anchor_lambda: float = 0.02
     max_weight_drift_ratio: float = 0.35
