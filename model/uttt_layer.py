@@ -542,8 +542,13 @@ class SharedFastWeightPool(nn.Module):
         w_gate_new = decay * state.w_gate + s_gate_new
         w_down_new = decay * state.w_down + s_down_new
 
-        loss_val = float(surprise_loss.detach().item())
-        new_history = list(state.surprise_history[-99:]) + [loss_val]
+        # Avoid synchronous GPU->CPU .item() stall inside the inner loop during training
+        if not torch.is_grad_enabled():
+            loss_val = float(surprise_loss.detach().item())
+            new_history = list(state.surprise_history[-99:]) + [loss_val]
+        else:
+            loss_val = state.last_surprise_loss
+            new_history = state.surprise_history
 
         new_state = FastWeightState(
             w_up=w_up_new,

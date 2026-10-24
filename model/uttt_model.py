@@ -425,7 +425,7 @@ class uTTTModel(nn.Module):
         )
 
         num_chunks = (x.shape[1] + self.config.chunk_size - 1) // self.config.chunk_size
-        loss_val = float(s_loss.detach().item())
+        loss_val = 0.0 if self.training else float(s_loss.detach().item())
         updated_state = FastWeightState(
             w_up=w_up_o,
             w_gate=w_gate_o,
@@ -437,7 +437,7 @@ class uTTTModel(nn.Module):
             ln_bias=fast_state.ln_bias,
             step=step_before + num_chunks,
             last_surprise_loss=loss_val,
-            surprise_history=(history_before + [loss_val])[-100:],
+            surprise_history=history_before if self.training else (history_before + [loss_val])[-100:],
         )
         return out_h, updated_state, s_loss
 
@@ -511,13 +511,15 @@ class uTTTModel(nn.Module):
                 new_kv_caches.append(updated_kv)
 
             layer_surprise_tensors.append(s_loss)
-            layer_surprise_floats.append(float(s_loss.detach().item()))
+            if not self.training:
+                layer_surprise_floats.append(float(s_loss.detach().item()))
 
         h = self.norm(h)
         logits = self.lm_head(h)
 
         mean_surprise_loss = torch.stack(layer_surprise_tensors).mean()
-        cur_fast_state.last_surprise_loss = float(mean_surprise_loss.detach().item())
+        if not self.training:
+            cur_fast_state.last_surprise_loss = float(mean_surprise_loss.detach().item())
 
         ce_loss: Optional[torch.Tensor] = None
         total_loss: Optional[torch.Tensor] = None

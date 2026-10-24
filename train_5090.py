@@ -315,6 +315,7 @@ def train(
     override_batch_size: Optional[int] = None,
     override_seq_len: Optional[int] = None,
     lightweight_preset: bool = False,
+    resume: bool = True,
 ) -> Path:
     """Run outer-loop + inner-loop uTTT Meta-Training and export `base_uttt.pt`."""
     import yaml
@@ -398,36 +399,72 @@ def train(
         num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
         data_path=data_path,
     )
+    use_workers = device.type == "cuda" and os.name != "nt"
     loader = DataLoader(
         dataset,
         batch_size=micro_batch_size,
         shuffle=True,
         drop_last=True,
         pin_memory=(device.type == "cuda"),
+        num_workers=2 if use_workers else 0,
+        persistent_workers=use_workers,
     )
     data_iter = iter(loader)
+
+    start_step = 1
+    ckpt_file = Path(ckpt_path)
+    if resume and not lightweight_preset and ckpt_file.exists():
+        try:
+            saved = torch.load(ckpt_file, map_location=device, weights_only=False)
+            saved_cfg = saved.get("config", {})
+            saved_step = int(saved.get("step", 0))
+            saved_loss = float(saved.get("metrics", {}).get("total_loss", 0.0))
+            dims_match = (
+                saved_cfg.get("d_model") == model_cfg.d_model
+                and saved_cfg.get("n_layers") == model_cfg.n_layers
+                and saved_cfg.get("d_ff_fast") == model_cfg.d_ff_fast
+                and saved_cfg.get("vocab_size") == model_cfg.vocab_size
+            )
+            if dims_match and 0 < saved_step < max_steps and math.isfinite(saved_loss):
+                model.load_dual_base_state(
+                    saved["slow_weights"],
+                    saved["init_fast_weights"],
+                    strict=True,
+                )
+                if "optimizer_state" in saved:
+                    optimizer.load_state_dict(saved["optimizer_state"])
+                start_step = saved_step + 1
+                print(
+                    f"[Resume] Resumed from {ckpt_file} at step {saved_step}/{max_steps} "
+                    f"(Last Loss: {saved_loss:.4f})",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[Resume] Could not resume from {ckpt_file} ({exc}); starting fresh.", flush=True)
 
     model.train()
     autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
 
     print(
-        f"[Train] Starting Meta-Training for {max_steps} steps | "
+        f"[Train] Starting Meta-Training from step {start_step} to {max_steps} | "
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
-        f"ChunkSize={model_cfg.chunk_size}, Precision={amp_dtype}",
+        f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
+        f"Precision={amp_dtype}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
         print(
-            "[Train] Step 1 includes one-time Triton kernel compilation (~5-15s on RTX 5090)...",
+            "[Train] First step includes one-time Triton kernel compilation (~5-15s on RTX 5090)...",
             flush=True,
         )
 
     running_loss = 0.0
     running_ce = 0.0
     running_surprise = 0.0
+    steps_since_log = 0
     t_start = time.perf_counter()
 
-    for step in range(1, max_steps + 1):
+    for step in range(start_step, max_steps + 1):
         # Update learning rates for both parameter groups
         cur_slow_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, outer_lr)
         cur_fast_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, meta_fast_lr)
@@ -436,9 +473,9 @@ def train(
 
         optimizer.zero_grad(set_to_none=True)
 
-        step_loss_accum = 0.0
-        step_ce_accum = 0.0
-        step_surprise_accum = 0.0
+        step_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
+        step_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
+        step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
         for _ in range(grad_accum_steps):
             try:
@@ -465,14 +502,21 @@ def train(
 
             scaled_loss.backward()
 
-            step_loss_accum += float(out.loss.detach().item()) / float(grad_accum_steps)
-            step_ce_accum += float(out.ce_loss.detach().item()) / float(grad_accum_steps)
-            step_surprise_accum += float(out.surprise_loss.detach().item()) / float(grad_accum_steps)
+            step_loss_gpu += out.loss.detach().float() / float(grad_accum_steps)
+            step_ce_gpu += out.ce_loss.detach().float() / float(grad_accum_steps)
+            step_surprise_gpu += out.surprise_loss.detach().float() / float(grad_accum_steps)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_outer_grad_norm, error_if_nonfinite=False
         )
-        grad_norm_val = float(grad_norm)
+        # Single GPU->CPU synchronization point per outer step
+        metrics_cpu = torch.stack([step_loss_gpu, step_ce_gpu, step_surprise_gpu, grad_norm.detach().float()]).tolist()
+        step_loss_accum, step_ce_accum, step_surprise_accum, grad_norm_val = (
+            float(metrics_cpu[0]),
+            float(metrics_cpu[1]),
+            float(metrics_cpu[2]),
+            float(metrics_cpu[3]),
+        )
         if math.isfinite(grad_norm_val) and math.isfinite(step_loss_accum):
             optimizer.step()
         else:
@@ -486,15 +530,17 @@ def train(
         running_loss += step_loss_accum
         running_ce += step_ce_accum
         running_surprise += step_surprise_accum
+        steps_since_log += 1
 
-        if step % log_interval == 0 or step == 1:
-            divisor = log_interval if step > 1 else 1
+        if step % log_interval == 0 or step == start_step:
+            divisor = max(1, steps_since_log)
             avg_loss = running_loss / divisor
             avg_ce = running_ce / divisor
             avg_surp = running_surprise / divisor
             running_loss = 0.0
             running_ce = 0.0
             running_surprise = 0.0
+            steps_since_log = 0
 
             elapsed = max(1e-6, time.perf_counter() - t_start)
             tokens_processed = divisor * micro_batch_size * grad_accum_steps * seq_len
@@ -580,6 +626,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use lightweight model dimensions for rapid smoke testing.",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start training from scratch even if checkpoints/base_uttt.pt exists.",
+    )
     return parser.parse_args()
 
 
@@ -593,4 +644,5 @@ if __name__ == "__main__":
         override_batch_size=args.batch_size,
         override_seq_len=args.seq_len,
         lightweight_preset=args.lightweight,
+        resume=not args.no_resume,
     )
