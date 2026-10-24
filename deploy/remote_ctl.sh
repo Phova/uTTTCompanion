@@ -218,7 +218,7 @@ cmd_train() {
     if [[ "${USE_DOCKER}" == "1" ]]; then
         TRAIN_CMD="docker run --rm --gpus all --ipc=host -v '${REMOTE_DIR}/checkpoints:/workspace/uTTT/checkpoints' -v '${REMOTE_DIR}/logs:/workspace/uTTT/logs' ${DOCKER_IMAGE} python -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
     else
-        TRAIN_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && export TORCH_CUDA_ARCH_LIST='12.0' && export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True,max_split_size_mb:512' && '${REMOTE_DIR}/.venv/bin/python3' -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
+        TRAIN_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && export TORCH_CUDA_ARCH_LIST='12.0' && '${REMOTE_DIR}/.venv/bin/python3' -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
     fi
 
     remote_exec "bash -c \"
@@ -355,29 +355,36 @@ cmd_status() {
             tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || true;
         "
     else
-        log_info "Streaming real-time RTX 5090 status from ${REMOTE_TARGET} (Refresh: 1s | Press Ctrl+C to exit)..."
-        remote_exec "
-            while true; do
-                printf '\033[2J\033[H';
-                echo '================================================================================';
-                echo -n '[uTTT-Remote Live Monitor] '; date '+%Y-%m-%d %H:%M:%S';
-                echo '================================================================================';
-                echo '=== [GPU Real-Time Telemetry - RTX 5090] ===';
-                nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv;
-                echo '';
-                echo '=== [Active tmux Sessions] ===';
-                tmux ls 2>/dev/null || echo 'No active tmux sessions.';
-                echo '';
-                echo '=== [Checkpoints & Personas] ===';
-                ls -lh '${REMOTE_DIR}/checkpoints' 2>/dev/null || true;
-                echo '';
-                echo '=== [Latest Training Log] ===';
-                tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || echo 'No training log yet.';
-                echo '--------------------------------------------------------------------------------';
-                echo 'Press Ctrl+C to stop live status stream.';
-                sleep 1;
-            done
-        "
+        log_info "Live RTX 5090 Compact Monitor on ${REMOTE_TARGET} (5-line in-place update | Ctrl+C to exit)"
+        ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "REMOTE_DIR='${REMOTE_DIR}' bash -s" <<'EOF'
+printf '\n\n\n\n\n'
+while true; do
+    GPU_LINE=$(nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n 1)
+    IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP <<< "${GPU_LINE}"
+    U_GPU="${U_GPU// /}"; U_MEM="${U_MEM// /}"; M_USED="${M_USED// /}"; M_TOT="${M_TOT// /}"
+    PWR="${PWR// /}"; CLK="${CLK// /}"; TMP="${TMP// /}"
+
+    TMUX_ST=$(tmux ls 2>/dev/null | tr '\n' ' ' | cut -c1-42)
+    [[ -z "${TMUX_ST}" ]] && TMUX_ST="none"
+
+    CKPT_ST=$(ls -lh --time-style='+%H:%M:%S' "${REMOTE_DIR}/checkpoints/base_uttt.pt" 2>/dev/null | awk '{print $5, "updated", $6}')
+    [[ -z "${CKPT_ST}" ]] && CKPT_ST="none"
+
+    LOG_ST=$(grep '\[Step ' "${REMOTE_DIR}/logs/train_5090.log" 2>/dev/null | tail -n 1 | cut -c1-108)
+    [[ -z "${LOG_ST}" ]] && LOG_ST=$(tail -n 1 "${REMOTE_DIR}/logs/train_5090.log" 2>/dev/null | cut -c1-108)
+
+    NOW_TS=$(date '+%H:%M:%S')
+    ESC=$(printf '\033')
+
+    printf '%s[5A\r%s[2K%s[1;36m[uTTT 5090 Live]%s[0m %s | tmux: %s | (Ctrl+C to exit)\n\r%s[2K%s[1;32mGPU  :%s[0m Util: %3s%% | MemBW: %3s%% | VRAM: %s/%s MiB | Power: %sW | %sMHz | %sC\n\r%s[2K%s[1;33mCkpt :%s[0m base_uttt.pt (%s)\n\r%s[2K%s[1;35mTrain:%s[0m %s\n\r%s[2K------------------------------------------------------------------------------------------------------------\n' \
+        "${ESC}" "${ESC}" "${ESC}" "${ESC}" "${NOW_TS}" "${TMUX_ST}" \
+        "${ESC}" "${ESC}" "${ESC}" "${U_GPU}" "${U_MEM}" "${M_USED}" "${M_TOT}" "${PWR}" "${CLK}" "${TMP}" \
+        "${ESC}" "${ESC}" "${ESC}" "${CKPT_ST}" \
+        "${ESC}" "${ESC}" "${ESC}" "${LOG_ST}" \
+        "${ESC}"
+    sleep 1
+done
+EOF
     fi
 }
 

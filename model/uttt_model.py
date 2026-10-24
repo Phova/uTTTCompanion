@@ -565,7 +565,7 @@ class uTTTModel(nn.Module):
 
         return uTTTModelOutput(
             logits=logits,
-            fast_state=cur_fast_state,
+            fast_state=cur_fast_state.detach() if self.training else cur_fast_state,
             loss=total_loss,
             ce_loss=ce_loss,
             surprise_loss=mean_surprise_loss,

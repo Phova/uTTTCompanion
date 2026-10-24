@@ -202,18 +202,13 @@ def configure_rtx5090_environment(hw_cfg: Dict[str, Any]) -> Tuple[torch.device,
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
 
-        # Enforce strict VRAM ceiling (default 28GB out of 32GB on RTX 5090)
-        vram_limit_gb = float(hw_cfg.get("vram_limit_gb", 28.0))
-        if total_vram_gb > 0:
-            fraction = min(0.95, max(0.50, vram_limit_gb / total_vram_gb))
-            try:
-                torch.cuda.set_per_process_memory_fraction(fraction, device=0)
-            except Exception:
-                pass
+        # Keep VRAM limit metadata for diagnostics; avoid set_per_process_memory_fraction
+        # which triggers synchronous CUDACachingAllocator cuMemUnmap thrashing on WSL2/WDDM.
+        vram_limit_gb = float(hw_cfg.get("vram_limit_gb", 29.5))
 
         print(
             f"[Hardware] GPU: {gpu_name} (sm_{cap_major}{cap_minor}) | "
-            f"Total VRAM: {total_vram_gb:.1f} GB | Cap: {vram_limit_gb:.1f} GB"
+            f"Total VRAM: {total_vram_gb:.1f} GB | Target Budget: {vram_limit_gb:.1f} GB"
         )
     else:
         device = torch.device("cpu")
@@ -551,6 +546,7 @@ def train(
                     step_loss_gpu += out.loss.detach().float() / float(grad_accum_steps)
                     step_ce_gpu += out.ce_loss.detach().float() / float(grad_accum_steps)
                     step_surprise_gpu += out.surprise_loss.detach().float() / float(grad_accum_steps)
+                    del out, scaled_loss
                 break
             except torch.OutOfMemoryError:
                 optimizer.zero_grad(set_to_none=True)
