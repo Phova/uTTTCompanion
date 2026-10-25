@@ -236,6 +236,7 @@ cmd_train() {
         mkdir -p '${REMOTE_DIR}/logs' '${REMOTE_DIR}/checkpoints';
         : > '${LOG_FILE}';
         if command -v tmux >/dev/null 2>&1; then
+            tmux has-session -t '${TMUX_SERVE_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_SERVE_SESSION}';
             tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_TRAIN_SESSION}';
             tmux new-session -d -s '${TMUX_TRAIN_SESSION}' \\\"${TRAIN_CMD}\\\";
             echo '[Remote] Started tmux session: ${TMUX_TRAIN_SESSION}';
@@ -247,7 +248,8 @@ cmd_train() {
 
     log_ok "Training started in background on remote RTX 5090."
     log_info "Streaming real-time training loss from ${LOG_FILE} (Press Ctrl+C to detach local log view; remote training will continue)..."
-    remote_exec "bash -c \"
+    ssh -tt "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "bash -c \"
+        trap 'kill \\\${TAIL_PID:-} 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE;
         sleep 1;
         tail -n +1 -f '${LOG_FILE}' &
         TAIL_PID=\\\$!;
@@ -399,20 +401,32 @@ cmd_status() {
         [[ ! "${INTERVAL_MS}" =~ ^[0-9]+$ ]] && INTERVAL_MS=200
         log_info "Live RTX 5090 High-Refresh Monitor on ${REMOTE_TARGET} (Refresh: ${INTERVAL_MS}ms / 5Hz | Ctrl+C to exit)"
         ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "REMOTE_DIR='${REMOTE_DIR}' INTERVAL_MS='${INTERVAL_MS}' bash -s" <<'EOF'
-trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
+pkill -9 -f 'nvidia-smi --query-gpu=' 2>/dev/null || true
+STAT_FILE="/dev/shm/uttt_gpu_stat"
+[[ ! -d /dev/shm ]] && STAT_FILE="/tmp/uttt_gpu_stat"
+echo "100, --, 26225, 32607, ---, ----, --" > "${STAT_FILE}"
+
+nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits -lms "${INTERVAL_MS}" 2>/dev/null | while IFS= read -r line; do
+    echo "${line}" > "${STAT_FILE}.tmp" && mv -f "${STAT_FILE}.tmp" "${STAT_FILE}"
+done &
+SMI_PID=$!
+trap 'kill -9 ${SMI_PID} 2>/dev/null || true; pkill -9 -P $$ 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
+
 ESC=$(printf '\033')
 TICK=0
 TMUX_ST="checking..."
 CKPT_ST="checking..."
 LOG_ST="waiting for log..."
+SLEEP_SEC=$(awk "BEGIN {printf \"%.3f\", ${INTERVAL_MS}/1000}")
 printf '\n\n\n\n\n'
 
-while IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP; do
+while true; do
+    IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP < "${STAT_FILE}" 2>/dev/null || true
     U_GPU="${U_GPU// /}"; U_MEM="${U_MEM// /}"; M_USED="${M_USED// /}"; M_TOT="${M_TOT// /}"
     PWR="${PWR// /}"; CLK="${CLK// /}"; TMP="${TMP// /}"
 
     if (( TICK % 5 == 0 )); then
-        TMUX_ST=$(tmux ls 2>/dev/null | tr '\n' ' ' | cut -c1-42)
+        TMUX_ST=$(tmux ls 2>/dev/null | awk -F: '{print $1}' | tr '\n' ',' | sed 's/,$//')
         [[ -z "${TMUX_ST}" ]] && TMUX_ST="none"
 
         CKPT_ST=$(ls -lht --time-style='+%H:%M:%S' "${REMOTE_DIR}/checkpoints/"*.pt 2>/dev/null | head -n 1 | awk '{n=split($7,a,"/"); printf "%s (%s updated %s)", a[n], $5, $6}')
@@ -431,7 +445,9 @@ while IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP; do
         "${ESC}" "${ESC}" "${ESC}" "${CKPT_ST}" \
         "${ESC}" "${ESC}" "${ESC}" "${LOG_ST}" \
         "${ESC}" || break
-done < <(nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits -lms "${INTERVAL_MS}" 2>/dev/null)
+
+    sleep "${SLEEP_SEC}" || break
+done
 EOF
     fi
 }
