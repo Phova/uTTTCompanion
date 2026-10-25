@@ -792,9 +792,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-ckpt",
+        "--save-path",
+        dest="output_ckpt",
         type=str,
         default=None,
-        help="Override path for exported base_uttt.pt checkpoint.",
+        help="Override path for exported checkpoint (e.g. checkpoints/Vitamin-C.pt).",
     )
     parser.add_argument(
         "--steps",

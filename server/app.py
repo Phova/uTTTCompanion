@@ -89,6 +89,17 @@ def get_personalizer() -> uTTTPersonalizer:
             temperature = float(p_cfg.get("temperature", temperature))
             top_p = float(p_cfg.get("top_p", top_p))
 
+        if not os.environ.get("UTTT_BASE_CKPT"):
+            ckpt_dir = Path(base_ckpt).parent
+            if ckpt_dir.exists():
+                pt_files = sorted(
+                    ckpt_dir.glob("*.pt"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if pt_files:
+                    base_ckpt = str(pt_files[0])
+
         if os.environ.get("UTTT_MAX_GPU_USERS"):
             max_gpu_users = int(os.environ["UTTT_MAX_GPU_USERS"])
         if os.environ.get("UTTT_MAX_NEW_TOKENS"):
@@ -298,7 +309,15 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server bind address")
     parser.add_argument("--port", type=int, default=8000, help="Server listen port")
     parser.add_argument("--config", type=str, default="configs/5090_config.yaml", help="YAML config path")
-    parser.add_argument("--base-ckpt", type=str, default="checkpoints/base_uttt.pt", help="Base checkpoint path")
+    parser.add_argument(
+        "--base-ckpt",
+        "--save-path",
+        "--output-ckpt",
+        dest="base_ckpt",
+        type=str,
+        default=None,
+        help="Base checkpoint path (defaults to latest .pt in checkpoints/ or base_uttt.pt)",
+    )
     parser.add_argument("--personas-dir", type=str, default="personas", help="User persona fast-weight directory")
     parser.add_argument("--user-id", type=str, default="", help="Optional default user ID to pre-warm in GPU VRAM")
     parser.add_argument("--max-gpu-users", type=int, default=None, help="Override Tier-1 GPU VRAM LRU pool size")
@@ -310,7 +329,8 @@ def main() -> None:
     args, _ = parser.parse_known_args()
 
     os.environ["UTTT_CONFIG"] = args.config
-    os.environ["UTTT_BASE_CKPT"] = args.base_ckpt
+    if args.base_ckpt:
+        os.environ["UTTT_BASE_CKPT"] = args.base_ckpt
     os.environ["UTTT_PERSONAS_DIR"] = args.personas_dir
     if args.user_id:
         os.environ["UTTT_DEFAULT_USER"] = args.user_id

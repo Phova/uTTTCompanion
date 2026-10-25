@@ -265,9 +265,21 @@ cmd_train() {
 # ------------------------------------------------------------------------------
 cmd_pull_ckpt() {
     validate_config
-    REMOTE_CKPT="${REMOTE_DIR}/checkpoints/base_uttt.pt"
+    local TARGET_ARG="${1:-}"
+    local CKPT_NAME=""
+
+    if [[ -n "${TARGET_ARG}" ]]; then
+        CKPT_NAME="$(basename "${TARGET_ARG}")"
+    else
+        CKPT_NAME="$(remote_exec "ls -t '${REMOTE_DIR}/checkpoints/'*.pt 2>/dev/null | head -n 1 | xargs -r basename" | tr -d '\r\n ')"
+        if [[ -z "${CKPT_NAME}" ]]; then
+            CKPT_NAME="base_uttt.pt"
+        fi
+    fi
+
+    REMOTE_CKPT="${REMOTE_DIR}/checkpoints/${CKPT_NAME}"
     LOCAL_CKPT_DIR="${LOCAL_ROOT}/checkpoints"
-    LOCAL_CKPT="${LOCAL_CKPT_DIR}/base_uttt.pt"
+    LOCAL_CKPT="${LOCAL_CKPT_DIR}/${CKPT_NAME}"
 
     mkdir -p "${LOCAL_CKPT_DIR}"
     log_info "Checking remote checkpoint at ${REMOTE_TARGET}:${REMOTE_CKPT}..."
@@ -403,7 +415,7 @@ while IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP; do
         TMUX_ST=$(tmux ls 2>/dev/null | tr '\n' ' ' | cut -c1-42)
         [[ -z "${TMUX_ST}" ]] && TMUX_ST="none"
 
-        CKPT_ST=$(ls -lh --time-style='+%H:%M:%S' "${REMOTE_DIR}/checkpoints/base_uttt.pt" 2>/dev/null | awk '{print $5, "updated", $6}')
+        CKPT_ST=$(ls -lht --time-style='+%H:%M:%S' "${REMOTE_DIR}/checkpoints/"*.pt 2>/dev/null | head -n 1 | awk '{n=split($7,a,"/"); printf "%s (%s updated %s)", a[n], $5, $6}')
         [[ -z "${CKPT_ST}" ]] && CKPT_ST="none"
 
         LOG_ST=$(tail -n 25 "${REMOTE_DIR}/logs/train_5090.log" 2>/dev/null | grep '\[Step ' | tail -n 1 | cut -c1-108)
@@ -413,7 +425,7 @@ while IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP; do
 
     NOW_TS=$(date '+%H:%M:%S.%1N')
 
-    printf '%s[5A\r%s[2K%s[1;36m[uTTT 5090 5Hz]%s[0m %s | tmux: %s | (Ctrl+C to exit)\n\r%s[2K%s[1;32mGPU  :%s[0m Util: %3s%% | MemBW: %3s%% | VRAM: %s/%s MiB | Power: %6sW | %4sMHz | %sC\n\r%s[2K%s[1;33mCkpt :%s[0m base_uttt.pt (%s)\n\r%s[2K%s[1;35mTrain:%s[0m %s\n\r%s[2K------------------------------------------------------------------------------------------------------------\n' \
+    printf '%s[5A\r%s[2K%s[1;36m[uTTT 5090 5Hz]%s[0m %s | tmux: %s | (Ctrl+C to exit)\n\r%s[2K%s[1;32mGPU  :%s[0m Util: %3s%% | MemBW: %3s%% | VRAM: %s/%s MiB | Power: %6sW | %4sMHz | %sC\n\r%s[2K%s[1;33mCkpt :%s[0m %s\n\r%s[2K%s[1;35mTrain:%s[0m %s\n\r%s[2K------------------------------------------------------------------------------------------------------------\n' \
         "${ESC}" "${ESC}" "${ESC}" "${ESC}" "${NOW_TS}" "${TMUX_ST}" \
         "${ESC}" "${ESC}" "${ESC}" "${U_GPU}" "${U_MEM}" "${M_USED}" "${M_TOT}" "${PWR}" "${CLK}" "${TMP}" \
         "${ESC}" "${ESC}" "${ESC}" "${CKPT_ST}" \
