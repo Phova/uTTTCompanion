@@ -169,12 +169,38 @@ class PersonaMetaDataset(Dataset):
         if len(token_ids) < self.seq_len:
             pad_len = self.seq_len - len(token_ids)
             mask = [1] * len(token_ids) + [0] * pad_len
-            labels = list(token_ids) + [-100] * pad_len
+            raw_labels = list(token_ids) + [-100] * pad_len
             token_ids = token_ids + [self.tokenizer.PAD_ID] * pad_len
         else:
             token_ids = token_ids[: self.seq_len]
             mask = [1] * self.seq_len
-            labels = list(token_ids)
+            raw_labels = list(token_ids)
+
+        # Conversational SFT Loss Masking:
+        # Keep `<|user|> ... <|assistant|>` in `input_ids` so inner-loop TTT fast weights
+        # absorb user persona/context, while masking user prompt tokens (`-100`) in `labels`
+        # so outer-loop Cross-Entropy supervises only `<|assistant|>` replies + `<|eos|>`.
+        if self.tokenizer.ASSISTANT_ID in token_ids:
+            labels = list(raw_labels)
+            in_user_turn = False
+            has_supervised = False
+            for i, tid in enumerate(token_ids):
+                if tid == self.tokenizer.PAD_ID:
+                    labels[i] = -100
+                elif tid in (self.tokenizer.BOS_ID, self.tokenizer.USER_ID):
+                    in_user_turn = True
+                    labels[i] = -100
+                elif tid == self.tokenizer.ASSISTANT_ID:
+                    in_user_turn = False
+                    labels[i] = -100
+                elif in_user_turn:
+                    labels[i] = -100
+                else:
+                    has_supervised = True
+            if not has_supervised:
+                labels = raw_labels
+        else:
+            labels = raw_labels
 
         return {
             "input_ids": torch.tensor(token_ids, dtype=torch.long),
@@ -376,6 +402,7 @@ def train(
     override_batch_size: Optional[int] = None,
     override_seq_len: Optional[int] = None,
     lightweight_preset: bool = False,
+    large_preset: bool = False,
     resume: bool = True,
 ) -> Path:
     """Run outer-loop + inner-loop uTTT Meta-Training and export `base_uttt.pt`."""
@@ -390,6 +417,7 @@ def train(
 
     if lightweight_preset:
         # Fast verification preset for quick local or CI smoke tests
+        model_cfg.name = "uTTT-Light-Smoke"
         model_cfg.d_model = 256
         model_cfg.n_layers = 4
         model_cfg.n_heads = 4
@@ -397,6 +425,17 @@ def train(
         model_cfg.d_ff_fast = 512
         model_cfg.chunk_size = 32
         model_cfg.sliding_window_size = 128
+    elif large_preset:
+        # Large-parameter preset for single RTX 5090 (32GB GDDR7, ~815M params)
+        model_cfg.name = "uTTT-Large-800M"
+        model_cfg.d_model = 1536
+        model_cfg.n_layers = 24
+        model_cfg.n_heads = 24
+        model_cfg.n_kv_heads = 6
+        model_cfg.d_ff_fast = 4096
+        model_cfg.chunk_size = 256
+        model_cfg.sliding_window_size = 512
+        model_cfg.gradient_checkpointing = True
 
     seed = int(train_cfg.get("seed", 42))
     torch.manual_seed(seed)
@@ -477,20 +516,24 @@ def train(
     data_iter = iter(loader)
 
     start_step = 1
+    cur_data_tag = str(data_path or "synthetic")
     ckpt_file = Path(ckpt_path)
     if resume and not lightweight_preset and ckpt_file.exists():
         try:
             saved = torch.load(ckpt_file, map_location="cpu", weights_only=False)
             saved_cfg = saved.get("config", {})
+            saved_metrics = saved.get("metrics", {})
             saved_step = int(saved.get("step", 0))
-            saved_loss = float(saved.get("metrics", {}).get("total_loss", 0.0))
+            saved_loss = float(saved_metrics.get("total_loss", 0.0))
             dims_match = (
                 saved_cfg.get("d_model") == model_cfg.d_model
                 and saved_cfg.get("n_layers") == model_cfg.n_layers
                 and saved_cfg.get("d_ff_fast") == model_cfg.d_ff_fast
                 and saved_cfg.get("vocab_size") == model_cfg.vocab_size
             )
-            if dims_match and 0 < saved_step < max_steps and math.isfinite(saved_loss):
+            is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
+            same_data = saved_metrics.get("data_source", cur_data_tag) == cur_data_tag
+            if dims_match and is_causal_v2 and same_data and 0 < saved_step < max_steps and math.isfinite(saved_loss):
                 model.load_dual_base_state(
                     saved["slow_weights"],
                     saved["init_fast_weights"],
@@ -502,6 +545,12 @@ def train(
                 print(
                     f"[Resume] Resumed from {ckpt_file} at step {saved_step}/{max_steps} "
                     f"(Last Loss: {saved_loss:.4f})",
+                    flush=True,
+                )
+            elif not is_causal_v2 or not same_data:
+                print(
+                    f"[Resume] Existing {ckpt_file} is from legacy non-causal run or different dataset; "
+                    "starting fresh causal meta-training from step 1.",
                     flush=True,
                 )
             del saved
@@ -704,6 +753,8 @@ def train(
                     "total_loss": step_loss_accum,
                     "ce_loss": step_ce_accum,
                     "surprise_loss": step_surprise_accum,
+                    "causal_ttt_v2": True,
+                    "data_source": cur_data_tag,
                     "peak_vram_gb": (
                         torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                         if device.type == "cuda"
@@ -769,7 +820,14 @@ def parse_args() -> argparse.Namespace:
         help="Use lightweight model dimensions for rapid smoke testing.",
     )
     parser.add_argument(
+        "--large",
+        action="store_true",
+        help="Use uTTT-Large-800M preset (d_model=1536, n_layers=24, d_ff_fast=4096) for RTX 5090.",
+    )
+    parser.add_argument(
         "--no-resume",
+        "--fresh",
+        dest="no_resume",
         action="store_true",
         help="Start training from scratch even if checkpoints/base_uttt.pt exists.",
     )
@@ -786,5 +844,6 @@ if __name__ == "__main__":
         override_batch_size=args.batch_size,
         override_seq_len=args.seq_len,
         lightweight_preset=args.lightweight,
+        large_preset=args.large,
         resume=not args.no_resume,
     )

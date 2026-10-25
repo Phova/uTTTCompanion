@@ -11,9 +11,12 @@ End-to-End Verification Suite for the uTTT Framework:
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
@@ -24,7 +27,8 @@ from model.uttt_layer import (
     analytical_swiglu_chunk_grad,
     swiglu_fast_forward,
 )
-from model.uttt_model import uTTTConfig, uTTTModel
+from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
+from model.uttt_nvs import uTTTNVSModel
 from train_5090 import export_base_checkpoint
 
 
@@ -184,6 +188,87 @@ class TestuTTTPipeline(unittest.TestCase):
 
         restore_res = personalizer.handle_command("alice", "/restore v1")
         self.assertGreater(restore_res.weight_drift_pct, 0.0)
+
+    def test_04_strict_causal_no_future_leakage_and_cjk_tokenizer(self) -> None:
+        """
+        Verify mathematically that `uTTTModel.forward(update_fast_weights=True)` has
+        ZERO intra-chunk or cross-layer future token leakage (modifying tokens t' >= t0
+        leaves logits[:, :t0, :] bit-for-bit identical), and verify CJK 1-token encoding.
+        """
+        tok = SimpleUTF8Tokenizer(vocab_size=32000)
+        sample_text = "<|user|> 你好，我是Phova！\n<|assistant|> 你好！很高兴认识你。"
+        encoded = tok.encode(sample_text, add_bos=True, add_eos=True)
+        decoded = tok.decode(encoded, skip_special_tokens=True)
+        self.assertIn("你好，我是Phova！", decoded)
+        self.assertIn(tok.USER_ID, encoded)
+        self.assertIn(tok.ASSISTANT_ID, encoded)
+
+        cfg = uTTTConfig(
+            vocab_size=512,
+            d_model=64,
+            n_layers=3,
+            n_heads=4,
+            n_kv_heads=2,
+            d_ff_fast=128,
+            chunk_size=8,
+            sliding_window_size=32,
+            gradient_checkpointing=False,
+        )
+        model = uTTTModel(cfg).eval()
+        ids_a = torch.randint(0, cfg.vocab_size, (2, 24))
+        ids_b = ids_a.clone()
+        # Corrupt future tokens from index 12..23 (inside chunk 1 and chunk 2)
+        ids_b[:, 12:] = (ids_a[:, 12:] + 77) % cfg.vocab_size
+
+        with torch.no_grad():
+            out_a = model(input_ids=ids_a, update_fast_weights=True)
+            out_b = model(input_ids=ids_b, update_fast_weights=True)
+
+        # Logits for tokens 0..11 must be 100% invariant to future tokens 12..23
+        self.assertTrue(
+            torch.allclose(out_a.logits[:, :12, :], out_b.logits[:, :12, :], atol=1e-5, rtol=1e-5)
+        )
+
+    def test_05_multimodal_nvs_novel_view_synthesis(self) -> None:
+        """
+        Verify `uTTTNVSModel` Plucker ray parameterization, 3D scene compression into
+        shared SwiGLU Fast Weights W_scene, and novel view synthesis readout + gradients.
+        """
+        cfg = uTTTConfig(
+            d_model=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            d_ff_fast=128,
+            chunk_size=16,
+            sliding_window_size=64,
+        )
+        nvs_model = uTTTNVSModel(cfg, img_size=32, patch_size=8)
+        bsz, v_ctx, v_tgt, h, w = 2, 2, 1, 32, 32
+
+        ctx_rgb = torch.rand(bsz, v_ctx, 3, h, w)
+        tgt_rgb = torch.rand(bsz, v_tgt, 3, h, w)
+        eye3 = torch.eye(3).view(1, 1, 3, 3)
+        eye4 = torch.eye(4).view(1, 1, 4, 4)
+        ctx_k = eye3.repeat(bsz, v_ctx, 1, 1) * 16.0
+        ctx_k[:, :, 2, 2] = 1.0
+        ctx_c2w = eye4.repeat(bsz, v_ctx, 1, 1)
+        tgt_k = eye3.repeat(bsz, v_tgt, 1, 1) * 16.0
+        tgt_k[:, :, 2, 2] = 1.0
+        tgt_c2w = eye4.repeat(bsz, v_tgt, 1, 1)
+
+        out = nvs_model(
+            ctx_rgb=ctx_rgb,
+            ctx_intrinsics=ctx_k,
+            ctx_c2w=ctx_c2w,
+            tgt_intrinsics=tgt_k,
+            tgt_c2w=tgt_c2w,
+            tgt_rgb=tgt_rgb,
+        )
+        self.assertEqual(out.rendered_rgb.shape, (bsz, v_tgt, 3, h, w))
+        self.assertGreater(out.scene_fast_state.step, 0)
+        out.loss.backward()
+        self.assertIsNotNone(nvs_model.fast_weight_pool.w_up_init.grad)
 
 
 if __name__ == "__main__":

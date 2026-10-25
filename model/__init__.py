@@ -19,6 +19,11 @@ from model.uttt_model import (
     uTTTModel,
     uTTTModelOutput,
 )
+from model.uttt_nvs import (
+    compute_plucker_rays,
+    uTTTNVSModel,
+    uTTTNVSOutput,
+)
 
 __all__ = [
     "FastWeightState",
@@ -34,4 +39,7 @@ __all__ = [
     "uTTTConfig",
     "uTTTModel",
     "uTTTModelOutput",
+    "compute_plucker_rays",
+    "uTTTNVSModel",
+    "uTTTNVSOutput",
 ]

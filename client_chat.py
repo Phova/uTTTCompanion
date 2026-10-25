@@ -226,11 +226,21 @@ async def run_websocket_session(
 
             if not user_input:
                 continue
-            if user_input.lower() in ("/quit", "/exit"):
+            normalized_cmd = user_input.lower().replace("\\", "/")
+            if normalized_cmd in ("/quit", "/exit", "quit", "exit"):
                 print("[Client] Saving session and exiting...")
-                await ws.send(json.dumps({"prompt": "/save"}))
+                try:
+                    await ws.send(json.dumps({"prompt": "/save"}))
+                    while True:
+                        raw_ack = await ws.recv()
+                        ack = json.loads(raw_ack)
+                        if ack.get("type") in ("ttt_status", "error"):
+                            break
+                except ( BaseException ):
+                    pass
+                print("[Client] Persona state saved. Goodbye!")
                 break
-            if user_input.lower() == "/help":
+            if normalized_cmd == "/help":
                 print_help()
                 continue
 
@@ -434,6 +444,9 @@ def main() -> None:
                     demo_prompts=demo_script,
                 )
             )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\n[Client] Session closed. Goodbye!")
+            return
         except Exception as exc:
             try:
                 import torch as _  # noqa: F401

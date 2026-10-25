@@ -119,9 +119,12 @@ class uTTTModelOutput:
 
 class SimpleUTF8Tokenizer:
     """
-    Deterministic hybrid UTF-8 byte + common-token vocabulary tokenizer.
-    Works offline out-of-the-box and guarantees reversible text encoding/decoding
-    within `vocab_size` without requiring external HuggingFace credentials.
+    Deterministic hybrid CJK + Special-Token + UTF-8 Byte tokenizer.
+    - When `vocab_size >= 24000`, maps all 20,902 standard Chinese characters (U+4E00..U+9FA5)
+      and CJK/fullwidth punctuation (U+3000..U+303F, U+FF00..U+FFEF) directly to 1-token IDs
+      (3x higher compression and zero mid-character UTF-8 split corruption), with lossless
+      UTF-8 byte fallback (`16..271`) for all other characters.
+    - Works 100% offline with zero external hub dependencies.
     """
 
     PAD_ID = 0
@@ -131,9 +134,16 @@ class SimpleUTF8Tokenizer:
     USER_ID = 4
     ASSISTANT_ID = 5
     BYTE_OFFSET = 16
+    CJK_OFFSET = 272
+    CJK_COUNT = 20902          # U+4E00 .. U+9FA5
+    PUNCT30_OFFSET = 21174     # U+3000 .. U+303F (64 chars)
+    PUNCTFF_OFFSET = 21238     # U+FF00 .. U+FFEF (240 chars)
+    ACTIVE_VOCAB_LIMIT = 21478
 
     def __init__(self, vocab_size: int = 32000) -> None:
         self.vocab_size = max(vocab_size, 512)
+        self.enable_cjk = self.vocab_size >= 24000
+        self.active_vocab_size = self.ACTIVE_VOCAB_LIMIT if self.enable_cjk else (self.BYTE_OFFSET + 256)
         self.special_tokens = {
             "<|pad|>": self.PAD_ID,
             "<|bos|>": self.BOS_ID,
@@ -143,6 +153,24 @@ class SimpleUTF8Tokenizer:
             "<|assistant|>": self.ASSISTANT_ID,
         }
         self.id_to_special = {v: k for k, v in self.special_tokens.items()}
+
+    def _encode_segment(self, seg: str, out_ids: List[int]) -> None:
+        if not self.enable_cjk:
+            for b in seg.encode("utf-8", errors="replace"):
+                out_ids.append(self.BYTE_OFFSET + int(b))
+            return
+
+        for ch in seg:
+            cp = ord(ch)
+            if 0x4E00 <= cp <= 0x9FA5:
+                out_ids.append(self.CJK_OFFSET + (cp - 0x4E00))
+            elif 0x3000 <= cp <= 0x303F:
+                out_ids.append(self.PUNCT30_OFFSET + (cp - 0x3000))
+            elif 0xFF00 <= cp <= 0xFFEF:
+                out_ids.append(self.PUNCTFF_OFFSET + (cp - 0xFF00))
+            else:
+                for b in ch.encode("utf-8", errors="replace"):
+                    out_ids.append(self.BYTE_OFFSET + int(b))
 
     def encode(
         self,
@@ -155,9 +183,27 @@ class SimpleUTF8Tokenizer:
         if add_bos:
             ids.append(self.BOS_ID)
 
-        raw_bytes = text.encode("utf-8", errors="replace")
-        for b in raw_bytes:
-            ids.append(self.BYTE_OFFSET + int(b))
+        # Parse inline special role tags (<|user|>, <|assistant|>, etc.) into single tokens
+        idx = 0
+        n = len(text)
+        while idx < n:
+            matched_tag = None
+            if text[idx] == "<" and idx + 4 < n and text[idx + 1] == "|":
+                for tag, tid in self.special_tokens.items():
+                    if text.startswith(tag, idx):
+                        matched_tag = (tag, tid)
+                        break
+            if matched_tag is not None:
+                ids.append(matched_tag[1])
+                idx += len(matched_tag[0])
+            else:
+                next_tag_pos = text.find("<|", idx + 1)
+                if next_tag_pos == -1:
+                    self._encode_segment(text[idx:], ids)
+                    break
+                else:
+                    self._encode_segment(text[idx:next_tag_pos], ids)
+                    idx = next_tag_pos
 
         if add_eos:
             ids.append(self.EOS_ID)
@@ -186,8 +232,16 @@ class SimpleUTF8Tokenizer:
                 continue
             if self.BYTE_OFFSET <= tid < self.BYTE_OFFSET + 256:
                 byte_buffer.append(tid - self.BYTE_OFFSET)
+            elif self.enable_cjk and self.CJK_OFFSET <= tid < self.CJK_OFFSET + self.CJK_COUNT:
+                _flush_bytes()
+                chunks.append(chr(0x4E00 + (tid - self.CJK_OFFSET)))
+            elif self.enable_cjk and self.PUNCT30_OFFSET <= tid < self.PUNCT30_OFFSET + 64:
+                _flush_bytes()
+                chunks.append(chr(0x3000 + (tid - self.PUNCT30_OFFSET)))
+            elif self.enable_cjk and self.PUNCTFF_OFFSET <= tid < self.PUNCTFF_OFFSET + 240:
+                _flush_bytes()
+                chunks.append(chr(0xFF00 + (tid - self.PUNCTFF_OFFSET)))
             else:
-                # Hash higher synthetic vocabulary tokens deterministically to printable ASCII
                 byte_buffer.append(32 + (tid % 95))
 
         _flush_bytes()
@@ -362,6 +416,9 @@ class uTTTModel(nn.Module):
         step_before = fast_state.step
         history_before = list(fast_state.surprise_history)
 
+        init_st = fast_state._init_state if fast_state._init_state is not None else fast_state
+        prev_chunks = fast_state._chunk_states
+
         def _pure_tensor_fn(
             x_in: torch.Tensor,
             w_up: torch.Tensor,
@@ -392,6 +449,8 @@ class uTTTModel(nn.Module):
                 ln_weight=ln_w,
                 ln_bias=ln_b,
                 step=step_before,
+                _init_state=init_st,
+                _chunk_states=prev_chunks,
             )
             out_h, st_out, s_loss, _ = block(
                 x_in,
@@ -489,6 +548,9 @@ class uTTTModel(nn.Module):
         layer_surprise_floats: List[float] = []
 
         cur_fast_state = fast_state
+        if update_fast_weights and (seq_len > self.config.chunk_size or self.training):
+            cur_fast_state._init_state = fast_state
+            cur_fast_state._chunk_states = None
 
         # Sequentially thread `cur_fast_state` through Layer 0 -> Layer 1 -> ... -> Layer L-1
         for idx, block in enumerate(self.layers):
@@ -638,12 +700,25 @@ class uTTTModel(nn.Module):
             next_token_logits = prefill_out.logits[:, -1, :]
             cur_pos = input_ids.shape[1]
             generated_count = 0
+            recent_tokens: List[int] = []
+            active_limit = (
+                SimpleUTF8Tokenizer.ACTIVE_VOCAB_LIMIT
+                if self.config.vocab_size >= 24000
+                else self.config.vocab_size
+            )
 
             while generated_count < max_new_tokens:
                 next_token = self._sample_next_token(
-                    next_token_logits, temperature=temperature, top_p=top_p
+                    next_token_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    recent_tokens=recent_tokens,
+                    active_vocab_limit=active_limit,
                 )
                 token_id = int(next_token.item())
+                if token_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):
+                    break
+                recent_tokens.append(token_id)
                 yield token_id
                 generated_count += 1
 
@@ -754,13 +829,33 @@ class uTTTModel(nn.Module):
 
     @staticmethod
     def _sample_next_token(
-        logits: torch.Tensor, temperature: float = 0.7, top_p: float = 0.9
+        logits: torch.Tensor,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        recent_tokens: Optional[List[int]] = None,
+        repetition_penalty: float = 1.18,
+        active_vocab_limit: Optional[int] = None,
     ) -> torch.Tensor:
-        """Top-p (nucleus) sampling with temperature scaling."""
-        if temperature <= 1e-5:
-            return torch.argmax(logits, dim=-1)
+        """Top-p (nucleus) sampling with repetition penalty and active vocabulary masking."""
+        work_logits = logits.float().clone()
+        # Mask out PAD/BOS/UNK and unallocated upper vocab IDs
+        work_logits[:, SimpleUTF8Tokenizer.PAD_ID] = -1e9
+        work_logits[:, SimpleUTF8Tokenizer.BOS_ID] = -1e9
+        work_logits[:, SimpleUTF8Tokenizer.UNK_ID] = -1e9
+        if active_vocab_limit is not None and active_vocab_limit < work_logits.shape[-1]:
+            work_logits[:, active_vocab_limit:] = -1e9
 
-        scaled_logits = logits.float() / temperature
+        if recent_tokens and repetition_penalty > 1.0:
+            unique_recent = list(set(recent_tokens[-48:]))
+            idx_tensor = torch.tensor(unique_recent, dtype=torch.long, device=work_logits.device)
+            score = work_logits[:, idx_tensor]
+            score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+            work_logits[:, idx_tensor] = score
+
+        if temperature <= 1e-5:
+            return torch.argmax(work_logits, dim=-1)
+
+        scaled_logits = work_logits / temperature
         probs = F.softmax(scaled_logits, dim=-1)
 
         if 0.0 < top_p < 1.0:
