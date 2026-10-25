@@ -18,6 +18,7 @@ Key Architectural Features:
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
@@ -153,24 +154,30 @@ class SimpleUTF8Tokenizer:
             "<|assistant|>": self.ASSISTANT_ID,
         }
         self.id_to_special = {v: k for k, v in self.special_tokens.items()}
+        self._special_re = re.compile(r"(<\|(?:pad|bos|eos|unk|user|assistant)\|>)")
 
     def _encode_segment(self, seg: str, out_ids: List[int]) -> None:
         if not self.enable_cjk:
-            for b in seg.encode("utf-8", errors="replace"):
-                out_ids.append(self.BYTE_OFFSET + int(b))
+            out_ids.extend(self.BYTE_OFFSET + b for b in seg.encode("utf-8", errors="replace"))
             return
 
+        cjk_off = self.CJK_OFFSET
+        p30_off = self.PUNCT30_OFFSET
+        pff_off = self.PUNCTFF_OFFSET
+        byte_off = self.BYTE_OFFSET
         for ch in seg:
             cp = ord(ch)
             if 0x4E00 <= cp <= 0x9FA5:
-                out_ids.append(self.CJK_OFFSET + (cp - 0x4E00))
+                out_ids.append(cjk_off + (cp - 0x4E00))
+            elif 0x20 <= cp <= 0x7E or cp == 0x0A:
+                out_ids.append(byte_off + cp)
             elif 0x3000 <= cp <= 0x303F:
-                out_ids.append(self.PUNCT30_OFFSET + (cp - 0x3000))
+                out_ids.append(p30_off + (cp - 0x3000))
             elif 0xFF00 <= cp <= 0xFFEF:
-                out_ids.append(self.PUNCTFF_OFFSET + (cp - 0xFF00))
+                out_ids.append(pff_off + (cp - 0xFF00))
             else:
                 for b in ch.encode("utf-8", errors="replace"):
-                    out_ids.append(self.BYTE_OFFSET + int(b))
+                    out_ids.append(byte_off + int(b))
 
     def encode(
         self,
@@ -183,27 +190,17 @@ class SimpleUTF8Tokenizer:
         if add_bos:
             ids.append(self.BOS_ID)
 
-        # Parse inline special role tags (<|user|>, <|assistant|>, etc.) into single tokens
-        idx = 0
-        n = len(text)
-        while idx < n:
-            matched_tag = None
-            if text[idx] == "<" and idx + 4 < n and text[idx + 1] == "|":
-                for tag, tid in self.special_tokens.items():
-                    if text.startswith(tag, idx):
-                        matched_tag = (tag, tid)
-                        break
-            if matched_tag is not None:
-                ids.append(matched_tag[1])
-                idx += len(matched_tag[0])
-            else:
-                next_tag_pos = text.find("<|", idx + 1)
-                if next_tag_pos == -1:
-                    self._encode_segment(text[idx:], ids)
-                    break
+        if "<|" in text:
+            for part in self._special_re.split(text):
+                if not part:
+                    continue
+                tid = self.special_tokens.get(part)
+                if tid is not None:
+                    ids.append(tid)
                 else:
-                    self._encode_segment(text[idx:next_tag_pos], ids)
-                    idx = next_tag_pos
+                    self._encode_segment(part, ids)
+        else:
+            self._encode_segment(text, ids)
 
         if add_eos:
             ids.append(self.EOS_ID)
@@ -579,6 +576,11 @@ class uTTTModel(nn.Module):
                 new_kv_caches.append(updated_kv)
 
             layer_surprise_tensors.append(s_loss)
+
+        # Break transient _init_state reference immediately so CUDACachingAllocator frees
+        # intermediate fast-weight tensors as soon as the micro-batch finishes
+        fast_state._init_state = None
+        cur_fast_state._init_state = None
 
         stacked_surprises = torch.stack(layer_surprise_tensors)
         mean_surprise_loss = stacked_surprises.mean()

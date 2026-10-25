@@ -226,8 +226,7 @@ async def run_websocket_session(
 
             if not user_input:
                 continue
-            normalized_cmd = user_input.lower().replace("\\", "/")
-            if normalized_cmd in ("/quit", "/exit", "quit", "exit"):
+            if user_input.lower() in ("/quit", "/exit"):
                 print("[Client] Saving session and exiting...")
                 try:
                     await ws.send(json.dumps({"prompt": "/save"}))
@@ -236,11 +235,11 @@ async def run_websocket_session(
                         ack = json.loads(raw_ack)
                         if ack.get("type") in ("ttt_status", "error"):
                             break
-                except ( BaseException ):
+                except BaseException:
                     pass
                 print("[Client] Persona state saved. Goodbye!")
                 break
-            if normalized_cmd == "/help":
+            if user_input.lower() == "/help":
                 print_help()
                 continue
 

@@ -379,9 +379,6 @@ def fused_chunk_ttt_step(
     max_inner_grad_norm: float,
     normalize_by_dim: bool,
     eps: float,
-    read_w_up: Optional[torch.Tensor] = None,
-    read_w_gate: Optional[torch.Tensor] = None,
-    read_w_down: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -396,7 +393,7 @@ def fused_chunk_ttt_step(
     End-to-end pure-tensor Chunk TTT Step designed for whole-step `torch.compile` fusion:
     Fuses Analytical Gradient + 2-Stage Shape-Aligned Frobenius Norm Clipping +
     First-Order Straight-Through Surprise-to-W0 Coupling + Momentum S_t + Decay W_t +
-    SwiGLU Fast-Weight Readout into a single compiled graph.
+    Strictly Causal SwiGLU Fast-Weight Readout into a single compiled graph.
     """
     bsz = q_chunk.shape[0]
     grad_up, grad_gate, grad_down, surprise_loss = analytical_swiglu_chunk_grad(
@@ -465,17 +462,14 @@ def fused_chunk_ttt_step(
     w_gate_new = decay * w_gate + (s_gate_base - step_gate)
     w_down_new = decay * w_down + (s_down_base - step_down)
 
-    # Strictly Causal Chunk Readout: tokens in chunk `c` read from `read_w_*` (pre-chunk
-    # state updated only by past chunks 0..c-1), preventing intra-chunk future token leakage.
-    rw_up = w_up if read_w_up is None else read_w_up
-    rw_gate = w_gate if read_w_gate is None else read_w_gate
-    rw_down = w_down if read_w_down is None else read_w_down
-
+    # Strictly Causal Chunk Readout: tokens in chunk `c` read from pre-chunk `w_up, w_gate, w_down`
+    # (updated only by past chunks 0..c-1), preventing intra-chunk future token leakage
+    # with zero extra tensor allocations.
     out_chunk = swiglu_fast_forward(
         x=q_chunk,
-        w_up=rw_up,
-        w_gate=rw_gate,
-        w_down=rw_down,
+        w_up=w_up,
+        w_gate=w_gate,
+        w_down=w_down,
         ln_weight=ln_weight,
         ln_bias=ln_bias,
         eps=eps,
@@ -600,7 +594,6 @@ class SharedFastWeightPool(nn.Module):
         alpha_chunk: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,
         update_fast_weights: bool = True,
-        readout_state: Optional[FastWeightState] = None,
     ) -> Tuple[torch.Tensor, FastWeightState, torch.Tensor]:
         """
         Execute one Chunk-wise Parallel TTT step:
@@ -609,17 +602,16 @@ class SharedFastWeightPool(nn.Module):
         3. Update Momentum S_t and Fast Weights W_t:
                S_t = beta * S_{t-1} - eta_t * grad_W L_TTT(W_{t-1}; k_t, v_t)
                W_t = (1 - alpha_t) * W_{t-1} + S_t
-        4. Read out chunk representation using strictly causal pre-chunk state R_{t-1}:
-               o_chunk = f_{R_{t-1}}(q_chunk)
+        4. Read out chunk representation using strictly causal pre-chunk state W_{t-1}:
+               o_chunk = f_{W_{t-1}}(q_chunk)
         """
         bsz = q_chunk.shape[0]
         state = state.ensure_batch_size(bsz)
-        r_state = readout_state.ensure_batch_size(bsz) if readout_state is not None else state
 
         if not update_fast_weights:
             # Frozen fast-weight inference mode (used during token streaming generation):
             # Only read out f_{W_t}(q_chunk); skip redundant k_chunk readout & syncs
-            out = self.forward_readout(q_chunk, r_state)
+            out = self.forward_readout(q_chunk, state)
             surprise_loss = q_chunk.new_zeros((), dtype=torch.float32)
             return out, state, surprise_loss
 
@@ -643,9 +635,6 @@ class SharedFastWeightPool(nn.Module):
                 max_inner_grad_norm=float(self.max_inner_grad_norm or 0.0),
                 normalize_by_dim=self.normalize_loss_by_dim,
                 eps=self.eps,
-                read_w_up=r_state.w_up,
-                read_w_gate=r_state.w_gate,
-                read_w_down=r_state.w_down,
             )
         )
 
@@ -1266,10 +1255,25 @@ class uTTTLayer(nn.Module):
                 chunk_outputs.append(seg_out)
                 chunk_losses.append(seg_loss)
         else:
-            init_st = fast_state._init_state if fast_state._init_state is not None else fast_state
-            prev_chunks = fast_state._chunk_states
-            cur_chunk_states: List[FastWeightState] = []
-            step_counter = fast_state.step
+            init_st = fast_state._init_state
+            if init_st is not None and num_chunks > 1:
+                # Start each layer's causal chunk sweep from initial pre-sequence state W_0
+                # (preventing end-of-sequence chunks of layer l-1 from leaking into chunk 0 of layer l)
+                # while preserving accumulated inner-loop step count across layers.
+                cur_state = FastWeightState(
+                    w_up=init_st.w_up,
+                    w_gate=init_st.w_gate,
+                    w_down=init_st.w_down,
+                    s_up=init_st.s_up,
+                    s_gate=init_st.s_gate,
+                    s_down=init_st.s_down,
+                    ln_weight=init_st.ln_weight,
+                    ln_bias=init_st.ln_bias,
+                    step=fast_state.step,
+                    last_surprise_loss=fast_state.last_surprise_loss,
+                    surprise_history=fast_state.surprise_history,
+                    _init_state=init_st,
+                )
 
             for c_idx in range(num_chunks):
                 start = c_idx * self.chunk_size
@@ -1282,66 +1286,8 @@ class uTTTLayer(nn.Module):
                 alpha_c = alpha[:, start:end, :]
                 mask_c = attention_mask[:, start:end] if attention_mask is not None else None
 
-                # 2D Causal Wavefront Recurrence across (layer l, chunk c):
-                # - Readout R_c^{(l)} uses `init_st` at c=0 and `S_{c-1}^{(l)}` at c>=1
-                #   (strictly causal: zero tokens from chunk >= c ever leak into readout).
-                # - Update base state W_base^{(l, c)} combines horizontal chunk history
-                #   S_{c-1}^{(l)} and vertical cross-layer history S_c^{(l-1)} - S_{c-1}^{(l-1)}.
-                if c_idx == 0:
-                    read_st = init_st
-                    if prev_chunks is not None and len(prev_chunks) > 0:
-                        p0 = prev_chunks[0]
-                        base_st = FastWeightState(
-                            w_up=p0.w_up,
-                            w_gate=p0.w_gate,
-                            w_down=p0.w_down,
-                            s_up=p0.s_up,
-                            s_gate=p0.s_gate,
-                            s_down=p0.s_down,
-                            ln_weight=p0.ln_weight,
-                            ln_bias=p0.ln_bias,
-                            step=step_counter,
-                            last_surprise_loss=fast_state.last_surprise_loss,
-                            surprise_history=fast_state.surprise_history,
-                        )
-                    else:
-                        base_st = FastWeightState(
-                            w_up=fast_state.w_up,
-                            w_gate=fast_state.w_gate,
-                            w_down=fast_state.w_down,
-                            s_up=fast_state.s_up,
-                            s_gate=fast_state.s_gate,
-                            s_down=fast_state.s_down,
-                            ln_weight=fast_state.ln_weight,
-                            ln_bias=fast_state.ln_bias,
-                            step=step_counter,
-                            last_surprise_loss=fast_state.last_surprise_loss,
-                            surprise_history=fast_state.surprise_history,
-                        )
-                else:
-                    s_left = cur_chunk_states[c_idx - 1]
-                    read_st = s_left
-                    if prev_chunks is not None and c_idx < len(prev_chunks):
-                        s_up_layer = prev_chunks[c_idx]
-                        s_diag = prev_chunks[c_idx - 1]
-                        base_st = FastWeightState(
-                            w_up=s_left.w_up + (s_up_layer.w_up - s_diag.w_up),
-                            w_gate=s_left.w_gate + (s_up_layer.w_gate - s_diag.w_gate),
-                            w_down=s_left.w_down + (s_up_layer.w_down - s_diag.w_down),
-                            s_up=s_left.s_up,
-                            s_gate=s_left.s_gate,
-                            s_down=s_left.s_down,
-                            ln_weight=s_left.ln_weight,
-                            ln_bias=s_left.ln_bias,
-                            step=step_counter,
-                            last_surprise_loss=s_left.last_surprise_loss,
-                            surprise_history=s_left.surprise_history,
-                        )
-                    else:
-                        base_st = s_left
-
-                out_c, updated_c, loss_c = fast_pool.chunk_step(
-                    state=base_st,
+                out_c, cur_state, loss_c = fast_pool.chunk_step(
+                    state=cur_state,
                     q_chunk=q_c,
                     k_chunk=k_c,
                     v_chunk=v_c,
@@ -1349,16 +1295,11 @@ class uTTTLayer(nn.Module):
                     alpha_chunk=alpha_c,
                     token_mask=mask_c,
                     update_fast_weights=True,
-                    readout_state=read_st,
                 )
-                step_counter = updated_c.step
-                cur_chunk_states.append(updated_c)
                 chunk_outputs.append(out_c)
                 chunk_losses.append(loss_c)
 
-            cur_state = cur_chunk_states[-1]
             cur_state._init_state = init_st
-            cur_state._chunk_states = cur_chunk_states
 
         out = torch.cat(chunk_outputs, dim=1)                       # (B, T, D)
         mean_surprise_loss = torch.stack(chunk_losses).mean()

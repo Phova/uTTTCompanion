@@ -28,7 +28,7 @@ model:
   dropout: 0.0
 
 uttt:
-  chunk_size: 256                      # Causal chunk size C=256 (4 causal chunks per 1024-tok sequence)
+  chunk_size: 512                      # Window-aligned parallel TTT step size C=512 (2x Tensor Core arithmetic intensity on 5090)
   base_inner_lr: 0.015                 # Base dynamic learning rate scale (eta_base)
   base_weight_decay: 0.005             # Base dynamic forget gate scale (alpha_base)
   momentum_beta: 0.90                  # Inner-loop momentum factor (beta)
