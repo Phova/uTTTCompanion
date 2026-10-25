@@ -545,7 +545,7 @@ class uTTTModel(nn.Module):
         layer_surprise_floats: List[float] = []
 
         cur_fast_state = fast_state
-        if update_fast_weights and (seq_len > self.config.chunk_size or self.training):
+        if update_fast_weights and logits_to_keep >= 0 and (seq_len > self.config.chunk_size or self.training):
             cur_fast_state._init_state = fast_state
             cur_fast_state._chunk_states = None
 

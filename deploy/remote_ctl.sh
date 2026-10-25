@@ -234,13 +234,21 @@ cmd_train() {
 
     remote_exec "bash -c \"
         mkdir -p '${REMOTE_DIR}/logs' '${REMOTE_DIR}/checkpoints';
-        : > '${LOG_FILE}';
         if command -v tmux >/dev/null 2>&1; then
             tmux has-session -t '${TMUX_SERVE_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_SERVE_SESSION}';
-            tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_TRAIN_SESSION}';
+            if tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null; then
+                pkill -TERM -f 'train_5090.py' 2>/dev/null || true;
+                for _ in {1..10}; do
+                    ls '${REMOTE_DIR}/checkpoints/'*.tmp* >/dev/null 2>&1 || break;
+                    sleep 0.5;
+                done;
+                tmux kill-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null || true;
+            fi;
+            : > '${LOG_FILE}';
             tmux new-session -d -s '${TMUX_TRAIN_SESSION}' \\\"${TRAIN_CMD}\\\";
             echo '[Remote] Started tmux session: ${TMUX_TRAIN_SESSION}';
         else
+            : > '${LOG_FILE}';
             nohup bash -c \\\"${TRAIN_CMD}\\\" >/dev/null 2>&1 &
             echo '[Remote] tmux not found; started background training via nohup (PID: '\$!')';
         fi
@@ -248,18 +256,19 @@ cmd_train() {
 
     log_ok "Training started in background on remote RTX 5090."
     log_info "Streaming real-time training loss from ${LOG_FILE} (Press Ctrl+C to detach local log view; remote training will continue)..."
-    ssh -tt "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "bash -c \"
-        trap 'kill \\\${TAIL_PID:-} 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE;
-        sleep 1;
-        tail -n +1 -f '${LOG_FILE}' &
-        TAIL_PID=\\\$!;
-        while tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null; do
-            sleep 1;
-        done;
-        sleep 1;
-        kill \\\${TAIL_PID} 2>/dev/null || true;
-        echo '[Remote] Training session (${TMUX_TRAIN_SESSION}) finished.';
-    \"" || true
+    trap 'printf "\n"; log_info "Detached local log view (remote training continues in tmux ${TMUX_TRAIN_SESSION})."; exit 0' INT TERM
+    remote_exec "LOG_FILE='${LOG_FILE}' TMUX_TRAIN_SESSION='${TMUX_TRAIN_SESSION}' bash -s" <<'EOF' || true
+trap 'kill ${TAIL_PID:-} 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
+sleep 1
+tail -n +1 -f "${LOG_FILE}" &
+TAIL_PID=$!
+while tmux has-session -t "${TMUX_TRAIN_SESSION}" 2>/dev/null; do
+    [[ $(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ') -eq 1 ]] && break
+    sleep 1
+done
+kill "${TAIL_PID}" 2>/dev/null || true
+echo "[Remote] Training session (${TMUX_TRAIN_SESSION}) finished."
+EOF
 }
 
 # ------------------------------------------------------------------------------
@@ -369,9 +378,10 @@ cmd_serve() {
     log_info "  python  client_chat.py --user-id Phova --ws-url ws://localhost:${LOCAL_TUNNEL_PORT}   (Windows PowerShell)"
     log_info "Press Ctrl+C to close the local SSH tunnel (remote server stays running in tmux '${TMUX_SERVE_SESSION}')."
 
+    trap 'printf "\n"; log_info "Closed local SSH tunnel (remote server remains active in tmux ${TMUX_SERVE_SESSION})."; exit 0' INT TERM
     ssh "${SSH_OPTS[@]}" \
         -N -L "${LOCAL_TUNNEL_PORT}:${REMOTE_INTERNAL_IP}:${REMOTE_SERVICE_PORT}" \
-        "${REMOTE_TARGET}"
+        "${REMOTE_TARGET}" || true
 }
 
 # ------------------------------------------------------------------------------
@@ -400,8 +410,9 @@ cmd_status() {
         local INTERVAL_MS="${1:-200}"
         [[ ! "${INTERVAL_MS}" =~ ^[0-9]+$ ]] && INTERVAL_MS=200
         log_info "Live RTX 5090 High-Refresh Monitor on ${REMOTE_TARGET} (Refresh: ${INTERVAL_MS}ms / 5Hz | Ctrl+C to exit)"
-        ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "REMOTE_DIR='${REMOTE_DIR}' INTERVAL_MS='${INTERVAL_MS}' bash -s" <<'EOF'
-pkill -9 -f 'nvidia-smi --query-gpu=' 2>/dev/null || true
+        trap 'printf "\n"; exit 0' INT TERM
+        ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "REMOTE_DIR='${REMOTE_DIR}' INTERVAL_MS='${INTERVAL_MS}' bash -s" <<'EOF' || true
+pkill -TERM -f 'nvidia-smi --query-gpu=' 2>/dev/null || true
 STAT_FILE="/dev/shm/uttt_gpu_stat"
 [[ ! -d /dev/shm ]] && STAT_FILE="/tmp/uttt_gpu_stat"
 echo "100, --, 26225, 32607, ---, ----, --" > "${STAT_FILE}"
@@ -410,7 +421,7 @@ nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.tot
     echo "${line}" > "${STAT_FILE}.tmp" && mv -f "${STAT_FILE}.tmp" "${STAT_FILE}"
 done &
 SMI_PID=$!
-trap 'kill -9 ${SMI_PID} 2>/dev/null || true; pkill -9 -P $$ 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
+trap 'kill -TERM ${SMI_PID} 2>/dev/null || true; pkill -TERM -f "nvidia-smi --query-gpu=" 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
 
 ESC=$(printf '\033')
 TICK=0
@@ -421,6 +432,7 @@ SLEEP_SEC=$(awk "BEGIN {printf \"%.3f\", ${INTERVAL_MS}/1000}")
 printf '\n\n\n\n\n'
 
 while true; do
+    [[ $(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ') -eq 1 ]] && break
     IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP < "${STAT_FILE}" 2>/dev/null || true
     U_GPU="${U_GPU// /}"; U_MEM="${U_MEM// /}"; M_USED="${M_USED// /}"; M_TOT="${M_TOT// /}"
     PWR="${PWR// /}"; CLK="${CLK// /}"; TMP="${TMP// /}"
@@ -460,8 +472,9 @@ cmd_logs() {
     else
         LOG_PATH="${REMOTE_DIR}/logs/train_5090.log"
     fi
-    log_info "Tailing remote log: ${LOG_PATH}..."
-    remote_exec "tail -n 100 -f '${LOG_PATH}'"
+    log_info "Tailing remote log: ${LOG_PATH} (Press Ctrl+C to exit)..."
+    trap 'printf "\n"; exit 0' INT TERM
+    remote_exec "tail -n 100 -f '${LOG_PATH}'" || true
 }
 
 cmd_stop() {
@@ -469,6 +482,11 @@ cmd_stop() {
     TARGET_MODE="${1:-all}"
     remote_exec "bash -c \"
         if [[ '${TARGET_MODE}' == 'train' || '${TARGET_MODE}' == 'all' ]]; then
+            pkill -TERM -f 'train_5090.py' 2>/dev/null || true;
+            for _ in {1..10}; do
+                ls '${REMOTE_DIR}/checkpoints/'*.tmp* >/dev/null 2>&1 || break;
+                sleep 0.5;
+            done;
             tmux kill-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null && echo 'Stopped ${TMUX_TRAIN_SESSION}' || true;
         fi
         if [[ '${TARGET_MODE}' == 'serve' || '${TARGET_MODE}' == 'all' ]]; then
@@ -479,45 +497,50 @@ cmd_stop() {
 }
 
 # ------------------------------------------------------------------------------
-# 9. Entrypoint Dispatcher
+# 9. Entrypoint Dispatcher (Wrapped in main() to prevent on-disk edit offset shifts)
 # ------------------------------------------------------------------------------
-COMMAND="${1:-help}"
-shift || true
+main() {
+    local COMMAND="${1:-help}"
+    shift || true
 
-case "${COMMAND}" in
-    init-env)
-        cmd_init_env "$@"
-        ;;
-    sync)
-        cmd_sync "$@"
-        ;;
-    prepare-data)
-        cmd_prepare_data "$@"
-        ;;
-    train)
-        cmd_train "$@"
-        ;;
-    pull-ckpt)
-        cmd_pull_ckpt "$@"
-        ;;
-    serve)
-        cmd_serve "$@"
-        ;;
-    status)
-        cmd_status "$@"
-        ;;
-    logs)
-        cmd_logs "$@"
-        ;;
-    stop)
-        cmd_stop "$@"
-        ;;
-    help|--help|-h)
-        usage
-        ;;
-    *)
-        log_error "Unknown subcommand: '${COMMAND}'"
-        usage
-        exit 1
-        ;;
-esac
+    case "${COMMAND}" in
+        init-env)
+            cmd_init_env "$@"
+            ;;
+        sync)
+            cmd_sync "$@"
+            ;;
+        prepare-data)
+            cmd_prepare_data "$@"
+            ;;
+        train)
+            cmd_train "$@"
+            ;;
+        pull-ckpt)
+            cmd_pull_ckpt "$@"
+            ;;
+        serve)
+            cmd_serve "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        logs)
+            cmd_logs "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            log_error "Unknown subcommand: '${COMMAND}'"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
+exit 0

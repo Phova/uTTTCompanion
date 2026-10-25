@@ -22,9 +22,12 @@ Key Features:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -38,6 +41,26 @@ import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
+
+
+def _wait_for_active_save() -> None:
+    global _ACTIVE_SAVE_THREAD
+    if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
+        print("[Checkpoint] Waiting for in-flight background checkpoint write to complete...", flush=True)
+        _ACTIVE_SAVE_THREAD.join()
+
+
+atexit.register(_wait_for_active_save)
+
+
+def _graceful_signal_handler(signum: int, _frame: Any) -> None:
+    _wait_for_active_save()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _graceful_signal_handler)
+if hasattr(signal, "SIGHUP"):
+    signal.signal(signal.SIGHUP, _graceful_signal_handler)
 
 
 # ==============================================================================
@@ -187,9 +210,17 @@ class PersonaMetaDataset(Dataset):
             for i, tid in enumerate(token_ids):
                 if tid == self.tokenizer.PAD_ID:
                     labels[i] = -100
-                elif tid in (self.tokenizer.BOS_ID, self.tokenizer.USER_ID):
+                elif tid == self.tokenizer.BOS_ID:
                     in_user_turn = True
                     labels[i] = -100
+                elif tid == self.tokenizer.USER_ID:
+                    if not in_user_turn and i > 0:
+                        # Supervise end-of-turn transition from Assistant -> User in multi-turn dialogues
+                        labels[i] = self.tokenizer.USER_ID
+                        has_supervised = True
+                    else:
+                        labels[i] = -100
+                    in_user_turn = True
                 elif tid == self.tokenizer.ASSISTANT_ID:
                     in_user_turn = False
                     labels[i] = -100
@@ -365,8 +396,19 @@ def export_base_checkpoint(
         payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
 
     def _write_to_disk() -> None:
-        tmp_path = out_path.with_suffix(".tmp.pt")
-        torch.save(payload, tmp_path)
+        tmp_path = Path(str(out_path) + ".tmp")
+        prev_path = Path(str(out_path) + ".prev")
+        with open(tmp_path, "wb") as f:
+            torch.save(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        if out_path.exists():
+            try:
+                if prev_path.exists() or prev_path.is_symlink():
+                    prev_path.unlink()
+                os.link(out_path, prev_path)
+            except Exception:
+                pass
         os.replace(tmp_path, out_path)
         size_mb = out_path.stat().st_size / (1024 * 1024)
         print(f"[Checkpoint] Saved Base Checkpoint -> {out_path} ({size_mb:.2f} MB)", flush=True)
@@ -518,46 +560,60 @@ def train(
     start_step = 1
     cur_data_tag = str(data_path or "synthetic")
     ckpt_file = Path(ckpt_path)
-    if resume and not lightweight_preset and ckpt_file.exists():
-        try:
-            saved = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-            saved_cfg = saved.get("config", {})
-            saved_metrics = saved.get("metrics", {})
-            saved_step = int(saved.get("step", 0))
-            saved_loss = float(saved_metrics.get("total_loss", 0.0))
-            dims_match = (
-                saved_cfg.get("d_model") == model_cfg.d_model
-                and saved_cfg.get("n_layers") == model_cfg.n_layers
-                and saved_cfg.get("d_ff_fast") == model_cfg.d_ff_fast
-                and saved_cfg.get("vocab_size") == model_cfg.vocab_size
-            )
-            is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
-            same_data = saved_metrics.get("data_source", cur_data_tag) == cur_data_tag
-            if dims_match and is_causal_v2 and same_data and 0 < saved_step < max_steps and math.isfinite(saved_loss):
-                model.load_dual_base_state(
-                    saved["slow_weights"],
-                    saved["init_fast_weights"],
-                    strict=True,
+    prev_ckpt_file = Path(str(ckpt_path) + ".prev")
+    if resume and not lightweight_preset and (ckpt_file.exists() or prev_ckpt_file.exists()):
+        saved = None
+        loaded_from = ckpt_file
+        for cand_file in (ckpt_file, prev_ckpt_file):
+            if not cand_file.exists():
+                continue
+            try:
+                saved = torch.load(cand_file, map_location="cpu", weights_only=False)
+                loaded_from = cand_file
+                break
+            except Exception as exc:
+                print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
+        if saved is not None:
+            try:
+                saved_cfg = saved.get("config", {})
+                saved_metrics = saved.get("metrics", {})
+                saved_step = int(saved.get("step", 0))
+                saved_loss = float(saved_metrics.get("total_loss", 0.0))
+                dims_match = (
+                    saved_cfg.get("d_model") == model_cfg.d_model
+                    and saved_cfg.get("n_layers") == model_cfg.n_layers
+                    and saved_cfg.get("d_ff_fast") == model_cfg.d_ff_fast
+                    and saved_cfg.get("vocab_size") == model_cfg.vocab_size
                 )
-                if "optimizer_state" in saved:
-                    optimizer.load_state_dict(saved["optimizer_state"])
-                start_step = saved_step + 1
-                print(
-                    f"[Resume] Resumed from {ckpt_file} at step {saved_step}/{max_steps} "
-                    f"(Last Loss: {saved_loss:.4f})",
-                    flush=True,
-                )
-            elif not is_causal_v2 or not same_data:
-                print(
-                    f"[Resume] Existing {ckpt_file} is from legacy non-causal run or different dataset; "
-                    "starting fresh causal meta-training from step 1.",
-                    flush=True,
-                )
-            del saved
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        except Exception as exc:
-            print(f"[Resume] Could not resume from {ckpt_file} ({exc}); starting fresh.", flush=True)
+                is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
+                same_data = saved_metrics.get("data_source", cur_data_tag) == cur_data_tag
+                if dims_match and is_causal_v2 and same_data and 0 < saved_step < max_steps and math.isfinite(saved_loss):
+                    model.load_dual_base_state(
+                        saved["slow_weights"],
+                        saved["init_fast_weights"],
+                        strict=True,
+                    )
+                    if "optimizer_state" in saved:
+                        optimizer.load_state_dict(saved["optimizer_state"])
+                    start_step = saved_step + 1
+                    print(
+                        f"[Resume] Resumed from {loaded_from} at step {saved_step}/{max_steps} "
+                        f"(Last Loss: {saved_loss:.4f})",
+                        flush=True,
+                    )
+                elif not is_causal_v2 or not same_data:
+                    print(
+                        f"[Resume] Existing {loaded_from} is from legacy non-causal run or different dataset; "
+                        "starting fresh causal meta-training from step 1.",
+                        flush=True,
+                    )
+                del saved
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            except Exception as exc:
+                print(f"[Resume] Could not restore state from {loaded_from} ({exc}); starting fresh.", flush=True)
+        else:
+            print(f"[Resume] No readable checkpoint found at {ckpt_file}; starting fresh.", flush=True)
 
     # Compile full uTTTBlocks after weights are loaded so state_dict keys remain clean
     maybe_compile_inner_loop(

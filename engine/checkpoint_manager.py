@@ -94,6 +94,9 @@ class DualTrackCheckpointManager:
             auto_create=auto_create_base_if_missing,
             lightweight_fallback=lightweight_fallback,
         )
+        with torch.no_grad():
+            w0_sum = float(self.model.fast_weight_pool.w_up_0.detach().float().abs().sum().item())
+        self.base_signature = f"{self.config.d_model}x{self.config.d_ff_fast}:{w0_sum:.6f}"
 
     # --------------------------------------------------------------------------
     # Base Checkpoint Loading & Initialization
@@ -248,14 +251,34 @@ class DualTrackCheckpointManager:
             # Tier 3: Disk Persona Checkpoint Hit
             disk_path = self._find_existing_persona_file(safe_uid)
             if disk_path is not None:
-                payload = torch.load(disk_path, map_location="cpu", weights_only=False)
-                fast_dict = payload.get("fast_state", payload)
-                gpu_state = FastWeightState.from_state_dict(
-                    fast_dict, device=self.device, dtype=self.dtype
-                )
-                self._user_metadata[safe_uid] = payload.get("metadata", {})
-                self._gpu_lru[safe_uid] = gpu_state
-                return gpu_state
+                try:
+                    payload = torch.load(disk_path, map_location="cpu", weights_only=False)
+                    saved_sig = payload.get("base_signature")
+                    if saved_sig is None or saved_sig == self.base_signature:
+                        fast_dict = payload.get("fast_state", payload)
+                        gpu_state = FastWeightState.from_state_dict(
+                            fast_dict, device=self.device, dtype=self.dtype
+                        )
+                        if (
+                            gpu_state.w_up.shape[-2] == self.config.d_model
+                            and gpu_state.w_up.shape[-1] == self.config.d_ff_fast
+                            and saved_sig == self.base_signature
+                        ):
+                            self._user_metadata[safe_uid] = payload.get("metadata", {})
+                            self._gpu_lru[safe_uid] = gpu_state
+                            return gpu_state
+                    print(
+                        f"[CheckpointManager] Persona '{safe_uid}' on disk was created under a "
+                        f"different Base Checkpoint ({saved_sig} != {self.base_signature}); "
+                        "auto-resetting to current Base W_0.",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[CheckpointManager] Could not load persona '{safe_uid}' from {disk_path} ({exc}); "
+                        "re-initializing from Base W_0.",
+                        flush=True,
+                    )
 
             # Cold Start: Clone W_0 from SharedFastWeightPool
             fresh_state = self.model.init_fast_state(
@@ -307,10 +330,13 @@ class DualTrackCheckpointManager:
             return None
 
     def _write_payload_files(self, primary_path: Path, alias_path: Path, payload: Dict[str, Any]) -> None:
-        """Thread-safe atomic disk writer with hardlink alias optimization."""
+        """Thread-safe atomic disk writer with fsync and hardlink alias optimization."""
         with self._disk_lock:
-            tmp_path = primary_path.with_suffix(".tmp.pt")
-            torch.save(payload, tmp_path)
+            tmp_path = Path(str(primary_path) + ".tmp")
+            with open(tmp_path, "wb") as f:
+                torch.save(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, primary_path)
 
             # Synchronize `{user_id}.pt` via zero-copy hardlink (fallback to copy2 if cross-device)
@@ -340,6 +366,7 @@ class DualTrackCheckpointManager:
             "checkpoint_type": "uTTT_User_Persona_State",
             "version": "1.0.0",
             "user_id": safe_uid,
+            "base_signature": self.base_signature,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "fast_state": state.to_state_dict(),
             "drift_metrics": drift_info,
