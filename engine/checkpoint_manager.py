@@ -95,7 +95,7 @@ class DualTrackCheckpointManager:
             lightweight_fallback=lightweight_fallback,
         )
         with torch.no_grad():
-            w0_sum = float(self.model.fast_weight_pool.w_up_0.detach().float().abs().sum().item())
+            w0_sum = float(self.model.fast_weight_pool.w_up_init.detach().float().abs().sum().item())
         self.base_signature = f"{self.config.d_model}x{self.config.d_ff_fast}:{w0_sum:.6f}"
 
     # --------------------------------------------------------------------------
