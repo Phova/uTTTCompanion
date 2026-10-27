@@ -19,12 +19,14 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from engine.checkpoint_manager import DualTrackCheckpointManager
 from engine.personalizer import uTTTPersonalizer
@@ -36,7 +38,7 @@ from engine.personalizer import uTTTPersonalizer
 
 class ChatRequest(BaseModel):
     user_id: str = Field(default="default_user", description="Unique user identifier")
-    prompt: str = Field(..., description="User message or slash command (/save, /reset, /snapshot, /diff)")
+    prompt: str = Field(..., min_length=1, description="User message or slash command (/save, /reset, /snapshot, /diff)")
     max_new_tokens: Optional[int] = Field(default=None, ge=1, le=1024)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, gt=0.0, le=1.0)
@@ -44,7 +46,7 @@ class ChatRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     user_id: str = Field(default="default_user", description="Unique user identifier")
-    command: str = Field(..., description="Slash command: /save, /reset, /snapshot [tag], /restore <tag>, /diff")
+    command: str = Field(..., min_length=1, description="Slash command: /save, /reset, /snapshot [tag], /restore <tag>, /diff")
 
 
 # ==============================================================================
@@ -144,8 +146,15 @@ async def lifespan(app: FastAPI):
         engine.ckpt_manager.get_user_state(prewarm_user)
         print(f"[Server] Pre-warmed persona state for user_id='{prewarm_user}' in GPU VRAM.")
     print(f"[Server] uTTT Personalization Engine online | Pool: {engine.ckpt_manager.pool_status()}")
-    yield
-    print("[Server] Shutting down uTTT Personalization Server...")
+    app.state.engine_lock = asyncio.Lock()
+    # Generators retain thread-local autocast state across yields. Always resume
+    # and close them on this same worker, and serialize complete GPU operations.
+    app.state.engine_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="uttt-engine")
+    try:
+        yield
+    finally:
+        app.state.engine_executor.shutdown(wait=True)
+        print("[Server] Shutting down uTTT Personalization Server...")
 
 
 app = FastAPI(
@@ -162,6 +171,37 @@ app = FastAPI(
 # ==============================================================================
 # 3. REST & WebSocket Endpoints
 # ==============================================================================
+
+async def _on_engine_thread(func, *args, **kwargs):
+    future = asyncio.get_running_loop().run_in_executor(
+        app.state.engine_executor, partial(func, *args, **kwargs)
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Do not release the operation lock while its worker is still running.
+        await asyncio.shield(future)
+        raise
+
+
+async def _run_engine(func, *args, **kwargs):
+    async with app.state.engine_lock:
+        return await _on_engine_thread(func, *args, **kwargs)
+
+
+async def _stream_engine(engine, req):
+    async with app.state.engine_lock:
+        gen = engine.stream_interact_and_evolve(**req.model_dump())
+        sentinel = object()
+        try:
+            while True:
+                event = await _on_engine_thread(next, gen, sentinel)
+                if event is sentinel:
+                    break
+                yield event
+        finally:
+            await _on_engine_thread(gen.close)
+
 
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
@@ -186,7 +226,7 @@ async def health_check() -> Dict[str, Any]:
 async def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
     engine = get_personalizer()
     try:
-        result = await asyncio.to_thread(
+        result = await _run_engine(
             engine.interact_and_evolve,
             user_id=req.user_id,
             prompt=req.prompt,
@@ -195,6 +235,8 @@ async def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
             top_p=req.top_p,
         )
         return result.to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -203,7 +245,7 @@ async def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
 async def command_endpoint(req: CommandRequest) -> Dict[str, Any]:
     engine = get_personalizer()
     try:
-        result = await asyncio.to_thread(
+        result = await _run_engine(
             engine.handle_command,
             user_id=req.user_id,
             command_text=req.command,
@@ -217,7 +259,7 @@ async def command_endpoint(req: CommandRequest) -> Dict[str, Any]:
 async def persona_diff_endpoint(user_id: str) -> Dict[str, Any]:
     engine = get_personalizer()
     try:
-        return await asyncio.to_thread(engine.ckpt_manager.compute_user_drift, user_id)
+        return await _run_engine(engine.ckpt_manager.compute_user_drift, user_id)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -234,8 +276,13 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: str) -> None:
     engine = get_personalizer()
 
     # Warm up user's FastWeightState into GPU LRU pool on connect
-    await asyncio.to_thread(engine.ckpt_manager.get_user_state, user_id)
-    init_drift = await asyncio.to_thread(engine.ckpt_manager.compute_user_drift, user_id)
+    try:
+        await _run_engine(engine.ckpt_manager.get_user_state, user_id)
+        init_drift = await _run_engine(engine.ckpt_manager.compute_user_drift, user_id)
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1008)
+        return
     await websocket.send_json(
         {
             "type": "session_ready",
@@ -252,46 +299,27 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: str) -> None:
                 continue
 
             try:
-                payload = json.loads(raw_msg)
-                if isinstance(payload, dict):
-                    prompt = str(payload.get("prompt", "")).strip()
-                    max_new_tokens = payload.get("max_new_tokens")
-                    temperature = payload.get("temperature")
-                    top_p = payload.get("top_p")
-                else:
-                    prompt = str(payload).strip()
-                    max_new_tokens = None
-                    temperature = None
-                    top_p = None
-            except json.JSONDecodeError:
-                prompt = raw_msg.strip()
-                max_new_tokens = None
-                temperature = None
-                top_p = None
-
-            if not prompt:
-                continue
-
-            # Stream events from the generator without blocking the event loop
-            gen = engine.stream_interact_and_evolve(
-                user_id=user_id,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            )
-
-            def _next_event(it):
                 try:
-                    return next(it)
-                except StopIteration:
-                    return None
-
-            while True:
-                event = await asyncio.to_thread(_next_event, gen)
-                if event is None:
-                    break
-                await websocket.send_json(event)
+                    payload = json.loads(raw_msg)
+                except json.JSONDecodeError:
+                    payload = raw_msg
+                if isinstance(payload, str):
+                    payload = {"prompt": payload}
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected a message string or JSON object")
+                req = ChatRequest(**{**payload, "user_id": user_id})
+                if not req.prompt.strip():
+                    raise ValueError("Prompt must not be blank")
+                stream = _stream_engine(engine, req)
+                try:
+                    async for event in stream:
+                        await websocket.send_json(event)
+                finally:
+                    await stream.aclose()
+            except (ValueError, ValidationError, FileNotFoundError) as exc:
+                await websocket.send_json({"type": "error", "message": str(exc)})
+                # A bad message must not terminate an otherwise healthy session.
+                continue
 
     except WebSocketDisconnect:
         pass

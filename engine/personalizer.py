@@ -23,6 +23,7 @@ Implements the complete closed-loop Test-Time Shaping state machine:
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 
@@ -209,11 +210,13 @@ class uTTTPersonalizer:
 
     def is_slash_command(self, text: str) -> bool:
         stripped = text.strip()
-        return stripped.startswith(("/save", "/reset", "/snapshot", "/restore", "/diff"))
+        return bool(stripped) and stripped.split()[0].lower() in {"/save", "/reset", "/snapshot", "/restore", "/diff"}
 
     def handle_command(self, user_id: str, command_text: str) -> EvolutionResult:
         """Execute state control commands (`/save`, `/reset`, `/snapshot`, `/diff`)."""
         parts = command_text.strip().split(maxsplit=1)
+        if not parts:
+            raise ValueError("Command must not be blank")
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else None
 
@@ -335,6 +338,15 @@ class uTTTPersonalizer:
         temp = temperature if temperature is not None else self.temperature
         tp = top_p if top_p is not None else self.top_p
 
+        if not prompt.strip():
+            raise ValueError("Prompt must not be blank")
+        if not isinstance(max_tokens, int) or not 1 <= max_tokens < self.config.max_seq_len:
+            raise ValueError(f"max_new_tokens must be between 1 and {self.config.max_seq_len - 1}")
+        if not math.isfinite(temp) or not 0.0 <= temp <= 2.0:
+            raise ValueError("temperature must be finite and between 0 and 2")
+        if not math.isfinite(tp) or not 0.0 < tp <= 1.0:
+            raise ValueError("top_p must be finite and in (0, 1]")
+
         # Retrieve user's isolated FastWeightState on GPU
         user_state = self.ckpt_manager.get_user_state(user_id)
 
@@ -355,7 +367,7 @@ class uTTTPersonalizer:
         emitted_len = 0
         autocast_dev = "cuda" if self.device.type == "cuda" else "cpu"
 
-        with torch.amp.autocast(autocast_dev, dtype=self.dtype):
+        with torch.amp.autocast(autocast_dev, dtype=self.dtype, enabled=self.dtype != torch.float32):
             for tok_id in self.model.stream_generate(
                 input_ids=input_tensor,
                 fast_state=user_state,
@@ -414,7 +426,7 @@ class uTTTPersonalizer:
                 )
             torch.cuda.current_stream(self.device).wait_stream(self._ttt_stream)
         else:
-            with torch.amp.autocast(autocast_dev, dtype=self.dtype):
+            with torch.amp.autocast(autocast_dev, dtype=self.dtype, enabled=self.dtype != torch.float32):
                 candidate_state, surprise_loss, layer_surprises = self.model.test_time_update(
                     interaction_ids=interaction_tensor,
                     fast_state=user_state,

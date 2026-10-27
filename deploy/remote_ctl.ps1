@@ -98,9 +98,11 @@ function Get-SshArgs([bool]$ForScp = $false) {
 function Invoke-RemotePS([string]$PsScript) {
     Assert-Config
     $sshArgs = Get-SshArgs
+    $PsScript = "`$ErrorActionPreference = 'Stop'`n" + $PsScript
     $bytes = [System.Text.Encoding]::Unicode.GetBytes($PsScript)
     $encoded = [Convert]::ToBase64String($bytes)
     & ssh @sshArgs "${RemoteUser}@${RemoteHost}" "powershell -NoProfile -NonInteractive -EncodedCommand $encoded"
+    if ($LASTEXITCODE -ne 0) { throw "Remote command failed (exit $LASTEXITCODE)" }
 }
 
 # ------------------------------------------------------------------------------
@@ -121,6 +123,8 @@ New-Item -ItemType Directory -Force -Path '$RemoteDir/logs' | Out-Null
     try {
         & tar.exe -czf $TempTar `
             --exclude=".git" `
+            --exclude=".env" `
+            --exclude="data" `
             --exclude="checkpoints" `
             --exclude="personas" `
             --exclude="logs" `
@@ -130,13 +134,16 @@ New-Item -ItemType Directory -Force -Path '$RemoteDir/logs' | Out-Null
             --exclude=".pytest_cache" `
             --exclude=".cache" `
             .
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create sync archive" }
 
         $scpArgs = Get-SshArgs -ForScp $true
         & scp.exe @scpArgs $TempTar "${RemoteUser}@${RemoteHost}:${RemoteDir}/uttt_sync.tar.gz"
+        if ($LASTEXITCODE -ne 0) { throw "Failed to transfer sync archive" }
 
         Invoke-RemotePS @"
 Set-Location '$RemoteDir'
 tar.exe -xzf uttt_sync.tar.gz
+if (`$LASTEXITCODE -ne 0) { throw "Failed to extract sync archive" }
 Remove-Item -Force uttt_sync.tar.gz
 "@
     } finally {
@@ -209,6 +216,7 @@ function Invoke-PullCkpt {
     $scpArgs = Get-SshArgs -ForScp $true
     & scp.exe @scpArgs "${RemoteUser}@${RemoteHost}:${RemoteDir}/checkpoints/base_uttt.pt" $LocalCkpt
 
+    if ($LASTEXITCODE -ne 0) { throw "Checkpoint download failed" }
     $LocalHash = (Get-FileHash -Path $LocalCkpt -Algorithm SHA256).Hash
     Write-Host "[uTTT-OK] Pulled Base Checkpoint ($LocalCkpt) | SHA256: $LocalHash" -ForegroundColor Green
 }
@@ -247,7 +255,7 @@ Write-Host "[Remote] Personalization Server launched (PID: `$(`$Proc.Id)) on por
     Write-Host "[uTTT-OK] Opening SSH Tunnel: localhost:$LocalPort -> ${RemoteHost}:$RemoteServicePort" -ForegroundColor Green
     Write-Host "[uTTT-Info] In another terminal, run: python client_chat.py --user-id alex --ws-url ws://localhost:$LocalPort" -ForegroundColor Cyan
     $sshArgs = Get-SshArgs
-    & ssh.exe @sshArgs -N -L "${LocalPort}:localhost:${RemoteServicePort}" "${RemoteUser}@${RemoteHost}"
+    & ssh.exe @sshArgs -o ExitOnForwardFailure=yes -N -L "${LocalPort}:localhost:${RemoteServicePort}" "${RemoteUser}@${RemoteHost}"
 }
 
 # ------------------------------------------------------------------------------

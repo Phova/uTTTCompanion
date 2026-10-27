@@ -45,6 +45,7 @@ SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519}"
 
 LOCAL_TUNNEL_PORT="${LOCAL_TUNNEL_PORT:-8000}"
 REMOTE_SERVICE_PORT="${REMOTE_SERVICE_PORT:-8000}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
 TMUX_TRAIN_SESSION="${TMUX_TRAIN_SESSION:-uttt_train}"
 TMUX_SERVE_SESSION="${TMUX_SERVE_SESSION:-uttt_serve}"
 USE_DOCKER="${USE_DOCKER:-0}"
@@ -350,17 +351,27 @@ cmd_serve() {
 
     log_info "Waiting for remote FastAPI server on port ${REMOTE_SERVICE_PORT} to become ready (includes kernel warmup)..."
     local READY=0
-    for _ in {1..45}; do
-        if remote_exec "curl -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
+    if [[ ! "${STARTUP_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "STARTUP_TIMEOUT must be a positive number of seconds."
+        return 1
+    fi
+    local DEADLINE=$((SECONDS + STARTUP_TIMEOUT))
+    while (( SECONDS < DEADLINE )); do
+        if remote_exec "curl --connect-timeout 2 --max-time 2 -fsS http://localhost:${REMOTE_SERVICE_PORT}/health >/dev/null 2>&1"; then
             log_ok "Remote uTTT Personalization Server is healthy!"
             READY=1
             break
+        fi
+        if remote_exec "grep -q 'Application startup failed' '${SERVE_LOG}' 2>/dev/null"; then
+            log_error "Server failed during application startup."
+            remote_exec "tail -n 80 '${SERVE_LOG}'"
+            return 1
         fi
         sleep 1
     done
 
     if [[ "${READY}" -eq 0 ]]; then
-        log_error "Server did not become ready within 45s. Check logs:"
+        log_error "Server did not become ready within ${STARTUP_TIMEOUT}s. Check logs:"
         remote_exec "cat '${SERVE_LOG}' 2>/dev/null || true"
         exit 1
     fi
@@ -380,8 +391,8 @@ cmd_serve() {
 
     trap 'printf "\n"; log_info "Closed local SSH tunnel (remote server remains active in tmux ${TMUX_SERVE_SESSION})."; exit 0' INT TERM
     ssh "${SSH_OPTS[@]}" \
-        -N -L "${LOCAL_TUNNEL_PORT}:${REMOTE_INTERNAL_IP}:${REMOTE_SERVICE_PORT}" \
-        "${REMOTE_TARGET}" || true
+        -o ExitOnForwardFailure=yes -N -L "${LOCAL_TUNNEL_PORT}:${REMOTE_INTERNAL_IP}:${REMOTE_SERVICE_PORT}" \
+        "${REMOTE_TARGET}"
 }
 
 # ------------------------------------------------------------------------------

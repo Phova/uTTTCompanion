@@ -41,13 +41,17 @@ import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
+_ACTIVE_SAVE_ERROR: Optional[Exception] = None
 
 
 def _wait_for_active_save() -> None:
-    global _ACTIVE_SAVE_THREAD
+    global _ACTIVE_SAVE_THREAD, _ACTIVE_SAVE_ERROR
     if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
         print("[Checkpoint] Waiting for in-flight background checkpoint write to complete...", flush=True)
         _ACTIVE_SAVE_THREAD.join()
+    if _ACTIVE_SAVE_ERROR is not None:
+        error, _ACTIVE_SAVE_ERROR = _ACTIVE_SAVE_ERROR, None
+        raise RuntimeError("Background checkpoint save failed") from error
 
 
 atexit.register(_wait_for_active_save)
@@ -124,7 +128,7 @@ class PersonaMetaDataset(Dataset):
         self.pack_sequences = pack_sequences
         self.external_texts: List[str] = []
 
-        if data_path and os.path.exists(data_path):
+        if data_path:
             with open(data_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -136,6 +140,8 @@ class PersonaMetaDataset(Dataset):
                     else:
                         text = line
                     self.external_texts.append(text)
+            if not self.external_texts:
+                raise ValueError(f"Training dataset is empty: {data_path}")
 
     def __len__(self) -> int:
         return len(self.external_texts) if self.external_texts else self.num_samples
@@ -346,7 +352,7 @@ def maybe_compile_inner_loop(
 def _cpu_copy_nested(obj: Any) -> Any:
     """Recursively copy tensors in optimizer state_dict to CPU memory for background saving."""
     if isinstance(obj, torch.Tensor):
-        return obj.detach().cpu()
+        return obj.detach().to(device="cpu", copy=True)
     if isinstance(obj, dict):
         return {k: _cpu_copy_nested(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -376,8 +382,7 @@ def export_base_checkpoint(
         - `step` & `metrics`:  Training provenance metadata
     """
     global _ACTIVE_SAVE_THREAD
-    if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
-        _ACTIVE_SAVE_THREAD.join()
+    _wait_for_active_save()
 
     out_path = Path(save_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,7 +398,10 @@ def export_base_checkpoint(
         "metrics": metrics,
     }
     if optimizer is not None:
-        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
+        payload["optimizer_state"] = optimizer.state_dict()
+
+    # CPU tensors otherwise alias the live model during background serialization.
+    payload = _cpu_copy_nested(payload)
 
     def _write_to_disk() -> None:
         tmp_path = Path(str(out_path) + ".tmp")
@@ -414,7 +422,13 @@ def export_base_checkpoint(
         print(f"[Checkpoint] Saved Base Checkpoint -> {out_path} ({size_mb:.2f} MB)", flush=True)
 
     if async_save:
-        _ACTIVE_SAVE_THREAD = threading.Thread(target=_write_to_disk, daemon=False)
+        def _background_write() -> None:
+            global _ACTIVE_SAVE_ERROR
+            try:
+                _write_to_disk()
+            except Exception as exc:
+                _ACTIVE_SAVE_ERROR = exc
+        _ACTIVE_SAVE_THREAD = threading.Thread(target=_background_write, daemon=False)
         _ACTIVE_SAVE_THREAD.start()
     else:
         _write_to_disk()
@@ -547,7 +561,7 @@ def train(
             dataset,
             batch_size=mb_size,
             shuffle=True,
-            drop_last=True,
+            drop_last=len(dataset) >= mb_size,
             pin_memory=(device.type == "cuda"),
             num_workers=2 if use_workers else 0,
             persistent_workers=use_workers,
@@ -587,6 +601,9 @@ def train(
                 )
                 is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
                 same_data = saved_metrics.get("data_source", cur_data_tag) == cur_data_tag
+                if dims_match and is_causal_v2 and same_data and saved_step >= max_steps and math.isfinite(saved_loss):
+                    print(f"[Resume] Checkpoint already reached step {saved_step} (requested {max_steps}); leaving it unchanged.", flush=True)
+                    return loaded_from
                 if dims_match and is_causal_v2 and same_data and 0 < saved_step < max_steps and math.isfinite(saved_loss):
                     model.load_dual_base_state(
                         saved["slow_weights"],
@@ -673,15 +690,11 @@ def train(
 
                     input_ids = batch["input_ids"].to(device, non_blocking=True)
                     labels = batch["labels"].to(device, non_blocking=True)
-                    # Elide all-ones attention_mask transfer & reduction when sequences are packed
-                    attention_mask = (
-                        None
-                        if pack_sequences
-                        else batch["attention_mask"].to(device, non_blocking=True)
-                    )
+                    # Packing can still leave padding (e.g. a one-row dataset).
+                    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
                     # Native BF16 mixed precision forward + analytical inner-loop TTT update
-                    with torch.amp.autocast(autocast_device_type, dtype=amp_dtype):
+                    with torch.amp.autocast(autocast_device_type, dtype=amp_dtype, enabled=amp_dtype != torch.float32):
                         out = model(
                             input_ids=input_ids,
                             fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
@@ -726,9 +739,12 @@ def train(
                     )
                 else:
                     # Stage 3: Enable 2-level Intra-Layer Chunk Segment Checkpointing
+                    max_segments = (seq_len + model_cfg.chunk_size - 1) // model_cfg.chunk_size
+                    if all(blk.uttt.chunk_checkpoint_segments >= max_segments for blk in model.layers):
+                        raise RuntimeError("CUDA OOM persists at batch size 1 with maximal checkpointing; reduce sequence/model size")
                     for blk in model.layers:
-                        blk.uttt.chunk_checkpoint_segments = max(
-                            4, blk.uttt.chunk_checkpoint_segments * 2
+                        blk.uttt.chunk_checkpoint_segments = min(
+                            max_segments, max(4, blk.uttt.chunk_checkpoint_segments * 2)
                         )
                     print(
                         f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM at MicroBatch=1! Enabled 2-level "
@@ -739,7 +755,7 @@ def train(
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_outer_grad_norm,
-            error_if_nonfinite=False,
+            error_if_nonfinite=True,
             foreach=(device.type == "cuda"),
         )
         # Launch fused AdamW step immediately on GPU BEFORE any host synchronization
@@ -827,8 +843,7 @@ def train(
                     async_save=(step < max_steps),
                 )
 
-    if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
-        _ACTIVE_SAVE_THREAD.join()
+    _wait_for_active_save()
     return Path(ckpt_path)
 
 

@@ -18,9 +18,11 @@ Responsibilities:
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 import shutil
 import threading
+import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -33,9 +35,11 @@ from model.uttt_model import uTTTConfig, uTTTModel
 
 
 def _sanitize_id(raw_id: str) -> str:
-    """Sanitize user_id or snapshot tag to prevent path traversal."""
-    cleaned = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", raw_id.strip())
-    return cleaned or "default_user"
+    """Reject ambiguous identifiers instead of merging distinct users silently."""
+    cleaned = raw_id.strip()
+    if not cleaned or cleaned in {".", ".."} or not re.fullmatch(r"[a-zA-Z0-9_.-]+", cleaned):
+        raise ValueError("User IDs and snapshot tags must contain only letters, digits, _, -, or .")
+    return cleaned
 
 
 class DualTrackCheckpointManager:
@@ -97,6 +101,18 @@ class DualTrackCheckpointManager:
         with torch.no_grad():
             w0_sum = float(self.model.fast_weight_pool.w_up_init.detach().float().abs().sum().item())
         self.base_signature = f"{self.config.d_model}x{self.config.d_ff_fast}:{w0_sum:.6f}"
+        # Retain the legacy signature for existing personas, but fingerprint all
+        # checkpoint bytes for new saves (including slow and gate/down weights).
+        if not hasattr(self, "base_fingerprint"):
+            with self.base_checkpoint_path.open("rb") as source:
+                self.base_fingerprint = self._fingerprint(source)
+
+    @staticmethod
+    def _fingerprint(source) -> str:
+        digest = hashlib.sha256()
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+        return digest.hexdigest()
 
     # --------------------------------------------------------------------------
     # Base Checkpoint Loading & Initialization
@@ -110,7 +126,12 @@ class DualTrackCheckpointManager:
         If missing and `auto_create=True`, initializes a fresh Base Checkpoint from config.
         """
         if self.base_checkpoint_path.exists():
-            ckpt = torch.load(self.base_checkpoint_path, map_location="cpu", weights_only=False)
+            # Use the same open file for loading and hashing, even if training
+            # atomically replaces the checkpoint path while startup is in progress.
+            with self.base_checkpoint_path.open("rb") as source:
+                ckpt = torch.load(source, map_location="cpu", weights_only=False)
+                source.seek(0)
+                self.base_fingerprint = self._fingerprint(source)
             cfg_dict = ckpt.get("config", {})
             config = uTTTConfig.from_dict(cfg_dict)
             model = uTTTModel(config)
@@ -123,6 +144,8 @@ class DualTrackCheckpointManager:
                 )
             elif "model_state_dict" in ckpt:
                 model.load_state_dict(ckpt["model_state_dict"], strict=True)
+            else:
+                raise ValueError(f"Unsupported base checkpoint format: {self.base_checkpoint_path}")
 
             model.to(device=self.device, dtype=self.dtype)
             model.freeze_slow_weights()
@@ -194,7 +217,7 @@ class DualTrackCheckpointManager:
         primary, alias = self.get_persona_paths(user_id)
         if primary.exists():
             return primary
-        if alias.exists():
+        if not user_id.endswith("_state") and alias.exists():
             return alias
         return None
 
@@ -211,12 +234,11 @@ class DualTrackCheckpointManager:
             victim_uid, victim_state = next(iter(self._gpu_lru.items()))
             if victim_uid == exclude_user and len(self._gpu_lru) == 1:
                 break
-            self._gpu_lru.pop(victim_uid)
-
             # Persist to disk before offloading to CPU RAM
             self._save_state_to_disk(victim_uid, victim_state)
+            self._gpu_lru.pop(victim_uid)
 
-            cpu_state = victim_state.to(device="cpu", dtype=torch.bfloat16, non_blocking=False)
+            cpu_state = victim_state.to(device="cpu", dtype=self.dtype, non_blocking=False)
             self._cpu_lru[victim_uid] = cpu_state
             self._cpu_lru.move_to_end(victim_uid)
 
@@ -253,23 +275,29 @@ class DualTrackCheckpointManager:
             if disk_path is not None:
                 try:
                     payload = torch.load(disk_path, map_location="cpu", weights_only=False)
+                    if payload.get("user_id", safe_uid) != safe_uid:
+                        raise ValueError("Persona file belongs to another user")
                     saved_sig = payload.get("base_signature")
-                    if saved_sig is None or saved_sig == self.base_signature:
+                    saved_fingerprint = payload.get("base_fingerprint")
+                    compatible = (
+                        saved_fingerprint == self.base_fingerprint
+                        if saved_fingerprint is not None
+                        else saved_sig == self.base_signature
+                    )
+                    if compatible:
                         fast_dict = payload.get("fast_state", payload)
                         gpu_state = FastWeightState.from_state_dict(
                             fast_dict, device=self.device, dtype=self.dtype
                         )
                         if (
-                            gpu_state.w_up.shape[-2] == self.config.d_model
-                            and gpu_state.w_up.shape[-1] == self.config.d_ff_fast
-                            and saved_sig == self.base_signature
+                            self._valid_state_shapes(gpu_state)
                         ):
                             self._user_metadata[safe_uid] = payload.get("metadata", {})
                             self._gpu_lru[safe_uid] = gpu_state
                             return gpu_state
                     print(
                         f"[CheckpointManager] Persona '{safe_uid}' on disk was created under a "
-                        f"different Base Checkpoint ({saved_sig} != {self.base_signature}); "
+                        "different or incompatible Base Checkpoint; "
                         "auto-resetting to current Base W_0.",
                         flush=True,
                     )
@@ -320,13 +348,14 @@ class DualTrackCheckpointManager:
                 },
             )
             meta["turns"] = int(meta.get("turns", 0)) + 1
+            meta.pop("_cached_drift", None)
+            meta.pop("_cached_drift_step", None)
             meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
             if auto_save:
-                primary_path, _ = self.get_persona_paths(safe_uid)
-                # Write synchronously on first creation; offload subsequent turn saves to background thread
-                async_save = primary_path.exists()
-                return self._save_state_to_disk(safe_uid, gpu_state, async_write=async_save)
+                # A successful response means the latest state is durable. Keeping
+                # writes ordered also prevents an older turn overwriting /reset.
+                return self._save_state_to_disk(safe_uid, gpu_state)
             return None
 
     def _write_payload_files(self, primary_path: Path, alias_path: Path, payload: Dict[str, Any]) -> None:
@@ -339,6 +368,10 @@ class DualTrackCheckpointManager:
                 os.fsync(f.fileno())
             os.replace(tmp_path, primary_path)
 
+            # alice_state.pt is alice's canonical file, not an alias we may
+            # overwrite when saving a different user named alice_state.
+            if payload["user_id"].endswith("_state"):
+                return
             # Synchronize `{user_id}.pt` via zero-copy hardlink (fallback to copy2 if cross-device)
             try:
                 if alias_path.exists() or alias_path.is_symlink():
@@ -351,7 +384,7 @@ class DualTrackCheckpointManager:
                     pass
 
     def _save_state_to_disk(
-        self, user_id: str, state: FastWeightState, async_write: bool = False
+        self, user_id: str, state: FastWeightState
     ) -> Path:
         """Internal atomic writer for `personas/{user_id}_state.pt` and `{user_id}.pt`."""
         safe_uid = _sanitize_id(user_id)
@@ -367,20 +400,14 @@ class DualTrackCheckpointManager:
             "version": "1.0.0",
             "user_id": safe_uid,
             "base_signature": self.base_signature,
+            "base_fingerprint": self.base_fingerprint,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "fast_state": state.to_state_dict(),
             "drift_metrics": drift_info,
             "metadata": {k: v for k, v in meta.items() if not k.startswith("_")},
         }
 
-        if async_write:
-            threading.Thread(
-                target=self._write_payload_files,
-                args=(primary_path, alias_path, payload),
-                daemon=True,
-            ).start()
-        else:
-            self._write_payload_files(primary_path, alias_path, payload)
+        self._write_payload_files(primary_path, alias_path, payload)
 
         return primary_path
 
@@ -400,6 +427,8 @@ class DualTrackCheckpointManager:
         """
         safe_uid = _sanitize_id(user_id)
         with self._lock:
+            if safe_uid not in self._gpu_lru:
+                self._evict_gpu_lru_if_needed(exclude_user=safe_uid)
             fresh_state = self.model.init_fast_state(
                 batch_size=1,
                 device=self.device,
@@ -427,33 +456,68 @@ class DualTrackCheckpointManager:
         with self._lock:
             state = self.get_user_state(safe_uid)
             drift_info = self.model.fast_weight_pool.compute_drift(state)
-            snap_path = self.snapshots_dir / f"{safe_uid}_{tag}.pt"
+            user_snapshots = self.snapshots_dir / safe_uid
+            user_snapshots.mkdir(parents=True, exist_ok=True)
+            snap_path = user_snapshots / f"{tag}.pt"
             payload = {
                 "checkpoint_type": "uTTT_Persona_Snapshot",
                 "user_id": safe_uid,
                 "snapshot_tag": tag,
+                "base_signature": self.base_signature,
+                "base_fingerprint": self.base_fingerprint,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "fast_state": state.to_state_dict(),
                 "drift_metrics": drift_info,
             }
-            torch.save(payload, snap_path)
+            # Publish a complete snapshot atomically without replacing a tag.
+            with tempfile.NamedTemporaryFile(dir=user_snapshots, suffix=".tmp", delete=False) as destination:
+                temporary_path = Path(destination.name)
+                try:
+                    torch.save(payload, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                except BaseException:
+                    destination.close()
+                    temporary_path.unlink(missing_ok=True)
+                    raise
+            try:
+                os.link(temporary_path, snap_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
             return snap_path
 
     def load_snapshot(self, user_id: str, snapshot_tag: str) -> FastWeightState:
         """Restore a previously saved persona snapshot into the active GPU session."""
         safe_uid = _sanitize_id(user_id)
         tag = _sanitize_id(snapshot_tag)
-        snap_path = self.snapshots_dir / f"{safe_uid}_{tag}.pt"
+        snap_path = self.snapshots_dir / safe_uid / f"{tag}.pt"
+        if not snap_path.exists():
+            snap_path = self.snapshots_dir / f"{safe_uid}_{tag}.pt"
         if not snap_path.exists():
             raise FileNotFoundError(f"Snapshot not found: {snap_path}")
 
         with self._lock:
             payload = torch.load(snap_path, map_location="cpu", weights_only=False)
+            if payload.get("user_id") != safe_uid or payload.get("snapshot_tag") != tag:
+                raise ValueError("Snapshot belongs to a different user or tag")
+            if payload.get("base_fingerprint") != self.base_fingerprint:
+                raise ValueError("Snapshot base checkpoint is different or cannot be verified")
             restored = FastWeightState.from_state_dict(
                 payload["fast_state"], device=self.device, dtype=self.dtype
             )
+            if not self._valid_state_shapes(restored):
+                raise ValueError("Snapshot fast-weight shapes do not match the base model")
             self.update_user_state(safe_uid, restored, auto_save=True)
             return restored
+
+    def _valid_state_shapes(self, state: FastWeightState) -> bool:
+        d, f = self.config.d_model, self.config.d_ff_fast
+        expected = {
+            "w_up": (1, d, f), "w_gate": (1, d, f), "w_down": (1, f, d),
+            "s_up": (1, d, f), "s_gate": (1, d, f), "s_down": (1, f, d),
+            "ln_weight": (d,), "ln_bias": (d,),
+        }
+        return all(tuple(getattr(state, name).shape) == shape for name, shape in expected.items())
 
     def compute_user_drift(self, user_id: str) -> Dict[str, Any]:
         """

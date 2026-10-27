@@ -27,10 +27,11 @@ import hashlib
 import json
 import os
 import socket
+import ssl
 import struct
 import sys
 from typing import List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 
 def format_ttt_status_bar(
@@ -63,13 +64,21 @@ class _StdlibWebSocket:
 
     def __init__(self, url: str, timeout: float = 120.0) -> None:
         parsed = urlsplit(url)
+        if parsed.scheme not in ("ws", "wss"):
+            raise ValueError("WebSocket URL must use ws:// or wss://")
         self.host = parsed.hostname or "localhost"
         self.port = parsed.port or (443 if parsed.scheme == "wss" else 80)
         self.path = parsed.path or "/"
         if parsed.query:
             self.path += f"?{parsed.query}"
         self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
-        self._handshake()
+        try:
+            if parsed.scheme == "wss":
+                self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=self.host)
+            self._handshake()
+        except BaseException:
+            self.sock.close()
+            raise
 
     def _handshake(self) -> None:
         raw_key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -90,8 +99,15 @@ class _StdlibWebSocket:
             resp += chunk
         header_block, self._buf = resp.split(b"\r\n\r\n", 1)
         status_line = header_block.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
-        if "101" not in status_line:
+        if len(status_line.split()) < 2 or status_line.split()[1] != "101":
             raise ConnectionError(f"WebSocket handshake failed: {status_line}")
+        headers = {}
+        for line in header_block.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((raw_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest())
+        if headers.get(b"sec-websocket-accept") != expected:
+            raise ConnectionError("Invalid WebSocket Sec-WebSocket-Accept response")
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
@@ -188,7 +204,7 @@ async def run_websocket_session(
     demo_prompts: Optional[List[str]] = None,
 ) -> None:
     """Connect to the remote/tunneled FastAPI WebSocket endpoint and stream chat + TTT updates."""
-    endpoint = f"{ws_url.rstrip('/')}/ws/chat/{user_id}"
+    endpoint = f"{ws_url.rstrip('/')}/ws/chat/{quote(user_id, safe='')}"
     print(BANNER)
     print(f"[Client] Connecting to {endpoint} (user_id='{user_id}')...")
 
@@ -219,7 +235,7 @@ async def run_websocket_session(
                 print(f"\nYou ({user_id}) > {user_input}")
             else:
                 try:
-                    user_input = input(f"\nYou ({user_id}) > ").strip()
+                    user_input = (await asyncio.to_thread(input, f"\nYou ({user_id}) > ")).strip()
                 except (EOFError, KeyboardInterrupt):
                     print("\n[Client] Session closed.")
                     break
@@ -228,16 +244,18 @@ async def run_websocket_session(
                 continue
             if user_input.lower() in ("/quit", "/exit"):
                 print("[Client] Saving session and exiting...")
+                saved = False
                 try:
                     await ws.send(json.dumps({"prompt": "/save"}))
                     while True:
                         raw_ack = await ws.recv()
                         ack = json.loads(raw_ack)
                         if ack.get("type") in ("ttt_status", "error"):
+                            saved = ack.get("type") == "ttt_status" and bool(ack.get("result", {}).get("persona_saved"))
                             break
-                except BaseException:
+                except Exception:
                     pass
-                print("[Client] Persona state saved. Goodbye!")
+                print("[Client] Persona state saved. Goodbye!" if saved else "[Client] Save was not confirmed. Check the server before closing.")
                 break
             if user_input.lower() == "/help":
                 print_help()

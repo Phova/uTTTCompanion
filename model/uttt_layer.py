@@ -455,12 +455,26 @@ def fused_chunk_ttt_step(
     s_gate_new = s_gate_base - step_gate.detach()
     s_down_new = s_down_base - step_down.detach()
 
-    alpha_bar = alpha_chunk.mean(dim=1, keepdim=True).to(w_up.dtype)
+    if token_mask is None:
+        alpha_bar = alpha_chunk.mean(dim=1, keepdim=True).to(w_up.dtype)
+    else:
+        mask = token_mask.unsqueeze(-1).to(alpha_chunk.dtype)
+        alpha_bar = ((alpha_chunk * mask).sum(dim=1, keepdim=True)
+                     / mask.sum(dim=1, keepdim=True).clamp_min(1)).to(w_up.dtype)
     decay = 1.0 - alpha_bar
 
     w_up_new = decay * w_up + (s_up_base - step_up)
     w_gate_new = decay * w_gate + (s_gate_base - step_gate)
     w_down_new = decay * w_down + (s_down_base - step_down)
+
+    if token_mask is not None:
+        active = token_mask.any(dim=1).view(bsz, 1, 1)
+        w_up_new = torch.where(active, w_up_new, w_up)
+        w_gate_new = torch.where(active, w_gate_new, w_gate)
+        w_down_new = torch.where(active, w_down_new, w_down)
+        s_up_new = torch.where(active, s_up_new, s_up)
+        s_gate_new = torch.where(active, s_gate_new, s_gate)
+        s_down_new = torch.where(active, s_down_new, s_down)
 
     # Strictly Causal Chunk Readout: tokens in chunk `c` read from pre-chunk `w_up, w_gate, w_down`
     # (updated only by past chunks 0..c-1), preventing intra-chunk future token leakage
@@ -912,10 +926,12 @@ class SlidingWindowAttention(nn.Module):
             k_prev, v_prev = kv_cache
             k = torch.cat([k_prev, k], dim=2)
             v = torch.cat([v_prev, v], dim=2)
-            # DeepInfer SWA Bounded Replay: strictly cap cached KV state to window_size
-            if k.shape[2] > self.window_size:
-                k = k[:, :, -self.window_size :, :]
-                v = v[:, :, -self.window_size :, :]
+            # Retain enough history for the FIRST query in a multi-token decode.
+            # Only the returned cache is capped to the final window below.
+            needed = self.window_size - 1 + seq_len
+            if k.shape[2] > needed:
+                k = k[:, :, -needed:, :]
+                v = v[:, :, -needed:, :]
 
         # Bound stored KV cache to window_size even on initial long-context prefill
         if not self.training and k.shape[2] > self.window_size:
@@ -1143,6 +1159,27 @@ class uTTTLayer(nn.Module):
             and num_chunks > 1
         )
 
+        init_st = fast_state._init_state
+        if init_st is not None:
+            # Start each layer's causal chunk sweep from initial pre-sequence state W_0
+            # (preventing end-of-sequence chunks of layer l-1 from leaking into chunk 0 of layer l)
+            # while preserving accumulated inner-loop step count across layers.
+            cur_state = FastWeightState(
+                w_up=init_st.w_up,
+                w_gate=init_st.w_gate,
+                w_down=init_st.w_down,
+                s_up=init_st.s_up,
+                s_gate=init_st.s_gate,
+                s_down=init_st.s_down,
+                ln_weight=init_st.ln_weight,
+                ln_bias=init_st.ln_bias,
+                step=fast_state.step,
+                last_surprise_loss=fast_state.last_surprise_loss,
+                surprise_history=fast_state.surprise_history,
+                _init_state=init_st,
+            )
+
+
         if use_seg_ckpt:
             seg_size = max(1, (num_chunks + self.chunk_checkpoint_segments - 1) // self.chunk_checkpoint_segments)
             for seg_start in range(0, num_chunks, seg_size):
@@ -1172,6 +1209,8 @@ class uTTTLayer(nn.Module):
                     s_down_s: torch.Tensor,
                     _mask_s: Optional[torch.Tensor] = mask_seg,
                     _step_b: int = step_before,
+                    _ln_w: torch.Tensor = cur_state.ln_weight,
+                    _ln_b: torch.Tensor = cur_state.ln_bias,
                 ) -> Tuple[
                     torch.Tensor,
                     torch.Tensor,
@@ -1189,8 +1228,8 @@ class uTTTLayer(nn.Module):
                         s_up=s_up_s,
                         s_gate=s_gate_s,
                         s_down=s_down_s,
-                        ln_weight=cur_state.ln_weight,
-                        ln_bias=cur_state.ln_bias,
+                        ln_weight=_ln_w,
+                        ln_bias=_ln_b,
                         step=_step_b,
                     )
                     seg_outs: List[torch.Tensor] = []
@@ -1253,28 +1292,8 @@ class uTTTLayer(nn.Module):
                     surprise_history=cur_state.surprise_history,
                 )
                 chunk_outputs.append(seg_out)
-                chunk_losses.append(seg_loss)
+                chunk_losses.append(seg_loss * (seg_end - seg_start))
         else:
-            init_st = fast_state._init_state
-            if init_st is not None and num_chunks > 1:
-                # Start each layer's causal chunk sweep from initial pre-sequence state W_0
-                # (preventing end-of-sequence chunks of layer l-1 from leaking into chunk 0 of layer l)
-                # while preserving accumulated inner-loop step count across layers.
-                cur_state = FastWeightState(
-                    w_up=init_st.w_up,
-                    w_gate=init_st.w_gate,
-                    w_down=init_st.w_down,
-                    s_up=init_st.s_up,
-                    s_gate=init_st.s_gate,
-                    s_down=init_st.s_down,
-                    ln_weight=init_st.ln_weight,
-                    ln_bias=init_st.ln_bias,
-                    step=fast_state.step,
-                    last_surprise_loss=fast_state.last_surprise_loss,
-                    surprise_history=fast_state.surprise_history,
-                    _init_state=init_st,
-                )
-
             for c_idx in range(num_chunks):
                 start = c_idx * self.chunk_size
                 end = min(start + self.chunk_size, seq_len)
@@ -1299,10 +1318,10 @@ class uTTTLayer(nn.Module):
                 chunk_outputs.append(out_c)
                 chunk_losses.append(loss_c)
 
-            cur_state._init_state = init_st
+        cur_state._init_state = init_st
 
         out = torch.cat(chunk_outputs, dim=1)                       # (B, T, D)
-        mean_surprise_loss = torch.stack(chunk_losses).mean()
+        mean_surprise_loss = torch.stack(chunk_losses).sum() / num_chunks
         return self.w_o(out), cur_state, mean_surprise_loss
 
 

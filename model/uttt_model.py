@@ -497,6 +497,7 @@ class uTTTModel(nn.Module):
             step=step_before + num_chunks,
             last_surprise_loss=loss_val,
             surprise_history=history_before if self.training else (history_before + [loss_val])[-100:],
+            _init_state=init_st,
         )
         return out_h, updated_state, s_loss
 
@@ -545,7 +546,7 @@ class uTTTModel(nn.Module):
         layer_surprise_floats: List[float] = []
 
         cur_fast_state = fast_state
-        if update_fast_weights and logits_to_keep >= 0 and (seq_len > self.config.chunk_size or self.training):
+        if update_fast_weights and logits_to_keep >= 0:
             cur_fast_state._init_state = fast_state
             cur_fast_state._chunk_states = None
 
@@ -629,7 +630,8 @@ class uTTTModel(nn.Module):
                 logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
-            )
+                reduction="sum",
+            ) / (shift_labels != -100).sum().clamp_min(1)
             total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
         elif logits_to_keep < 0:
             # Skip final norm and lm_head when logits are not needed (e.g. test_time_update)
@@ -767,50 +769,46 @@ class uTTTModel(nn.Module):
                             start_pos=cur_pos,
                             update_fast_weights=False,
                         )
-                        # Verify proposed draft tokens against full model predictions
-                        accepted = 0
-                        hit_eos = False
+                        # Sample with exactly the same constraints as ordinary decoding.
+                        committed = [token_id]
+                        rejected = False
+                        finished = False
                         for idx in range(len(draft_tokens) - 1):
                             target_tok = self._sample_next_token(
-                                verify_out.logits[:, idx, :],
-                                temperature=temperature,
-                                top_p=top_p,
+                                verify_out.logits[:, idx, :], temperature=temperature,
+                                top_p=top_p, recent_tokens=recent_tokens,
+                                active_vocab_limit=active_limit,
                             )
                             target_id = int(target_tok.item())
-                            if target_id == draft_tokens[idx + 1]:
-                                yield target_id
-                                generated_count += 1
-                                accepted += 1
-                                if eos_token_id is not None and target_id == eos_token_id:
-                                    hit_eos = True
-                                    break
-                                if generated_count >= max_new_tokens:
-                                    break
-                            else:
-                                # Accept the corrected token from the verifier and stop
-                                yield target_id
-                                generated_count += 1
-                                accepted += 1
-                                next_token_logits = verify_out.logits[:, idx, :]
-                                if eos_token_id is not None and target_id == eos_token_id:
-                                    hit_eos = True
+                            if target_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):
+                                finished = True
                                 break
-
-                        if hit_eos or generated_count >= max_new_tokens:
+                            recent_tokens.append(target_id)
+                            committed.append(target_id)
+                            yield target_id
+                            generated_count += 1
+                            if (eos_token_id is not None and target_id == eos_token_id) or generated_count >= max_new_tokens:
+                                finished = True
+                                break
+                            if target_id != draft_tokens[idx + 1]:
+                                rejected = True
+                                break
+                        if finished:
                             break
 
-                        # Trim KV caches to match the exact number of accepted tokens (1 + accepted)
-                        valid_steps = 1 + accepted
-                        trim_drop = len(draft_tokens) - valid_steps
-                        if trim_drop > 0 and verify_out.kv_caches is not None:
-                            kv_caches = [
-                                (k_c[:, :, :-trim_drop, :], v_c[:, :, :-trim_drop, :])
-                                for (k_c, v_c) in verify_out.kv_caches
-                            ]
-                        else:
-                            kv_caches = verify_out.kv_caches
-                        cur_pos += valid_steps
-                        next_token_logits = verify_out.logits[:, valid_steps - 1, :]
+                        if rejected:
+                            # Replay the accepted prefix and corrected token from the
+                            # ORIGINAL cache: the verifier cached a rejected token and
+                            # may already have dropped old sliding-window history.
+                            verify_out = self.forward(
+                                input_ids=torch.tensor([committed], dtype=torch.long, device=input_ids.device),
+                                fast_state=fast_state, kv_caches=kv_caches,
+                                start_pos=cur_pos, update_fast_weights=False,
+                                logits_to_keep=1,
+                            )
+                        kv_caches = verify_out.kv_caches
+                        cur_pos += len(committed)
+                        next_token_logits = verify_out.logits[:, -1, :]
                         continue
 
                 # Standard 1-token autoregressive decoding step
