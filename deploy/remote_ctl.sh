@@ -69,6 +69,9 @@ Core Commands:
   init-env              Auto-detect remote RTX 5090 driver/CUDA and build environment
   sync                  Incremental rsync of local workspace (excludes checkpoints/ & .git/)
   prepare-data [args]   Download & format public Persona-Chat + Belle multi-turn dataset on remote
+  prepare-tokenizer     Train a local BPE tokenizer on remote (--data-path required)
+  evaluate [args]       Evaluate frozen-memory replies (--checkpoint required)
+  profile-capacity      Measure full-AdamW capacity in isolated remote subprocesses
   train [extra_args]    Start train_5090.py in remote tmux session and stream live loss
   pull-ckpt             Pull remote checkpoints/base_uttt.pt to local checkpoints/base_uttt.pt
   serve [extra_args]    Launch remote FastAPI+WebSocket server & map SSH tunnel to localhost:${LOCAL_TUNNEL_PORT}
@@ -213,6 +216,16 @@ cmd_prepare_data() {
     log_info "Downloading & formatting public Persona + Multi-Turn dataset on ${REMOTE_TARGET}..."
     remote_exec "cd '${REMOTE_DIR}' && python3 deploy/prepare_dataset.py ${EXTRA_DATA_ARGS}"
     log_ok "Remote public dataset prepared at ${REMOTE_DIR}/data/uttt_persona_train.jsonl"
+}
+
+cmd_python_tool() {
+    local TOOL_SCRIPT="$1"
+    shift
+    validate_config
+    cmd_sync
+    local QUOTED_ARGS
+    printf -v QUOTED_ARGS '%q ' "$@"
+    remote_exec "cd '${REMOTE_DIR}' && .venv/bin/python -u 'deploy/${TOOL_SCRIPT}' ${QUOTED_ARGS}"
 }
 
 # ------------------------------------------------------------------------------
@@ -523,6 +536,15 @@ main() {
             ;;
         prepare-data)
             cmd_prepare_data "$@"
+            ;;
+        prepare-tokenizer)
+            cmd_python_tool train_tokenizer.py "$@"
+            ;;
+        evaluate)
+            cmd_python_tool evaluate_model.py "$@"
+            ;;
+        profile-capacity)
+            cmd_python_tool profile_capacity.py "$@"
             ;;
         train)
             cmd_train "$@"

@@ -1,0 +1,96 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090 (32 GiB class)",
+  "torch": "2.11.0+cu128",
+  "budget_gb": 28.0,
+  "seq_len": 1024,
+  "batch_size": 1,
+  "steps": 2,
+  "parameter_dtype": "float32",
+  "activation_dtype": "bfloat16",
+  "optimizer": "full AdamW, fused=True",
+  "gradient_checkpointing": true,
+  "torch_compile": false,
+  "candidates": [
+    {
+      "width": 1536,
+      "layers": 24,
+      "parameters": 436302384,
+      "peak_allocated_gb": 7.907694817,
+      "peak_reserved_gb": 8.361328125,
+      "status": "ok"
+    },
+    {
+      "width": 2048,
+      "layers": 24,
+      "parameters": 754751536,
+      "peak_allocated_gb": 13.424128532,
+      "peak_reserved_gb": 13.86328125,
+      "status": "ok"
+    },
+    {
+      "width": 2560,
+      "layers": 24,
+      "parameters": 1157742128,
+      "peak_allocated_gb": 20.736521721,
+      "peak_reserved_gb": 21.451171875,
+      "status": "ok"
+    },
+    {
+      "width": 2560,
+      "layers": 28,
+      "parameters": 1328197176,
+      "peak_allocated_gb": 23.356991768,
+      "peak_reserved_gb": 24.4453125,
+      "status": "ok"
+    },
+    {
+      "width": 2560,
+      "layers": 32,
+      "parameters": 1498652224,
+      "peak_allocated_gb": 25.984358788,
+      "peak_reserved_gb": 26.580078125,
+      "status": "ok"
+    },
+    {
+      "width": 3072,
+      "layers": 24,
+      "parameters": 1646453808,
+      "peak_allocated_gb": 28.771327019,
+      "peak_reserved_gb": 29.818359375,
+      "status": "over_budget"
+    },
+    {
+      "status": "ok",
+      "parameters": 1541265986,
+      "peak_allocated_gb": 26.6428027153,
+      "peak_reserved_gb": 27.32421875,
+      "width": 2560,
+      "layers": 33
+    },
+    {
+      "status": "ok",
+      "parameters": 1583879748,
+      "peak_allocated_gb": 27.300819397,
+      "peak_reserved_gb": 27.9609375,
+      "width": 2560,
+      "layers": 34
+    },
+    {
+      "status": "over_budget",
+      "parameters": 1626493510,
+      "peak_allocated_gb": 27.954624653,
+      "peak_reserved_gb": 28.669921875,
+      "width": 2560,
+      "layers": 35
+    }
+  ],
+  "limitation": "Short full training-step capacity measurements; not a long training stability or convergence guarantee. Largest among this tested family under the specified process budget.",
+  "largest_tested": {
+    "status": "ok",
+    "parameters": 1583879748,
+    "peak_allocated_gb": 27.300819397,
+    "peak_reserved_gb": 27.9609375,
+    "width": 2560,
+    "layers": 34
+  }
+}

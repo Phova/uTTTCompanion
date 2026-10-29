@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import hashlib
+import re
 import math
 import os
 import signal
@@ -39,6 +41,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
+from model.tokenizer import build_tokenizer
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
 _ACTIVE_SAVE_ERROR: Optional[Exception] = None
@@ -120,13 +123,26 @@ class PersonaMetaDataset(Dataset):
         num_samples: int = 4096,
         data_path: Optional[str] = None,
         pack_sequences: bool = True,
+        mode: str = "sft",
+        split: str = "all",
+        validation_fraction: float = 0.0,
+        split_seed: int = 42,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
+        if seq_len < 2:
+            raise ValueError("seq_len must be at least 2")
         self.seq_len = seq_len
         self.num_samples = num_samples
         self.pack_sequences = pack_sequences
         self.external_texts: List[str] = []
+        self.mode, self.split = mode, split
+        if mode not in {"pretrain", "sft", "meta"}:
+            raise ValueError("mode must be pretrain, sft, or meta")
+        if not 0 <= validation_fraction < 1:
+            raise ValueError("validation_fraction must be in [0, 1)")
+        seen = set()
+        fingerprint = hashlib.sha256()
 
         if data_path:
             with open(data_path, "r", encoding="utf-8") as f:
@@ -136,12 +152,24 @@ class PersonaMetaDataset(Dataset):
                         continue
                     if line.startswith("{"):
                         obj = json.loads(line)
-                        text = obj.get("text") or obj.get("content") or json.dumps(obj)
+                        text = obj.get("text") or obj.get("content")
                     else:
                         text = line
+                    if not isinstance(text, str):
+                        raise ValueError("Dataset rows must contain string text/content")
+                    text = re.sub(r"^<\|user\|> \[Context Category:[^\n]*\n", "", text).strip()
+                    identity = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    if not text or identity in seen:
+                        continue
+                    seen.add(identity)
+                    is_validation = int(hashlib.sha256(f"{split_seed}:{identity}".encode()).hexdigest()[:16], 16) / 2**64 < validation_fraction
+                    if split != "all" and (split == "validation") != is_validation:
+                        continue
+                    fingerprint.update(identity.encode())
                     self.external_texts.append(text)
             if not self.external_texts:
-                raise ValueError(f"Training dataset is empty: {data_path}")
+                raise ValueError(f"Dataset split {split} is empty: {data_path}")
+        self.fingerprint = fingerprint.hexdigest()
 
     def __len__(self) -> int:
         return len(self.external_texts) if self.external_texts else self.num_samples
@@ -171,78 +199,58 @@ class PersonaMetaDataset(Dataset):
         repeats = max(1, (self.seq_len // max(len(turn_text), 64)) + 2)
         return turn_text * repeats
 
+    def _document(self, text):
+        raw = self.tokenizer.encode(text, add_bos=True, add_eos=True)
+        ids, labels = [], []
+        assistant = False
+        for token in raw:
+            if token == self.tokenizer.USER_ID:
+                if assistant and ids and ids[-1] != self.tokenizer.EOS_ID:
+                    ids.append(self.tokenizer.EOS_ID)
+                    labels.append(self.tokenizer.EOS_ID)
+                assistant = False
+            elif token == self.tokenizer.ASSISTANT_ID:
+                assistant = True
+            ids.append(token)
+            supervised = self.mode == "pretrain" or assistant
+            labels.append(token if supervised and token not in (
+                self.tokenizer.PAD_ID, self.tokenizer.BOS_ID
+            ) and (self.mode == "pretrain" or token != self.tokenizer.ASSISTANT_ID) else -100)
+            if token == self.tokenizer.EOS_ID:
+                assistant = False
+        return ids, labels
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        if self.external_texts:
-            n_ext = len(self.external_texts)
-            text = self.external_texts[idx % n_ext]
-            token_ids = self.tokenizer.encode(
-                text, add_bos=True, add_eos=True, max_length=self.seq_len
-            )
-            # Multi-Dialogue Sequence Packing: pack consecutive short dialogues to eliminate PAD waste
-            if self.pack_sequences and len(token_ids) < self.seq_len and n_ext > 1:
-                pack_step = 1
-                while len(token_ids) < self.seq_len and pack_step <= 16:
-                    next_text = self.external_texts[(idx + pack_step * 131) % n_ext]
-                    remain = self.seq_len - len(token_ids)
-                    more_ids = self.tokenizer.encode(
-                        next_text, add_bos=True, add_eos=True, max_length=remain
-                    )
-                    token_ids.extend(more_ids)
-                    pack_step += 1
-        else:
-            text = self._synthesize_dialogue(idx)
-            token_ids = self.tokenizer.encode(
-                text, add_bos=True, add_eos=True, max_length=self.seq_len
-            )
-
-        if len(token_ids) < self.seq_len:
-            pad_len = self.seq_len - len(token_ids)
-            mask = [1] * len(token_ids) + [0] * pad_len
-            raw_labels = list(token_ids) + [-100] * pad_len
-            token_ids = token_ids + [self.tokenizer.PAD_ID] * pad_len
-        else:
-            token_ids = token_ids[: self.seq_len]
-            mask = [1] * self.seq_len
-            raw_labels = list(token_ids)
-
-        # Conversational SFT Loss Masking:
-        # Keep `<|user|> ... <|assistant|>` in `input_ids` so inner-loop TTT fast weights
-        # absorb user persona/context, while masking user prompt tokens (`-100`) in `labels`
-        # so outer-loop Cross-Entropy supervises only `<|assistant|>` replies + `<|eos|>`.
-        if self.tokenizer.ASSISTANT_ID in token_ids:
-            labels = list(raw_labels)
-            in_user_turn = False
-            has_supervised = False
-            for i, tid in enumerate(token_ids):
-                if tid == self.tokenizer.PAD_ID:
-                    labels[i] = -100
-                elif tid == self.tokenizer.BOS_ID:
-                    in_user_turn = True
-                    labels[i] = -100
-                elif tid == self.tokenizer.USER_ID:
-                    if not in_user_turn and i > 0:
-                        # Supervise end-of-turn transition from Assistant -> User in multi-turn dialogues
-                        labels[i] = self.tokenizer.USER_ID
-                        has_supervised = True
-                    else:
-                        labels[i] = -100
-                    in_user_turn = True
-                elif tid == self.tokenizer.ASSISTANT_ID:
-                    in_user_turn = False
-                    labels[i] = -100
-                elif in_user_turn:
-                    labels[i] = -100
-                else:
-                    has_supervised = True
-            if not has_supervised:
-                labels = raw_labels
-        else:
-            labels = raw_labels
-
+        text = self.external_texts[idx % len(self.external_texts)] if self.external_texts else self._synthesize_dialogue(idx)
+        ids, labels = self._document(text)
+        # Select targets from the whole conversation, not always its first 1024
+        # characters. Compute role masks BEFORE cropping so mid-answer windows
+        # retain their supervision and never fall back to training user prompts.
+        if len(ids) > self.seq_len:
+            targets = [i for i, value in enumerate(labels) if value != -100 and i > 0]
+            if targets:
+                seed = int(hashlib.sha256(text.encode()).hexdigest()[:16], 16)
+                anchor_index = seed % len(targets) if self.split == "validation" else int(torch.randint(len(targets), ()).item())
+                anchor = targets[anchor_index]
+                low, high = max(0, anchor - self.seq_len + 1), min(anchor - 1, len(ids) - self.seq_len)
+                start = low + (seed % (high - low + 1)) if self.split == "validation" else int(torch.randint(low, high + 1, ()).item())
+            else:
+                start = 0
+            ids, labels = ids[start:start + self.seq_len], labels[start:start + self.seq_len]
+        if self.pack_sequences and self.mode == "pretrain" and self.external_texts:
+            for offset in range(1, 17):
+                if len(ids) >= self.seq_len:
+                    break
+                extra_ids, extra_labels = self._document(self.external_texts[(idx + offset * 131) % len(self.external_texts)])
+                remaining = self.seq_len - len(ids)
+                ids.extend(extra_ids[:remaining])
+                labels.extend(extra_labels[:remaining])
+        valid = len(ids)
+        padding = self.seq_len - valid
         return {
-            "input_ids": torch.tensor(token_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-            "attention_mask": torch.tensor(mask, dtype=torch.float32),
+            "input_ids": torch.tensor(ids + [self.tokenizer.PAD_ID] * padding, dtype=torch.long),
+            "labels": torch.tensor(labels + [-100] * padding, dtype=torch.long),
+            "attention_mask": torch.tensor([1.0] * valid + [0.0] * padding),
         }
 
 
@@ -398,10 +406,7 @@ def export_base_checkpoint(
         "metrics": metrics,
     }
     if optimizer is not None:
-        payload["optimizer_state"] = optimizer.state_dict()
-
-    # CPU tensors otherwise alias the live model during background serialization.
-    payload = _cpu_copy_nested(payload)
+        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
 
     def _write_to_disk() -> None:
         tmp_path = Path(str(out_path) + ".tmp")
@@ -450,6 +455,35 @@ def get_cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float) 
     return base_lr * (0.1 + 0.9 * cosine_decay)
 
 
+@torch.no_grad()
+def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=False, max_batches=32):
+    was_training = model.training
+    model.eval()
+    nll, frozen_nll, targets = 0.0, 0.0, 0
+    try:
+        for index in range(min(len(dataset), max_batches)):
+            batch = dataset[index]
+            count = int((batch["labels"][1:] != -100).sum())
+            if not count:
+                continue
+            inputs = {name: value.unsqueeze(0).to(device) for name, value in batch.items()}
+            with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+                result = model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0)
+                nll += float(result.ce_loss) * count
+                if update_fast_weights:
+                    frozen = model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0)
+                    frozen_nll += float(frozen.ce_loss) * count
+                else:
+                    frozen_nll += float(result.ce_loss) * count
+            targets += count
+        if not targets:
+            raise ValueError("Validation split has no supervised next-token targets")
+        return {"validation_ce": nll / targets, "validation_frozen_ce": frozen_nll / targets,
+                "validation_targets": targets}
+    finally:
+        model.train(was_training)
+
+
 def train(
     config_path: str = "configs/5090_config.yaml",
     data_path: Optional[str] = None,
@@ -460,6 +494,9 @@ def train(
     lightweight_preset: bool = False,
     large_preset: bool = False,
     resume: bool = True,
+    stage: Optional[str] = None,
+    init_from: Optional[str] = None,
+    tokenizer_path: Optional[str] = None,
 ) -> Path:
     """Run outer-loop + inner-loop uTTT Meta-Training and export `base_uttt.pt`."""
     import yaml
@@ -470,6 +507,15 @@ def train(
     hw_cfg = raw_cfg.get("hardware", {})
     train_cfg = raw_cfg.get("training", {})
     model_cfg = uTTTConfig.from_dict(raw_cfg)
+    training_stage = stage or train_cfg.get("stage", "meta")
+    if training_stage not in {"pretrain", "sft", "meta"}:
+        raise ValueError("stage must be pretrain, sft, or meta")
+    update_fast_weights = training_stage == "meta"
+    tokenizer_file = tokenizer_path or train_cfg.get("tokenizer_path")
+    if tokenizer_file:
+        model_cfg.tokenizer_json = Path(tokenizer_file).read_text(encoding="utf-8")
+    if init_from and Path(init_from).resolve() == Path(output_ckpt or train_cfg.get("base_checkpoint_path", "checkpoints/base_uttt.pt")).resolve():
+        raise ValueError("--init-from must differ from the output checkpoint")
 
     if lightweight_preset:
         # Fast verification preset for quick local or CI smoke tests
@@ -482,16 +528,17 @@ def train(
         model_cfg.chunk_size = 32
         model_cfg.sliding_window_size = 128
     elif large_preset:
-        # Large-parameter preset for single RTX 5090 (32GB GDDR7, ~815M params)
-        model_cfg.name = "uTTT-Large-800M"
-        model_cfg.d_model = 1536
-        model_cfg.n_layers = 24
-        model_cfg.n_heads = 24
-        model_cfg.n_kv_heads = 6
-        model_cfg.d_ff_fast = 4096
-        model_cfg.chunk_size = 256
+        # Measured full-AdamW capacity at B=1, T=1024 on the RTX 5090.
+        model_cfg.name = "uTTT-1.584B"
+        model_cfg.d_model = 2560
+        model_cfg.n_layers = 34
+        model_cfg.n_heads = 20
+        model_cfg.n_kv_heads = 5
+        model_cfg.d_ff_fast = 6912
+        model_cfg.chunk_size = 128
         model_cfg.sliding_window_size = 512
         model_cfg.gradient_checkpointing = True
+        hw_cfg["torch_compile"] = False
 
     seed = int(train_cfg.get("seed", 42))
     torch.manual_seed(seed)
@@ -502,6 +549,15 @@ def train(
 
     # Instantiate uTTT Model
     model = uTTTModel(model_cfg).to(device=device)
+    if init_from:
+        initialized = torch.load(init_from, map_location="cpu", weights_only=False, mmap=True)
+        previous = uTTTConfig.from_dict(initialized["config"])
+        for field in ("d_model", "d_ff_fast", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "tokenizer_json"):
+            if getattr(previous, field) != getattr(model_cfg, field):
+                raise ValueError(f"Initialization checkpoint has incompatible {field}")
+        model.load_dual_base_state(initialized["slow_weights"], initialized["init_fast_weights"])
+        del initialized
+        print(f"[Init] Loaded model weights from {init_from}; optimizer starts fresh for {training_stage}.")
     param_stats = model.num_parameters()
     print(
         f"[Model] {model_cfg.name} initialized | "
@@ -534,26 +590,38 @@ def train(
         fused=(device.type == "cuda"),
     )
 
-    micro_batch_size = override_batch_size or int(train_cfg.get("micro_batch_size", 4))
-    grad_accum_steps = int(train_cfg.get("grad_accum_steps", 8))
+    micro_batch_size = override_batch_size or (1 if large_preset else int(train_cfg.get("micro_batch_size", 4)))
+    grad_accum_steps = int(train_cfg.get("large_grad_accum_steps", 32) if large_preset else train_cfg.get("grad_accum_steps", 8))
     seq_len = override_seq_len or int(train_cfg.get("seq_len", 1024))
     max_steps = override_steps or int(train_cfg.get("max_steps", 2000))
     warmup_steps = min(int(train_cfg.get("warmup_steps", 100)), max(1, max_steps // 5))
     max_outer_grad_norm = float(train_cfg.get("max_outer_grad_norm", 1.0))
-    surprise_aux_weight = float(train_cfg.get("surprise_aux_loss_weight", 0.10))
+    # Directly minimizing a learned reconstruction task has a trivial solution.
+    # Language modelling, not small surprise, is the criterion for useful memory.
+    surprise_aux_weight = float(train_cfg.get("surprise_aux_loss_weight", 0.0)) if update_fast_weights else 0.0
     log_interval = max(1, int(train_cfg.get("log_interval", 10)))
     save_interval = max(1, int(train_cfg.get("save_interval", 200)))
     ckpt_path = output_ckpt or train_cfg.get("base_checkpoint_path", "checkpoints/base_uttt.pt")
 
-    tokenizer = SimpleUTF8Tokenizer(vocab_size=model_cfg.vocab_size)
+    tokenizer = build_tokenizer(model_cfg)
     pack_sequences = bool(train_cfg.get("pack_sequences", True))
     dataset = PersonaMetaDataset(
         tokenizer=tokenizer,
         seq_len=seq_len,
         num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
         data_path=data_path,
-        pack_sequences=pack_sequences,
+        pack_sequences=pack_sequences, mode=training_stage,
+        split="train" if train_cfg.get("validation_fraction", 0) else "all",
+        validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
     )
+    validation_dataset = None
+    if data_path and train_cfg.get("validation_fraction", 0):
+        validation_dataset = PersonaMetaDataset(
+            tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
+            pack_sequences=pack_sequences, mode=training_stage, split="validation",
+            validation_fraction=float(train_cfg["validation_fraction"]), split_seed=seed,
+        )
+        print(f"[Data] Deduplicated train={len(dataset):,}, validation={len(validation_dataset):,} conversations; split before windowing.")
     use_workers = device.type == "cuda" and os.name != "nt"
 
     def _build_loader(mb_size: int) -> DataLoader:
@@ -572,6 +640,10 @@ def train(
     data_iter = iter(loader)
 
     start_step = 1
+    tokens_seen = 0
+    best_validation_ce = float("inf")
+    validation_metrics = {}
+    evaluation_interval = max(1, int(train_cfg.get("eval_interval", 250)))
     cur_data_tag = str(data_path or "synthetic")
     ckpt_file = Path(ckpt_path)
     prev_ckpt_file = Path(str(ckpt_path) + ".prev")
@@ -582,12 +654,17 @@ def train(
             if not cand_file.exists():
                 continue
             try:
-                saved = torch.load(cand_file, map_location="cpu", weights_only=False)
+                saved = torch.load(cand_file, map_location="cpu", weights_only=False, mmap=True)
                 loaded_from = cand_file
                 break
             except Exception as exc:
                 print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
         if saved is not None:
+            metadata = saved.get("metrics", {})
+            if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
+                    or metadata.get("dataset_fingerprint") != dataset.fingerprint
+                    or saved.get("config", {}).get("tokenizer_json") != model_cfg.tokenizer_json):
+                raise ValueError("Resume checkpoint uses different data, tokenizer or training pipeline/stage. Use a new output path and --init-from for an intentional stage transition.")
             try:
                 saved_cfg = saved.get("config", {})
                 saved_metrics = saved.get("metrics", {})
@@ -613,6 +690,8 @@ def train(
                     if "optimizer_state" in saved:
                         optimizer.load_state_dict(saved["optimizer_state"])
                     start_step = saved_step + 1
+                    tokens_seen = int(saved_metrics.get("tokens_seen", 0))
+                    best_validation_ce = float(saved_metrics.get("best_validation_ce", float("inf")))
                     print(
                         f"[Resume] Resumed from {loaded_from} at step {saved_step}/{max_steps} "
                         f"(Last Loss: {saved_loss:.4f})",
@@ -628,7 +707,7 @@ def train(
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
             except Exception as exc:
-                print(f"[Resume] Could not restore state from {loaded_from} ({exc}); starting fresh.", flush=True)
+                raise RuntimeError(f"Could not restore state from {loaded_from}; checkpoint preserved") from exc
         else:
             print(f"[Resume] No readable checkpoint found at {ckpt_file}; starting fresh.", flush=True)
 
@@ -644,7 +723,7 @@ def train(
     autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
 
     print(
-        f"[Train] Starting Meta-Training from step {start_step} to {max_steps} | "
+        f"[Train] Starting {training_stage} from step {start_step} to {max_steps} | "
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}",
@@ -680,6 +759,7 @@ def train(
                 step_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
                 step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
                 inv_accum = 1.0 / float(grad_accum_steps)
+                step_tokens = 0
 
                 for _ in range(grad_accum_steps):
                     try:
@@ -688,6 +768,9 @@ def train(
                         data_iter = iter(loader)
                         batch = next(data_iter)
 
+                    if not bool((batch["labels"][:, 1:] != -100).any()):
+                        raise ValueError("Batch has no supervised next-token targets; check dialogue roles and training stage")
+                    step_tokens += int(batch["attention_mask"].sum())
                     input_ids = batch["input_ids"].to(device, non_blocking=True)
                     labels = batch["labels"].to(device, non_blocking=True)
                     # Packing can still leave padding (e.g. a one-row dataset).
@@ -700,7 +783,7 @@ def train(
                             fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
                             labels=labels,
                             attention_mask=attention_mask,
-                            update_fast_weights=True,
+                            update_fast_weights=update_fast_weights,
                             surprise_aux_weight=surprise_aux_weight,
                         )
                         scaled_loss = out.loss * inv_accum
@@ -761,6 +844,7 @@ def train(
         # Launch fused AdamW step immediately on GPU BEFORE any host synchronization
         # so the CUDA command stream never drains to 0% between outer steps.
         optimizer.step()
+        tokens_seen += step_tokens
 
         running_loss_gpu += step_loss_gpu
         running_ce_gpu += step_ce_gpu
@@ -770,7 +854,16 @@ def train(
         should_log = (step % log_interval == 0) or (step == start_step)
         should_save = (step % save_interval == 0) or (step == max_steps)
 
-        if should_log or should_save:
+        improved = False
+        if validation_dataset is not None and (step % evaluation_interval == 0 or step == start_step or step == max_steps):
+            validation_metrics = evaluate_language_model(
+                model, validation_dataset, device, amp_dtype, update_fast_weights,
+                max_batches=int(train_cfg.get("eval_samples", 32)),
+            )
+            improved = validation_metrics["validation_ce"] < best_validation_ce
+            best_validation_ce = min(best_validation_ce, validation_metrics["validation_ce"])
+            print(f"[Validation {step}] CE={validation_metrics['validation_ce']:.4f} | Frozen CE={validation_metrics['validation_frozen_ce']:.4f} | Tokens seen={tokens_seen:,}", flush=True)
+        if should_log or should_save or improved:
             sync_vals = torch.stack(
                 [
                     running_loss_gpu,
@@ -820,12 +913,15 @@ def train(
                 )
                 t_start = time.perf_counter()
 
-            if should_save and math.isfinite(step_loss_accum):
+            if (should_save or improved) and math.isfinite(step_loss_accum):
                 metrics = {
                     "total_loss": step_loss_accum,
                     "ce_loss": step_ce_accum,
                     "surprise_loss": step_surprise_accum,
                     "causal_ttt_v2": True,
+                    "training_pipeline": 3, "training_stage": training_stage,
+                    "dataset_fingerprint": dataset.fingerprint, "tokens_seen": tokens_seen,
+                    "best_validation_ce": best_validation_ce, **validation_metrics,
                     "data_source": cur_data_tag,
                     "peak_vram_gb": (
                         torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -842,6 +938,9 @@ def train(
                     metrics=metrics,
                     async_save=(step < max_steps),
                 )
+                if improved:
+                    best_path = str(Path(ckpt_path).with_suffix(".best.pt"))
+                    export_base_checkpoint(model, None, model_cfg, best_path, step, metrics)
 
     _wait_for_active_save()
     return Path(ckpt_path)
@@ -895,7 +994,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--large",
         action="store_true",
-        help="Use uTTT-Large-800M preset (d_model=1536, n_layers=24, d_ff_fast=4096) for RTX 5090.",
+        help="Use the measured 1.584B preset (2560 wide, 34 layers), micro-batch 1 and checkpointing.",
     )
     parser.add_argument(
         "--no-resume",
@@ -904,6 +1003,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start training from scratch even if checkpoints/base_uttt.pt exists.",
     )
+    parser.add_argument("--stage", choices=["pretrain", "sft", "meta"], default=None)
+    parser.add_argument("--init-from", help="Load compatible model weights for a new training stage")
+    parser.add_argument("--tokenizer", help="Local BPE tokenizer JSON, embedded into new checkpoints")
     return parser.parse_args()
 
 
@@ -919,4 +1021,5 @@ if __name__ == "__main__":
         lightweight_preset=args.lightweight,
         large_preset=args.large,
         resume=not args.no_resume,
+        stage=args.stage, init_from=args.init_from, tokenizer_path=args.tokenizer,
     )

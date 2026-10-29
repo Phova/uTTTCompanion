@@ -13,6 +13,10 @@ checkpoints/*.pt
 checkpoints/*.tmp.pt
 personas/*.pt
 personas/snapshots/*.pt
+personas/
+checkpoints/*.prev
+checkpoints/*.tmp
+data/tokenizer.json
 data/*.jsonl
 data/*.csv
 data/*.txt

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import re
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
@@ -43,7 +44,7 @@ from model.uttt_layer import (
 @dataclass
 class uTTTConfig:
     """Configuration for the uTTT Model and Inner-Loop Fast-Weight Dynamics."""
-    name: str = "uTTT-500M-Base"
+    name: str = "uTTT-151M-Base"
     vocab_size: int = 32000
     d_model: int = 1024
     n_layers: int = 16
@@ -73,6 +74,8 @@ class uTTTConfig:
     write_schedule: str = "sequential"          # "sequential" (Eq. 14/17) or "aggregated" (Eq. 2)
     dspark_speculative_k: int = 0               # DeepInfer DSpark speculative draft length (0=off)
     dspark_conf_threshold: float = 0.82         # Confidence gate for DSpark draft token proposal
+    tokenizer_json: Optional[str] = None       # Embedded byte-level BPE for new checkpoints
+    repetition_penalty: float = 1.0            # Character tokens must not penalize common letters
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -267,6 +270,15 @@ class uTTTModel(nn.Module):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = config.gradient_checkpointing
+        if config.tokenizer_json:
+            tokenizer_data = json.loads(config.tokenizer_json)
+            ids = list(tokenizer_data["model"]["vocab"].values())
+            ids.extend(token["id"] for token in tokenizer_data.get("added_tokens", []))
+            self.active_vocab_limit = max(ids) + 1
+            if self.active_vocab_limit > config.vocab_size:
+                raise ValueError("Tokenizer vocabulary exceeds model vocabulary")
+        else:
+            self.active_vocab_limit = SimpleUTF8Tokenizer.ACTIVE_VOCAB_LIMIT if config.vocab_size >= 24000 else config.vocab_size
 
         # Slow Weights: Token Embedding
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.d_model)
@@ -340,7 +352,7 @@ class uTTTModel(nn.Module):
         """Export only Slow Weights Theta_slow for `base_uttt.pt`."""
         full = self.state_dict()
         return {
-            k: v.detach().cpu()
+            k: v.detach().to(device="cpu", copy=True)
             for k, v in full.items()
             if not k.startswith("fast_weight_pool.")
         }
@@ -348,7 +360,7 @@ class uTTTModel(nn.Module):
     def init_fast_state_dict(self) -> Dict[str, torch.Tensor]:
         """Export meta-initialized Fast Weights W_0 for `base_uttt.pt`."""
         return {
-            k: v.detach().cpu()
+            k: v.detach().to(device="cpu", copy=True)
             for k, v in self.fast_weight_pool.state_dict().items()
         }
 
@@ -405,6 +417,7 @@ class uTTTModel(nn.Module):
         x: torch.Tensor,
         fast_state: FastWeightState,
         attention_mask: Optional[torch.Tensor],
+        update_fast_weights: bool = True,
     ) -> Tuple[torch.Tensor, FastWeightState, torch.Tensor]:
         """
         Wrap `uTTTBlock.forward` with `torch.utils.checkpoint.checkpoint` using pure
@@ -456,7 +469,7 @@ class uTTTModel(nn.Module):
                 attention_mask=attention_mask,
                 kv_cache=None,
                 start_pos=0,
-                update_fast_weights=True,
+                update_fast_weights=update_fast_weights,
             )
             return (
                 out_h,
@@ -494,7 +507,7 @@ class uTTTModel(nn.Module):
             s_down=s_down_o,
             ln_weight=fast_state.ln_weight,
             ln_bias=fast_state.ln_bias,
-            step=step_before + num_chunks,
+            step=step_before + (num_chunks if update_fast_weights else 0),
             last_surprise_loss=loss_val,
             surprise_history=history_before if self.training else (history_before + [loss_val])[-100:],
             _init_state=init_st,
@@ -552,17 +565,26 @@ class uTTTModel(nn.Module):
 
         # Sequentially thread `cur_fast_state` through Layer 0 -> Layer 1 -> ... -> Layer L-1
         for idx, block in enumerate(self.layers):
+            if update_fast_weights and logits_to_keep >= 0 and idx > 0:
+                # Causal layers already restart from the pre-sequence state.
+                # Pass that shared storage directly into checkpointing instead of
+                # retaining unused end-of-sequence weights from every prior layer.
+                cur_fast_state = FastWeightState(
+                    **{name: getattr(fast_state, name) for name in (
+                        "w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias"
+                    )},
+                    step=cur_fast_state.step, _init_state=fast_state,
+                )
             layer_kv = kv_caches[idx] if kv_caches is not None else None
             use_ckpt = (
                 self.gradient_checkpointing
                 and self.training
-                and update_fast_weights
                 and kv_caches is None
             )
 
             if use_ckpt:
                 h, cur_fast_state, s_loss = self._checkpointed_block_forward(
-                    block, h, cur_fast_state, attention_mask
+                    block, h, cur_fast_state, attention_mask, update_fast_weights
                 )
             else:
                 h, cur_fast_state, s_loss, updated_kv = block(
@@ -705,11 +727,7 @@ class uTTTModel(nn.Module):
             cur_pos = input_ids.shape[1]
             generated_count = 0
             recent_tokens: List[int] = []
-            active_limit = (
-                SimpleUTF8Tokenizer.ACTIVE_VOCAB_LIMIT
-                if self.config.vocab_size >= 24000
-                else self.config.vocab_size
-            )
+            active_limit = self.active_vocab_limit
 
             while generated_count < max_new_tokens:
                 next_token = self._sample_next_token(
@@ -718,6 +736,7 @@ class uTTTModel(nn.Module):
                     top_p=top_p,
                     recent_tokens=recent_tokens,
                     active_vocab_limit=active_limit,
+                    repetition_penalty=self.config.repetition_penalty,
                 )
                 token_id = int(next_token.item())
                 if token_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):
@@ -778,6 +797,7 @@ class uTTTModel(nn.Module):
                                 verify_out.logits[:, idx, :], temperature=temperature,
                                 top_p=top_p, recent_tokens=recent_tokens,
                                 active_vocab_limit=active_limit,
+                                repetition_penalty=self.config.repetition_penalty,
                             )
                             target_id = int(target_tok.item())
                             if target_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):

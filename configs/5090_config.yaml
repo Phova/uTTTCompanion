@@ -14,7 +14,7 @@ hardware:
   compile_mode: "default"              # Triton kernel fusion (compatible with gradient checkpointing)
 
 model:
-  name: "uTTT-500M-Base"
+  name: "uTTT-151M-Base"
   vocab_size: 32000
   d_model: 1024                        # Hidden dimension D
   n_layers: 16                         # Number of uTTTBlocks sharing the Fast-Weight Pool
@@ -39,6 +39,10 @@ uttt:
   max_weight_drift_ratio: 0.35         # Safety ceiling on ||W_user - W_0||_F / ||W_0||_F
 
 training:
+  stage: "pretrain"
+  validation_fraction: 0.02
+  eval_interval: 250
+  eval_samples: 32
   seed: 42
   micro_batch_size: 8                  # Per-step micro-batch size on single RTX 5090 (2x Tensor Core occupancy)
   grad_accum_steps: 4                  # Effective batch size = 32 sequences (8 * 4 = 32, lossless math)
@@ -49,7 +53,7 @@ training:
   meta_fast_lr: 1.5e-4                 # AdamW learning rate for Meta-Init Fast Weights W_0
   weight_decay: 0.1
   max_outer_grad_norm: 1.0
-  surprise_aux_loss_weight: 0.10       # Weight for auxiliary inner-loop reconstruction loss
+  surprise_aux_loss_weight: 0.0       # Weight for auxiliary inner-loop reconstruction loss
   gradient_checkpointing: false        # SRAM-recomputed SwiGLU + C=512 fits all 16 layers in ~21GB (VRAM-Guard auto-enables if needed)
   pack_sequences: true                 # Multi-dialogue sequence packing (eliminates PAD token compute waste)
   log_interval: 10

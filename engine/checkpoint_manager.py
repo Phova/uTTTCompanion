@@ -92,6 +92,7 @@ class DualTrackCheckpointManager:
         self._gpu_lru: OrderedDict[str, FastWeightState] = OrderedDict()
         self._cpu_lru: OrderedDict[str, FastWeightState] = OrderedDict()
         self._user_metadata: Dict[str, Dict[str, Any]] = {}
+        self.training_metadata: Dict[str, Any] = {}
 
         # Load or initialize the shared Base Model
         self.model, self.config = self._load_or_init_base_model(
@@ -129,9 +130,16 @@ class DualTrackCheckpointManager:
             # Use the same open file for loading and hashing, even if training
             # atomically replaces the checkpoint path while startup is in progress.
             with self.base_checkpoint_path.open("rb") as source:
-                ckpt = torch.load(source, map_location="cpu", weights_only=False)
+                descriptor_path = Path(f"/proc/self/fd/{source.fileno()}")
+                if descriptor_path.exists():
+                    # Linux/WSL: map the same open inode without materializing
+                    # many GiB of optimizer tensors that serving never uses.
+                    ckpt = torch.load(descriptor_path, map_location="cpu", weights_only=False, mmap=True)
+                else:
+                    ckpt = torch.load(source, map_location="cpu", weights_only=False)
                 source.seek(0)
                 self.base_fingerprint = self._fingerprint(source)
+            self.training_metadata = dict(ckpt.get("metrics", {}))
             cfg_dict = ckpt.get("config", {})
             config = uTTTConfig.from_dict(cfg_dict)
             model = uTTTModel(config)

@@ -33,6 +33,7 @@ from engine.checkpoint_manager import DualTrackCheckpointManager
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_layer import FastWeightState
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
+from model.tokenizer import build_tokenizer
 
 _INFERENCE_KERNELS_COMPILED = False
 
@@ -119,7 +120,8 @@ class uTTTPersonalizer:
         self.config: uTTTConfig = self.ckpt_manager.config
         self.device = self.ckpt_manager.device
         self.dtype = self.ckpt_manager.dtype
-        self.tokenizer = SimpleUTF8Tokenizer(vocab_size=self.config.vocab_size)
+        self.tokenizer = build_tokenizer(self.config)
+        self.online_updates_enabled = self.ckpt_manager.training_metadata.get("training_stage") not in {"pretrain", "sft"}
 
         # Stability Guard hyperparameters (auto-calibrate when normalize_loss_by_dim=True)
         raw_thresh = (
@@ -391,6 +393,23 @@ class uTTTPersonalizer:
         if not reply_text:
             reply_text = "[Acknowledged]"
             yield {"type": "token", "content": reply_text}
+
+        if not self.online_updates_enabled:
+            # Language stages have not trained the K/V memory-writing task yet.
+            # Applying random online writes here would corrupt an otherwise useful LM.
+            drift = self.ckpt_manager.compute_user_drift(user_id)
+            primary_path, _ = self.ckpt_manager.get_persona_paths(user_id)
+            result = EvolutionResult(
+                user_id=user_id, prompt=prompt, reply=reply_text,
+                surprise_loss=0.0, surprise_threshold=self.surprise_threshold,
+                gate_triggered=False, weight_drift_frobenius=float(drift["drift_frobenius"]),
+                weight_drift_pct=float(drift["drift_pct"]), persona_saved=False,
+                persona_path=str(primary_path), step=int(drift["step"]),
+                status_bar="[LM Status] Online TTT disabled until the meta-training stage.",
+                drift_details=drift,
+            )
+            yield {"type": "ttt_status", "result": result.to_dict()}
+            return result
 
         # ======================================================================
         # Step 2 (Test-Time Update): Chunk TTT Update on [User Prompt + Reply]

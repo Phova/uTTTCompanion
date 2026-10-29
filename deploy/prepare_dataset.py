@@ -77,10 +77,7 @@ def format_sharegpt_conversation(obj: Dict[str, object]) -> Optional[str]:
     if not isinstance(conv, list) or not conv:
         return None
 
-    category = str(obj.get("category") or "").strip()
     lines: List[str] = []
-    if category:
-        lines.append(f"<|user|> [Context Category: {category}]")
 
     valid_turns = 0
     for turn in conv:
@@ -91,14 +88,14 @@ def format_sharegpt_conversation(obj: Dict[str, object]) -> Optional[str]:
         if not human_msg or not assistant_msg:
             continue
         lines.append(f"<|user|> {human_msg}")
-        lines.append(f"<|assistant|> {assistant_msg}")
+        lines.append(f"<|assistant|> {assistant_msg}<|eos|>")
         valid_turns += 1
 
     if valid_turns == 0:
         return None
 
     full_text = "\n".join(lines)
-    return full_text if len(full_text) >= 100 else None
+    return full_text
 
 
 def stream_modelscope_split(

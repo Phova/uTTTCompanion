@@ -1,6 +1,7 @@
 # Core Deep Learning & RTX 5090 (Blackwell sm_120) Stack
 torch>=2.6.0
 pyyaml>=6.0.1
+tokenizers>=0.21.0,<1.0
 
 # FastAPI + WebSocket Streaming Personalization Server & Client
 fastapi>=0.115.0
