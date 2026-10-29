@@ -128,6 +128,7 @@ New-Item -ItemType Directory -Force -Path '$RemoteDir/logs' | Out-Null
             --exclude="checkpoints" `
             --exclude="personas" `
             --exclude="logs" `
+            --exclude="runs" `
             --exclude=".venv" `
             --exclude="venv" `
             --exclude="__pycache__" `

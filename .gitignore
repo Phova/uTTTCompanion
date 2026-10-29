@@ -17,6 +17,9 @@ personas/
 checkpoints/*.prev
 checkpoints/*.tmp
 data/tokenizer.json
+data/pretrain_*/
+data/instruction_*/
+runs/
 data/*.jsonl
 data/*.csv
 data/*.txt

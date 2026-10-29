@@ -159,6 +159,7 @@ cmd_sync() {
         --exclude="personas/" \
         --exclude="data/" \
         --exclude="logs/" \
+        --exclude="runs/" \
         --exclude=".venv/" \
         --exclude="venv/" \
         --exclude="__pycache__/" \

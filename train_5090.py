@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader, Dataset
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
+from engine.corpus import TokenizedCorpusDataset, read_manifest
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
 _ACTIVE_SAVE_ERROR: Optional[Exception] = None
@@ -62,7 +63,7 @@ atexit.register(_wait_for_active_save)
 
 def _graceful_signal_handler(signum: int, _frame: Any) -> None:
     _wait_for_active_save()
-    sys.exit(0)
+    sys.exit(128 + signum)
 
 
 signal.signal(signal.SIGTERM, _graceful_signal_handler)
@@ -461,7 +462,9 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
     model.eval()
     nll, frozen_nll, targets = 0.0, 0.0, 0
     try:
-        for index in range(min(len(dataset), max_batches)):
+        count_batches = min(len(dataset), max_batches)
+        indices = [index * (len(dataset) - 1) // max(1, count_batches - 1) for index in range(count_batches)]
+        for index in indices:
             batch = dataset[index]
             count = int((batch["labels"][1:] != -100).sum())
             if not count:
@@ -482,6 +485,21 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
                 "validation_targets": targets}
     finally:
         model.train(was_training)
+
+
+@torch.no_grad()
+def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype, max_new_tokens=48):
+    results = []
+    for prompt in prompts:
+        text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
+        ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
+        with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+            generated = list(model.stream_generate(
+                torch.tensor([ids], device=device), model.init_fast_state(device=device, dtype=dtype, detach=True),
+                max_new_tokens=max_new_tokens, temperature=0.0,
+            ))
+        results.append({"prompt": prompt, "reply": tokenizer.decode(generated).strip(), "eos_generated": tokenizer.EOS_ID in generated})
+    return results
 
 
 def train(
@@ -511,9 +529,16 @@ def train(
     if training_stage not in {"pretrain", "sft", "meta"}:
         raise ValueError("stage must be pretrain, sft, or meta")
     update_fast_weights = training_stage == "meta"
+    corpus_manifest = read_manifest(data_path)
+    if corpus_manifest and training_stage != "pretrain":
+        raise ValueError("Packed text corpus is for pretraining; use dialogue data for SFT/meta")
     tokenizer_file = tokenizer_path or train_cfg.get("tokenizer_path")
+    if corpus_manifest and not tokenizer_path:
+        tokenizer_file = str(Path(data_path).resolve().parent / corpus_manifest["tokenizer"])
     if tokenizer_file:
         model_cfg.tokenizer_json = Path(tokenizer_file).read_text(encoding="utf-8")
+    if corpus_manifest and hashlib.sha256(model_cfg.tokenizer_json.encode()).hexdigest() != corpus_manifest["tokenizer_sha256"]:
+        raise ValueError("Corpus and configured tokenizer have different fingerprints")
     if init_from and Path(init_from).resolve() == Path(output_ckpt or train_cfg.get("base_checkpoint_path", "checkpoints/base_uttt.pt")).resolve():
         raise ValueError("--init-from must differ from the output checkpoint")
 
@@ -605,23 +630,26 @@ def train(
 
     tokenizer = build_tokenizer(model_cfg)
     pack_sequences = bool(train_cfg.get("pack_sequences", True))
-    dataset = PersonaMetaDataset(
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
-        data_path=data_path,
-        pack_sequences=pack_sequences, mode=training_stage,
-        split="train" if train_cfg.get("validation_fraction", 0) else "all",
-        validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
-    )
     validation_dataset = None
-    if data_path and train_cfg.get("validation_fraction", 0):
-        validation_dataset = PersonaMetaDataset(
+    if corpus_manifest:
+        dataset = TokenizedCorpusDataset(data_path, seq_len=seq_len, split="train")
+        validation_dataset = TokenizedCorpusDataset(data_path, seq_len=seq_len, split="validation")
+        print(f"[Corpus] Memory-mapped train={dataset.token_count:,}, validation={validation_dataset.token_count:,} tokens; no text corpus loaded into RAM.", flush=True)
+    else:
+        dataset = PersonaMetaDataset(
             tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
-            pack_sequences=pack_sequences, mode=training_stage, split="validation",
-            validation_fraction=float(train_cfg["validation_fraction"]), split_seed=seed,
+            num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
+            pack_sequences=pack_sequences, mode=training_stage,
+            split="train" if train_cfg.get("validation_fraction", 0) else "all",
+            validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
         )
-        print(f"[Data] Deduplicated train={len(dataset):,}, validation={len(validation_dataset):,} conversations; split before windowing.")
+        if data_path and train_cfg.get("validation_fraction", 0):
+            validation_dataset = PersonaMetaDataset(
+                tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
+                pack_sequences=pack_sequences, mode=training_stage, split="validation",
+                validation_fraction=float(train_cfg["validation_fraction"]), split_seed=seed,
+            )
+            print(f"[Data] Deduplicated train={len(dataset):,}, validation={len(validation_dataset):,} conversations; split before windowing.")
     use_workers = device.type == "cuda" and os.name != "nt"
 
     def _build_loader(mb_size: int) -> DataLoader:
@@ -863,6 +891,13 @@ def train(
             improved = validation_metrics["validation_ce"] < best_validation_ce
             best_validation_ce = min(best_validation_ce, validation_metrics["validation_ce"])
             print(f"[Validation {step}] CE={validation_metrics['validation_ce']:.4f} | Frozen CE={validation_metrics['validation_frozen_ce']:.4f} | Tokens seen={tokens_seen:,}", flush=True)
+            if train_cfg.get("eval_prompts"):
+                validation_metrics["validation_samples"] = generate_validation_samples(
+                    model, tokenizer, train_cfg["eval_prompts"], training_stage, device, amp_dtype,
+                    max_new_tokens=int(train_cfg.get("eval_new_tokens", 48)),
+                )
+                for sample in validation_metrics["validation_samples"]:
+                    print("[Validation sample] " + json.dumps(sample, ensure_ascii=False), flush=True)
         if should_log or should_save or improved:
             sync_vals = torch.stack(
                 [
@@ -920,6 +955,8 @@ def train(
                     "surprise_loss": step_surprise_accum,
                     "causal_ttt_v2": True,
                     "training_pipeline": 3, "training_stage": training_stage,
+                    "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),
+                    "run_id": os.environ.get("UTTT_RUN_ID"),
                     "dataset_fingerprint": dataset.fingerprint, "tokens_seen": tokens_seen,
                     "best_validation_ce": best_validation_ce, **validation_metrics,
                     "data_source": cur_data_tag,

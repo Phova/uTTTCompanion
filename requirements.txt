@@ -2,6 +2,8 @@
 torch>=2.6.0
 pyyaml>=6.0.1
 tokenizers>=0.21.0,<1.0
+numpy>=1.26
+pyarrow>=18
 
 # FastAPI + WebSocket Streaming Personalization Server & Client
 fastapi>=0.115.0
