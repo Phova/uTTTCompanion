@@ -39,6 +39,19 @@ _FLEX_BLOCK_MASK_CACHE: Dict[Tuple[int, int, int, torch.device], Any] = {}
 _COMPILED_FLEX_ATTN: Optional[Any] = None
 
 
+def compile_with_backward_amp_off(function, **compile_kwargs):
+    """Compile lazily with the non-autocast backward used by the trainer.
+
+    The invocation needs the patch because torch.compile traces on first use.
+    An unsupported PyTorch build must use its caller's eager/SDPA fallback.
+    """
+    from torch._functorch import config as aot_config
+    if not hasattr(aot_config, "backward_pass_autocast"):
+        raise RuntimeError("This PyTorch build cannot configure compiled-backward AMP semantics")
+    compiled = torch.compile(function, **compile_kwargs)
+    return aot_config.patch(backward_pass_autocast="off")(compiled)
+
+
 # ==============================================================================
 # 1. Fast-Weight State Container
 # ==============================================================================
@@ -68,6 +81,8 @@ class FastWeightState:
     surprise_history: List[float] = field(default_factory=list)
     _init_state: Optional["FastWeightState"] = field(default=None, repr=False)
     _chunk_states: Optional[List["FastWeightState"]] = field(default=None, repr=False)
+    _packed_up_gate: Optional[torch.Tensor] = field(default=None, repr=False)
+    _packed_key: Optional[tuple] = field(default=None, repr=False)
 
     def clone(self, detach: bool = False) -> "FastWeightState":
         """Deep-copy all fast weight and momentum tensors."""
@@ -225,6 +240,16 @@ def swiglu_fast_forward(
         z, (z.shape[-1],), ln_weight.to(orig_dtype), ln_bias.to(orig_dtype), eps
     )
     return x + ln_out
+
+
+def swiglu_packed_forward(
+    x: torch.Tensor, packed_up_gate: torch.Tensor, w_down: torch.Tensor,
+    ln_weight: torch.Tensor, ln_bias: torch.Tensor, eps: float = 1e-5,
+) -> torch.Tensor:
+    """Inference SwiGLU with one shared up/gate projection and fusible pointwise ops."""
+    up, gate = torch.bmm(x, packed_up_gate).chunk(2, dim=-1)
+    projected = torch.bmm(F.silu(gate) * up, w_down)
+    return x + F.layer_norm(projected, (projected.shape[-1],), ln_weight.to(x.dtype), ln_bias.to(x.dtype), eps)
 
 
 def analytical_swiglu_chunk_grad(
@@ -558,9 +583,9 @@ class SharedFastWeightPool(nn.Module):
         ln_b = self.ln_bias.to(device=target_device, dtype=target_dtype)
 
         if detach:
-            w_up = w_up.detach().clone().unsqueeze(0).repeat(batch_size, 1, 1)
-            w_gate = w_gate.detach().clone().unsqueeze(0).repeat(batch_size, 1, 1)
-            w_down = w_down.detach().clone().unsqueeze(0).repeat(batch_size, 1, 1)
+            w_up = w_up.detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
+            w_gate = w_gate.detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
+            w_down = w_down.detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
             ln_w = ln_w.detach().clone()
             ln_b = ln_b.detach().clone()
         else:
@@ -585,9 +610,30 @@ class SharedFastWeightPool(nn.Module):
             last_surprise_loss=0.0,
         )
 
+    def readonly_state(self, batch_size=1, device=None, dtype=None, detach=False) -> FastWeightState:
+        """Internal frozen readout views; never use as a mutable persona state."""
+        def view(tensor):
+            value = tensor.to(device=device, dtype=dtype)
+            return value.detach() if detach else value
+        up, gate, down = (view(tensor).unsqueeze(0).expand(batch_size, -1, -1)
+                          for tensor in (self.w_up_init, self.w_gate_init, self.w_down_init))
+        zero = up.new_zeros(())
+        return FastWeightState(
+            up, gate, down, zero.expand_as(up), zero.expand_as(gate), zero.expand_as(down),
+            view(self.ln_weight), view(self.ln_bias),
+        )
+
     def forward_readout(self, x: torch.Tensor, state: FastWeightState) -> torch.Tensor:
         """Read out from current FastWeightState without modifying W_fast."""
         state = state.ensure_batch_size(x.shape[0])
+        if (getattr(self, "fused_inference_readout", False) and not self.training
+                and not torch.is_grad_enabled() and not state.w_up.is_inference() and not state.w_gate.is_inference()):
+            key = tuple((tensor.data_ptr(), tensor._version, tensor.device, tensor.dtype, tensor.shape)
+                        for tensor in (state.w_up, state.w_gate))
+            if state._packed_up_gate is None or state._packed_key != key:
+                state._packed_up_gate = torch.cat((state.w_up, state.w_gate), dim=-1)
+                state._packed_key = key
+            return swiglu_packed_forward(x, state._packed_up_gate, state.w_down, state.ln_weight, state.ln_bias, self.eps)
         return swiglu_fast_forward(
             x=x,
             w_up=state.w_up,
@@ -876,6 +922,31 @@ class SlidingWindowAttention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
         self._cached_mask: Optional[torch.Tensor] = None
         self._cached_mask_key: Optional[Tuple[int, int, torch.device]] = None
+        self.register_buffer("_packed_qkv", None, persistent=False)
+        self._packed_qkv_key = None
+
+    def _projection_key(self):
+        if any(weight.is_inference() for weight in (self.wq.weight, self.wk.weight, self.wv.weight)):
+            return None
+        return tuple((id(weight), weight._version, weight.device, weight.dtype)
+                     for weight in (self.wq.weight, self.wk.weight, self.wv.weight))
+
+    @torch.no_grad()
+    def prepare_for_inference(self):
+        key = self._projection_key()
+        if key is None:
+            self._packed_qkv = None
+            self._packed_qkv_key = None
+            return
+        if self._packed_qkv is None or key != self._packed_qkv_key:
+            self._packed_qkv = torch.cat((self.wq.weight, self.wk.weight, self.wv.weight), dim=0)
+            self._packed_qkv_key = key
+
+    def train(self, mode=True):
+        if mode:
+            self._packed_qkv = None
+            self._packed_qkv_key = None
+        return super().train(mode)
 
     def _get_sliding_causal_mask(
         self, seq_len: int, kv_len: int, device: torch.device
@@ -915,9 +986,17 @@ class SlidingWindowAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         bsz, seq_len, _ = x.shape
 
-        q = self.wq(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.wk(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        if self._packed_qkv is not None and not self.training and not torch.is_grad_enabled():
+            self.prepare_for_inference()
+        if self._packed_qkv is not None and not self.training and not torch.is_grad_enabled():
+            q_raw, k_raw, v_raw = F.linear(x, self._packed_qkv).split(
+                (self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim), dim=-1
+            )
+        else:
+            q_raw, k_raw, v_raw = self.wq(x), self.wk(x), self.wv(x)
+        q = q_raw.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_raw.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_raw.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rope(q, start_pos=start_pos)
         q, k = apply_rope(q, k, cos, sin)
@@ -935,7 +1014,8 @@ class SlidingWindowAttention(nn.Module):
 
         # Bound stored KV cache to window_size even on initial long-context prefill
         if not self.training and k.shape[2] > self.window_size:
-            new_kv_cache = (k[:, :, -self.window_size :, :], v[:, :, -self.window_size :, :])
+            new_kv_cache = (k[:, :, -self.window_size :, :].clone(memory_format=torch.contiguous_format),
+                            v[:, :, -self.window_size :, :].clone(memory_format=torch.contiguous_format))
         else:
             new_kv_cache = (k, v)
 
@@ -962,7 +1042,7 @@ class SlidingWindowAttention(nn.Module):
             ):
                 global _COMPILED_FLEX_ATTN
                 if _COMPILED_FLEX_ATTN is None:
-                    _COMPILED_FLEX_ATTN = torch.compile(flex_attention)
+                    _COMPILED_FLEX_ATTN = compile_with_backward_amp_off(flex_attention)
                 block_mask = self._get_flex_block_mask(seq_len, kv_len, x.device)
                 attn_out = _COMPILED_FLEX_ATTN(
                     q, k, v, block_mask=block_mask, enable_gqa=(self.n_rep > 1)

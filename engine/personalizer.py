@@ -23,6 +23,7 @@ Implements the complete closed-loop Test-Time Shaping state machine:
 from __future__ import annotations
 
 import time
+import os
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
@@ -34,8 +35,9 @@ import model.uttt_layer as uttt_layer_mod
 from model.uttt_layer import FastWeightState
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
+from engine.inference import TokenTextStream
 
-_INFERENCE_KERNELS_COMPILED = False
+_INFERENCE_KERNELS_COMPILED: set[str] = set()
 
 
 @dataclass
@@ -148,63 +150,63 @@ class uTTTPersonalizer:
         self.top_p = top_p
         # DeepInfer Asynchronous CUDA Stream for background TTT fast-weight updates
         self._ttt_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" and self.online_updates_enabled else None
         )
+        self._warmup_complete = False
+        self._warmup_compiled = False
 
     def warmup(self, compile_kernels: bool = True) -> None:
         """
-        Compile high-throughput RTX 5090 inference & TTT kernels with `dynamic=True`
-        (matching training performance) and pre-warm Triton caches so the first chat
-        turn experiences zero JIT compilation latency.
+        Optionally compile read kernels and pre-warm ordinary inference kernels.
+        CUDA graph capture is deferred until after the first reply token, then
+        reused for subsequent turns with unchanged model and persona weights.
         """
-        global _INFERENCE_KERNELS_COMPILED
-        if self.device.type == "cuda" and compile_kernels and hasattr(torch, "compile") and not _INFERENCE_KERNELS_COMPILED:
-            try:
-                uttt_layer_mod.swiglu_fast_forward = torch.compile(
-                    uttt_layer_mod.swiglu_fast_forward, dynamic=True
-                )
-                uttt_layer_mod.fused_fast_q_proj = torch.compile(
-                    uttt_layer_mod.fused_fast_q_proj, dynamic=True
-                )
-                uttt_layer_mod.fused_slow_projections = torch.compile(
-                    uttt_layer_mod.fused_slow_projections, dynamic=True
-                )
-                uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
-                    uttt_layer_mod.fused_chunk_ttt_step, dynamic=True
-                )
-                uttt_layer_mod.apply_rope = torch.compile(
-                    uttt_layer_mod.apply_rope, dynamic=True
-                )
-                _INFERENCE_KERNELS_COMPILED = True
-                print("[Personalizer] Enabled torch.compile (dynamic=True) for RTX 5090 inference & TTT kernels.")
-            except Exception as exc:
-                print(f"[Personalizer] Warning: torch.compile fallback to eager ({exc})")
+        prepare = getattr(self.model, "prepare_for_inference", None)
+        if compile_kernels and callable(prepare):
+            prepare()
+        if self.device.type != "cuda":
+            return
+        if self._warmup_complete and (not compile_kernels or self._warmup_compiled):
+            return
 
-        if self.device.type == "cuda":
-            t0 = time.perf_counter()
-            autocast_dev = "cuda"
-            dummy_state = self.model.init_fast_state(
-                batch_size=1, device=self.device, dtype=self.dtype, detach=True
-            )
-            dummy_prompt = torch.ones((1, 16), dtype=torch.long, device=self.device)
-            dummy_turn = torch.ones((1, 64), dtype=torch.long, device=self.device)
-            dummy_mask = torch.ones((1, 64), dtype=torch.float32, device=self.device)
-            with torch.no_grad(), torch.amp.autocast(autocast_dev, dtype=self.dtype):
-                for _ in self.model.stream_generate(
-                    input_ids=dummy_prompt,
-                    fast_state=dummy_state,
-                    max_new_tokens=2,
-                    temperature=0.0,
-                ):
-                    pass
+        kernel_names = ["swiglu_fast_forward", "swiglu_packed_forward", "fused_fast_q_proj", "apply_rope"]
+        if self.online_updates_enabled:
+            kernel_names += ["fused_slow_projections", "fused_chunk_ttt_step"]
+        if compile_kernels and hasattr(torch, "compile"):
+            for name in kernel_names:
+                if name in _INFERENCE_KERNELS_COMPILED:
+                    continue
+                try:
+                    compiled = torch.compile(getattr(uttt_layer_mod, name), dynamic=True)
+                    setattr(uttt_layer_mod, name, compiled)
+                    _INFERENCE_KERNELS_COMPILED.add(name)
+                except Exception as exc:
+                    print(f"[Personalizer] Warning: {name} compile fallback to eager ({exc})")
+            self._warmup_compiled = all(name in _INFERENCE_KERNELS_COMPILED for name in kernel_names)
+            print(f"[Personalizer] Prepared {len(kernel_names)} inference kernels (online TTT={self.online_updates_enabled}).")
+
+        t0 = time.perf_counter()
+        dummy_state = self.model.init_fast_state(
+            batch_size=1, device=self.device, dtype=self.dtype, detach=True
+        )
+        dummy_prompt = torch.ones((1, 16), dtype=torch.long, device=self.device)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=self.dtype):
+            for _ in self.model.stream_generate(
+                input_ids=dummy_prompt, fast_state=dummy_state,
+                max_new_tokens=2, temperature=0.0,
+            ):
+                pass
+            if self.online_updates_enabled:
+                dummy_turn = torch.ones((1, 64), dtype=torch.long, device=self.device)
+                dummy_mask = torch.ones((1, 64), dtype=torch.float32, device=self.device)
                 self.model.test_time_update(
-                    interaction_ids=dummy_turn,
-                    fast_state=dummy_state,
+                    interaction_ids=dummy_turn, fast_state=dummy_state,
                     attention_mask=dummy_mask,
                 )
-            torch.cuda.synchronize(self.device)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            print(f"[Personalizer] RTX 5090 inference & TTT kernels warmed up in {dt_ms:.1f} ms.")
+        torch.cuda.synchronize(self.device)
+        self._warmup_complete = True
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[Personalizer] Inference kernels warmed up in {dt_ms:.1f} ms (online TTT={self.online_updates_enabled}).")
 
     # --------------------------------------------------------------------------
     # Slash Command Execution (/save, /reset, /snapshot, /restore, /diff)
@@ -367,6 +369,7 @@ class uTTTPersonalizer:
         # ======================================================================
         generated_ids: List[int] = []
         emitted_len = 0
+        text_stream = TokenTextStream(self.tokenizer)
         autocast_dev = "cuda" if self.device.type == "cuda" else "cpu"
 
         with torch.amp.autocast(autocast_dev, dtype=self.dtype, enabled=self.dtype != torch.float32):
@@ -377,14 +380,12 @@ class uTTTPersonalizer:
                 temperature=temp,
                 top_p=tp,
                 eos_token_id=self.tokenizer.EOS_ID,
+                use_cuda_graph=os.environ.get("UTTT_CUDA_GRAPH", "1") != "0",
             ):
                 generated_ids.append(tok_id)
-                decoded_so_far = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                # Hold back trailing incomplete UTF-8 multi-byte character (\ufffd) until next byte arrives
-                clean_so_far = decoded_so_far.rstrip("\ufffd").replace("\ufffd", "")
-                if len(clean_so_far) > emitted_len:
-                    piece = clean_so_far[emitted_len:]
-                    emitted_len = len(clean_so_far)
+                piece = text_stream.push(tok_id)
+                if piece:
+                    emitted_len += len(piece)
                     yield {"type": "token", "content": piece}
 
         reply_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).replace("\ufffd", "").strip()

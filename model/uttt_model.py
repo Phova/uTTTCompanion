@@ -70,6 +70,7 @@ class uTTTConfig:
 
     # Training memory & schedule optimization
     gradient_checkpointing: bool = True
+    gradient_checkpointing_every: int = 1
     tie_word_embeddings: bool = True
     write_schedule: str = "sequential"          # "sequential" (Eq. 14/17) or "aggregated" (Eq. 2)
     dspark_speculative_k: int = 0               # DeepInfer DSpark speculative draft length (0=off)
@@ -87,8 +88,9 @@ class uTTTConfig:
         if "model" in data or "uttt" in data:
             merged.update(data.get("model", {}))
             merged.update(data.get("uttt", {}))
-            if "training" in data and "gradient_checkpointing" in data["training"]:
-                merged["gradient_checkpointing"] = data["training"]["gradient_checkpointing"]
+            for name in ("gradient_checkpointing", "gradient_checkpointing_every"):
+                if name in data.get("training", {}):
+                    merged[name] = data["training"][name]
         else:
             merged.update(data)
 
@@ -109,7 +111,7 @@ class uTTTConfig:
 class uTTTModelOutput:
     """Structured output returned by `uTTTModel.forward`."""
     logits: torch.Tensor
-    fast_state: FastWeightState
+    fast_state: Optional[FastWeightState]
     loss: Optional[torch.Tensor] = None
     ce_loss: Optional[torch.Tensor] = None
     surprise_loss: Optional[torch.Tensor] = None
@@ -382,6 +384,14 @@ class uTTTModel(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
 
+    def prepare_for_inference(self) -> None:
+        """Prepare disposable packed projections without changing checkpoint keys."""
+        if self.training:
+            raise ValueError("Call eval() before preparing inference projections")
+        for block in self.layers:
+            block.attn.prepare_for_inference()
+        self.fast_weight_pool.fused_inference_readout = True
+
     def init_fast_state(
         self,
         batch_size: int = 1,
@@ -494,6 +504,7 @@ class uTTTModel(nn.Module):
             fast_state.ln_weight,
             fast_state.ln_bias,
             use_reentrant=False,
+            preserve_rng_state=self.config.dropout > 0.0,
         )
 
         num_chunks = (x.shape[1] + self.config.chunk_size - 1) // self.config.chunk_size
@@ -525,6 +536,7 @@ class uTTTModel(nn.Module):
         update_fast_weights: bool = True,
         surprise_aux_weight: float = 0.10,
         logits_to_keep: int = 0,
+        return_fast_state: bool = True,
     ) -> uTTTModelOutput:
         """
         Forward pass through all uTTTBlocks with sequential cross-layer FastWeightState passing.
@@ -545,12 +557,14 @@ class uTTTModel(nn.Module):
             h = h.to(torch.get_autocast_dtype("cuda" if h.is_cuda else "cpu"))
 
         if fast_state is None:
-            fast_state = self.init_fast_state(
-                batch_size=bsz,
-                device=h.device,
-                dtype=h.dtype,
-                detach=not self.training,
-            )
+            if not update_fast_weights and not return_fast_state:
+                fast_state = self.fast_weight_pool.readonly_state(
+                    batch_size=bsz, device=h.device, dtype=h.dtype, detach=not self.training
+                )
+            else:
+                fast_state = self.init_fast_state(
+                    batch_size=bsz, device=h.device, dtype=h.dtype, detach=not self.training
+                )
         else:
             fast_state = fast_state.ensure_batch_size(bsz)
 
@@ -580,6 +594,7 @@ class uTTTModel(nn.Module):
                 self.gradient_checkpointing
                 and self.training
                 and kv_caches is None
+                and idx % max(1, self.config.gradient_checkpointing_every) == 0
             )
 
             if use_ckpt:
@@ -668,7 +683,7 @@ class uTTTModel(nn.Module):
 
         return uTTTModelOutput(
             logits=logits,
-            fast_state=cur_fast_state.detach() if self.training else cur_fast_state,
+            fast_state=(cur_fast_state.detach() if self.training else cur_fast_state) if return_fast_state else None,
             loss=total_loss,
             ce_loss=ce_loss,
             surprise_loss=mean_surprise_loss,
@@ -691,6 +706,7 @@ class uTTTModel(nn.Module):
         eos_token_id: Optional[int] = SimpleUTF8Tokenizer.EOS_ID,
         speculative_draft_k: Optional[int] = None,
         dspark_conf_threshold: Optional[float] = None,
+        use_cuda_graph: bool = False,
     ) -> Iterator[int]:
         """
         Step 1 of `interact_and_evolve`:
@@ -728,6 +744,8 @@ class uTTTModel(nn.Module):
             generated_count = 0
             recent_tokens: List[int] = []
             active_limit = self.active_vocab_limit
+            graph_decoder = None
+            graph_attempted = False
 
             while generated_count < max_new_tokens:
                 next_token = self._sample_next_token(
@@ -833,6 +851,34 @@ class uTTTModel(nn.Module):
 
                 # Standard 1-token autoregressive decoding step
                 step_input = next_token.view(1, 1)
+                # Defer capture/reset until the first token has been yielded.
+                # A one-token reply or immediate EOS needs no decode graph.
+                if use_cuda_graph and draft_k == 0 and not graph_attempted:
+                    graph_attempted = True
+                    from engine.inference import CUDAGraphDecoder
+                    try:
+                        if CUDAGraphDecoder.is_supported(self, fast_state, kv_caches, cur_pos):
+                            cached = getattr(self, "_cuda_graph_decoder", None)
+                            if cached is not None and cached.matches(self, fast_state):
+                                cached.reset(kv_caches, cur_pos)
+                                graph_decoder = cached
+                            else:
+                                graph_decoder = CUDAGraphDecoder(self, fast_state, kv_caches, cur_pos)
+                                self._cuda_graph_decoder = graph_decoder
+                    except (RuntimeError, ValueError) as error:
+                        self._cuda_graph_decoder = None
+                        print(f"[Inference] CUDA graph unavailable; using standard decode ({error})")
+                if graph_decoder is not None:
+                    try:
+                        next_token_logits = graph_decoder.step(step_input)
+                        cur_pos += 1
+                        continue
+                    except ValueError:
+                        # Position-table limits or changed persona state are
+                        # detected before replay; recover the exact KV history.
+                        kv_caches = graph_decoder.export_kv_caches()
+                        graph_decoder = None
+                        self._cuda_graph_decoder = None
                 step_out = self.forward(
                     input_ids=step_input,
                     fast_state=fast_state,

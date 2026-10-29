@@ -139,7 +139,7 @@ def get_personalizer() -> uTTTPersonalizer:
 async def lifespan(app: FastAPI):
     # Initialize shared Slow Weights & LRU Fast-Weight Pool on startup
     engine = get_personalizer()
-    compile_kernels = os.environ.get("UTTT_NO_COMPILE", "0") != "1"
+    compile_kernels = os.environ.get("UTTT_NO_COMPILE", "1") != "1"
     engine.warmup(compile_kernels=compile_kernels)
     prewarm_user = os.environ.get("UTTT_DEFAULT_USER", "").strip()
     if prewarm_user:

@@ -32,6 +32,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -324,34 +325,43 @@ def maybe_compile_inner_loop(
         compile_mode = "default"
 
     try:
-        uttt_layer_mod.fused_chunk_ttt_step = torch.compile(
-            uttt_layer_mod.fused_chunk_ttt_step,
-            mode=compile_mode,
-            fullgraph=False,
+        def compile_training_kernel(function):
+            # The shared helper also protects attention's default lazy compile
+            # path when the optional training-kernel compiler is disabled.
+            return uttt_layer_mod.compile_with_backward_amp_off(
+                function, mode=compile_mode, fullgraph=False,
+                dynamic=bool(hw_cfg.get("compile_dynamic", False)),
+            )
+
+        names = (
+            "fused_chunk_ttt_step", "fused_slow_projections", "fused_fast_q_proj",
+            "swiglu_fast_forward", "apply_rope",
         )
-        uttt_layer_mod.fused_slow_projections = torch.compile(
-            uttt_layer_mod.fused_slow_projections,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        uttt_layer_mod.swiglu_fast_forward = torch.compile(
-            uttt_layer_mod.swiglu_fast_forward,
-            mode=compile_mode,
-            fullgraph=False,
-        )
-        uttt_layer_mod.apply_rope = torch.compile(
-            uttt_layer_mod.apply_rope,
-            mode=compile_mode,
-            fullgraph=False,
-        )
+        compiled = {
+            name: compile_training_kernel(getattr(uttt_layer_mod, name))
+            for name in names
+        }
+        for name, function in compiled.items():
+            setattr(uttt_layer_mod, name, function)
         if getattr(uttt_layer_mod, "_HAS_FLEX_ATTENTION", False) and uttt_layer_mod.flex_attention is not None:
-            uttt_layer_mod._COMPILED_FLEX_ATTN = torch.compile(uttt_layer_mod.flex_attention)
+            uttt_layer_mod._COMPILED_FLEX_ATTN = compile_training_kernel(uttt_layer_mod.flex_attention)
         print(
-            f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for fused_chunk_ttt_step, "
-            "fused_slow_projections, FlexAttention SWA, swiglu_fast_forward & apply_rope."
+            f"[Compiler] Enabled torch.compile (mode='{compile_mode}') for "
+            + ", ".join(names) + " and FlexAttention SWA."
         )
     except Exception as exc:
         print(f"[Compiler] torch.compile fallback to eager mode: {exc}")
+
+
+def accumulation_autocast(device_type: str, dtype: torch.dtype, cache_across_accumulation: bool):
+    """Keep weight casts only until the optimizer step, optionally across micro-batches.
+
+    Do not substitute a disabled autocast context for nullcontext: nesting an
+    enabled forward inside it also retains the cache until the outer exit.
+    """
+    if cache_across_accumulation and dtype != torch.float32:
+        return torch.amp.autocast(device_type, dtype=dtype)
+    return nullcontext()
 
 
 # ==============================================================================
@@ -502,6 +512,19 @@ def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype,
     return results
 
 
+def same_training_data(saved_metrics, current_fingerprint: str, current_source: str) -> bool:
+    """Content identity survives symlink/snapshot aliases; legacy paths stay strict.
+
+    The resume compatibility check still requires a verified fingerprint for the
+    current training pipeline. This fallback never treats an unverified path
+    alias as evidence that two datasets are the same.
+    """
+    saved_fingerprint = saved_metrics.get("dataset_fingerprint")
+    if isinstance(saved_fingerprint, str) and saved_fingerprint:
+        return saved_fingerprint == current_fingerprint
+    return saved_metrics.get("data_source") == current_source
+
+
 def train(
     config_path: str = "configs/5090_config.yaml",
     data_path: Optional[str] = None,
@@ -525,6 +548,12 @@ def train(
     hw_cfg = raw_cfg.get("hardware", {})
     train_cfg = raw_cfg.get("training", {})
     model_cfg = uTTTConfig.from_dict(raw_cfg)
+    model_cfg.gradient_checkpointing_every = int(train_cfg.get(
+        "gradient_checkpointing_every", getattr(model_cfg, "gradient_checkpointing_every", 1)
+    ))
+    if model_cfg.gradient_checkpointing_every < 1:
+        raise ValueError("gradient_checkpointing_every must be positive; disable gradient_checkpointing for none")
+    cache_across_accumulation = bool(train_cfg.get("autocast_cache_across_accumulation", False))
     training_stage = stage or train_cfg.get("stage", "meta")
     if training_stage not in {"pretrain", "sft", "meta"}:
         raise ValueError("stage must be pretrain, sft, or meta")
@@ -672,7 +701,7 @@ def train(
     best_validation_ce = float("inf")
     validation_metrics = {}
     evaluation_interval = max(1, int(train_cfg.get("eval_interval", 250)))
-    cur_data_tag = str(data_path or "synthetic")
+    cur_data_tag = str(Path(data_path).expanduser().resolve()) if data_path else "synthetic"
     ckpt_file = Path(ckpt_path)
     prev_ckpt_file = Path(str(ckpt_path) + ".prev")
     if resume and not lightweight_preset and (ckpt_file.exists() or prev_ckpt_file.exists()):
@@ -705,7 +734,7 @@ def train(
                     and saved_cfg.get("vocab_size") == model_cfg.vocab_size
                 )
                 is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
-                same_data = saved_metrics.get("data_source", cur_data_tag) == cur_data_tag
+                same_data = same_training_data(saved_metrics, dataset.fingerprint, cur_data_tag)
                 if dims_match and is_causal_v2 and same_data and saved_step >= max_steps and math.isfinite(saved_loss):
                     print(f"[Resume] Checkpoint already reached step {saved_step} (requested {max_steps}); leaving it unchanged.", flush=True)
                     return loaded_from
@@ -754,7 +783,8 @@ def train(
         f"[Train] Starting {training_stage} from step {start_step} to {max_steps} | "
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
-        f"Precision={amp_dtype}",
+        f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
+        f"AccumulationAmpCache={cache_across_accumulation}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -789,39 +819,48 @@ def train(
                 inv_accum = 1.0 / float(grad_accum_steps)
                 step_tokens = 0
 
-                for _ in range(grad_accum_steps):
-                    try:
-                        batch = next(data_iter)
-                    except StopIteration:
-                        data_iter = iter(loader)
-                        batch = next(data_iter)
+                # This context exits before clipping and optimizer.step, so
+                # cached BF16 casts can never survive a parameter update.
+                with accumulation_autocast(autocast_device_type, amp_dtype, cache_across_accumulation):
+                    for _ in range(grad_accum_steps):
+                        try:
+                            batch = next(data_iter)
+                        except StopIteration:
+                            data_iter = iter(loader)
+                            batch = next(data_iter)
 
-                    if not bool((batch["labels"][:, 1:] != -100).any()):
-                        raise ValueError("Batch has no supervised next-token targets; check dialogue roles and training stage")
-                    step_tokens += int(batch["attention_mask"].sum())
-                    input_ids = batch["input_ids"].to(device, non_blocking=True)
-                    labels = batch["labels"].to(device, non_blocking=True)
-                    # Packing can still leave padding (e.g. a one-row dataset).
-                    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                        if not bool((batch["labels"][:, 1:] != -100).any()):
+                            raise ValueError("Batch has no supervised next-token targets; check dialogue roles and training stage")
+                        step_tokens += int(batch["attention_mask"].sum())
+                        input_ids = batch["input_ids"].to(device, non_blocking=True)
+                        labels = batch["labels"].to(device, non_blocking=True)
+                        # Packing can still leave padding (e.g. a one-row dataset).
+                        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-                    # Native BF16 mixed precision forward + analytical inner-loop TTT update
-                    with torch.amp.autocast(autocast_device_type, dtype=amp_dtype, enabled=amp_dtype != torch.float32):
-                        out = model(
-                            input_ids=input_ids,
-                            fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
-                            labels=labels,
-                            attention_mask=attention_mask,
-                            update_fast_weights=update_fast_weights,
-                            surprise_aux_weight=surprise_aux_weight,
-                        )
-                        scaled_loss = out.loss * inv_accum
+                        # Native BF16 mixed precision forward + analytical inner-loop TTT update
+                        with torch.amp.autocast(autocast_device_type, dtype=amp_dtype, enabled=amp_dtype != torch.float32):
+                            out = model(
+                                input_ids=input_ids,
+                                fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
+                                labels=labels,
+                                attention_mask=attention_mask,
+                                update_fast_weights=update_fast_weights,
+                                surprise_aux_weight=surprise_aux_weight,
+                                return_fast_state=False,
+                            )
+                            scaled_loss = out.loss * inv_accum
 
-                    scaled_loss.backward()
+                        # The outer cache stays alive, but ordinary backward kernels
+                        # must run outside enabled autocast. Checkpoint recomputation
+                        # restores its own saved forward autocast context.
+                        with (torch.amp.autocast(autocast_device_type, enabled=False)
+                              if cache_across_accumulation else nullcontext()):
+                            scaled_loss.backward()
 
-                    step_loss_gpu += out.loss.detach().float() * inv_accum
-                    step_ce_gpu += out.ce_loss.detach().float() * inv_accum
-                    step_surprise_gpu += out.surprise_loss.detach().float() * inv_accum
-                    del out, scaled_loss
+                        step_loss_gpu += out.loss.detach().float() * inv_accum
+                        step_ce_gpu += out.ce_loss.detach().float() * inv_accum
+                        step_surprise_gpu += out.surprise_loss.detach().float() * inv_accum
+                        del out, scaled_loss
                 break
             except torch.OutOfMemoryError:
                 optimizer.zero_grad(set_to_none=True)
@@ -835,6 +874,18 @@ def train(
                         f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM with GradCkpt=False! "
                         f"Automatically enabled GradCkpt=True at MicroBatch={micro_batch_size}. Retrying step...",
                         flush=True,
+                    )
+                elif model_cfg.gradient_checkpointing_every > 1:
+                    model_cfg.gradient_checkpointing_every = 1
+                    print(
+                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM with selective checkpointing; "
+                        "restored checkpointing on every layer. Retrying step...", flush=True,
+                    )
+                elif cache_across_accumulation:
+                    cache_across_accumulation = False
+                    print(
+                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM with persistent AMP cache; "
+                        "disabled cross-microbatch weight caching. Retrying step...", flush=True,
                     )
                 elif micro_batch_size > 1:
                     # Stage 2: Halve MicroBatch and double GradAccum (preserving EffectiveBatch)
