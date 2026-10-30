@@ -16,6 +16,8 @@
 
 Windows SSH 的 `exec request failed on channel 0` 已通过非PTY流连接和短命令上传修复，并在实际主机验证断线回收，见 [监控兼容记录](docs/windows_ssh_monitor_20261030.md)。
 
+通过 Windows SSH 启动 WSL 长时间训练时，可使用独立的 Windows WSL 客户端持有前台训练所有者；启动、安全停止及实际验证见 [WSL 独立训练所有者](docs/wsl_training_owner.md)。
+
 第21500步保存后的 `InterruptedError` 属于计划停止，现已改为简短中断提示；同一检查点的贪心、随机采样、受控生成及语料重复审计见 [重复输出诊断](docs/repetition_training_audit_20261030.md)。模型仍处于早期预训练，解码约束的改善不等于权重质量已经合格。
 
 ## 可靠性修复与兼容说明

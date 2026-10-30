@@ -15,7 +15,7 @@ def training_command(root, session):
     """Follow one training supervisor without ever sending it a signal."""
     pid = None
     if shutil.which('tmux'):
-        result = subprocess.run(['tmux', 'display-message', '-p', '-t', '=' + session, '#{pane_pid}'],
+        result = subprocess.run(['tmux', 'display-message', '-p', '-t', '=' + session + ':', '#{pane_pid}'],
                                 capture_output=True, text=True)
         if result.returncode == 0:
             pid = result.stdout.strip()

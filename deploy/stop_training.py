@@ -133,7 +133,7 @@ def main():
     if args.timeout <= 0:
         parser.error("timeout must be positive")
     roots = []
-    tmux = subprocess.run(["tmux", "list-panes", "-t", "=" + args.session, "-F", "#{pane_pid}"],
+    tmux = subprocess.run(["tmux", "list-panes", "-t", "=" + args.session + ":", "-F", "#{pane_pid}"],
                           capture_output=True, text=True) if shutil.which("tmux") else None
     if tmux is not None and tmux.returncode == 0:
         roots.extend(int(value) for value in tmux.stdout.splitlines())
