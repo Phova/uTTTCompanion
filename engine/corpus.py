@@ -19,16 +19,34 @@ class ResumableBatchSampler(Sampler):
             raise ValueError("Dataset size and batch size must be positive")
         self.size, self.batch_size, self.seed = int(size), int(batch_size), int(seed)
         self.epoch, self.offset = 0, 0
+        self._permutation_key, self._permutation = None, None
+
+    def _order_for_epoch(self):
+        key = (self.size, self.seed, self.epoch)
+        if self._permutation_key != key:
+            generator = torch.Generator().manual_seed(self.seed + self.epoch)
+            # Keep the exact legacy randperm, but avoid millions of boxed Python
+            # integers. NumPy shares this CPU tensor's storage without copying.
+            self._permutation = torch.randperm(self.size, generator=generator).numpy()
+            self._permutation_key = key
+        return self._permutation
 
     def __iter__(self):
-        generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        order = torch.randperm(self.size, generator=generator).tolist()
-        limit = self.size - self.size % self.batch_size if self.size >= self.batch_size else self.size
-        for start in range(self.offset, limit, self.batch_size):
-            end = min(start + self.batch_size, limit)
-            if end - start < self.batch_size and self.size >= self.batch_size:
+        order = memoryview(self._order_for_epoch())
+        size, batch_size, offset = self.size, self.batch_size, self.offset
+        # An OOM can change batch size at an offset that is not divisible by
+        # the new size. Drop only the actual remaining tail, not a global tail.
+        limit = offset + ((size - offset) // batch_size) * batch_size if size >= batch_size else size
+        if batch_size == 1:
+            for start in range(offset, limit):
+                yield [order[start]]
+            return
+        for start in range(offset, limit, batch_size):
+            end = min(start + batch_size, limit)
+            if end - start < batch_size and size >= batch_size:
                 break
-            yield order[start:end]
+            # Only box the small batch crossing the DataLoader queue boundary.
+            yield order[start:end].tolist()
 
     def __len__(self):
         remaining = self.size - self.offset

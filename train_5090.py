@@ -53,10 +53,14 @@ _STOP_REQUESTED: Optional[int] = None
 
 
 def _wait_for_active_save() -> None:
-    global _ACTIVE_SAVE_THREAD, _ACTIVE_SAVE_ERROR
     if _ACTIVE_SAVE_THREAD is not None and _ACTIVE_SAVE_THREAD.is_alive():
         print("[Checkpoint] Waiting for in-flight background checkpoint write to complete...", flush=True)
         _ACTIVE_SAVE_THREAD.join()
+    _raise_active_save_error()
+
+
+def _raise_active_save_error() -> None:
+    global _ACTIVE_SAVE_ERROR
     if _ACTIVE_SAVE_ERROR is not None:
         error, _ACTIVE_SAVE_ERROR = _ACTIVE_SAVE_ERROR, None
         raise RuntimeError("Background checkpoint save failed") from error
@@ -377,16 +381,26 @@ def accumulation_autocast(device_type: str, dtype: torch.dtype, cache_across_acc
 # 3. Base Checkpoint Export (`checkpoints/base_uttt.pt`)
 # ==============================================================================
 
-def _cpu_copy_nested(obj: Any) -> Any:
-    """Recursively copy tensors in optimizer state_dict to CPU memory for background saving."""
+def _cpu_copy_nested(obj: Any, tensor_memo=None) -> Any:
+    """Snapshot tensors without duplicating tied parameters or identical views."""
+    if tensor_memo is None:
+        tensor_memo = {}
     if isinstance(obj, torch.Tensor):
-        return obj.detach().to(device="cpu", copy=True)
+        key = None
+        if obj.layout == torch.strided:
+            key = (obj.device, obj.dtype, obj.data_ptr(), obj.storage_offset(), tuple(obj.shape),
+                   tuple(obj.stride()), obj.is_conj(), obj.is_neg())
+        if key is None:
+            return obj.detach().to(device="cpu", copy=True)
+        if key not in tensor_memo:
+            tensor_memo[key] = obj.detach().to(device="cpu", copy=True)
+        return tensor_memo[key]
     if isinstance(obj, dict):
-        return {k: _cpu_copy_nested(v) for k, v in obj.items()}
+        return {k: _cpu_copy_nested(v, tensor_memo) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_cpu_copy_nested(v) for v in obj]
+        return [_cpu_copy_nested(v, tensor_memo) for v in obj]
     if isinstance(obj, tuple):
-        return tuple(_cpu_copy_nested(v) for v in obj)
+        return tuple(_cpu_copy_nested(v, tensor_memo) for v in obj)
     return obj
 
 
@@ -399,6 +413,7 @@ def export_base_checkpoint(
     metrics: Dict[str, Any],
     async_save: bool = False,
     training_state: Optional[Dict[str, Any]] = None,
+    best_save_path: Optional[str | Path] = None,
 ) -> Path:
     """
     Export the dual-track Base Checkpoint (`checkpoints/base_uttt.pt`).
@@ -415,6 +430,17 @@ def export_base_checkpoint(
 
     out_path = Path(save_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    best_path = Path(best_save_path) if best_save_path is not None else None
+    if best_path is not None:
+        if best_path.resolve() == out_path.resolve():
+            raise ValueError("The best checkpoint must differ from the full checkpoint")
+        best_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Copy a consistent model snapshot once. state_dict has two keys for tied
+    # embeddings; retaining that alias saves both copy traffic and file space.
+    tensor_memo = {}
+    model_snapshot = _cpu_copy_nested(model.state_dict(), tensor_memo)
+    fast_prefix = "fast_weight_pool."
 
     payload = {
         "checkpoint_type": "uTTT_Base_Checkpoint",
@@ -422,32 +448,53 @@ def export_base_checkpoint(
         "step": step,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "config": config.to_dict(),
-        "slow_weights": model.slow_state_dict(),
-        "init_fast_weights": model.init_fast_state_dict(),
-        "metrics": metrics,
+        "slow_weights": {key: value for key, value in model_snapshot.items() if not key.startswith(fast_prefix)},
+        "init_fast_weights": {key[len(fast_prefix):]: value for key, value in model_snapshot.items() if key.startswith(fast_prefix)},
+        "metrics": _cpu_copy_nested(metrics, tensor_memo),
     }
     if optimizer is not None:
-        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
+        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict(), tensor_memo)
     if training_state is not None:
-        payload["training_state"] = _cpu_copy_nested(training_state)
+        payload["training_state"] = _cpu_copy_nested(training_state, tensor_memo)
+    # The weight-only best file references the same immutable CPU tensors. Disk
+    # serialization does not mutate them, and no second GPU snapshot is needed.
+    best_payload = ({key: value for key, value in payload.items()
+                     if key not in ("optimizer_state", "training_state")} if best_path is not None else None)
+
+    def _write_one(path, contents) -> None:
+        tmp_path = Path(str(path) + ".tmp")
+        prev_path = Path(str(path) + ".prev")
+        try:
+            with open(tmp_path, "wb") as f:
+                torch.save(contents, f)
+                f.flush()
+                os.fsync(f.fileno())
+            if path.exists():
+                backup_tmp = Path(str(prev_path) + ".tmp")
+                try:
+                    backup_tmp.unlink(missing_ok=True)
+                    os.link(path, backup_tmp)
+                    os.replace(backup_tmp, prev_path)
+                except OSError:
+                    # Keep an older usable backup if this filesystem cannot
+                    # create a hardlink for the latest one.
+                    pass
+                finally:
+                    backup_tmp.unlink(missing_ok=True)
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        size_mb = path.stat().st_size / (1024 * 1024)
+        print(f"[Checkpoint] Saved Base Checkpoint -> {path} ({size_mb:.2f} MB)", flush=True)
 
     def _write_to_disk() -> None:
-        tmp_path = Path(str(out_path) + ".tmp")
-        prev_path = Path(str(out_path) + ".prev")
-        with open(tmp_path, "wb") as f:
-            torch.save(payload, f)
-            f.flush()
-            os.fsync(f.fileno())
-        if out_path.exists():
-            try:
-                if prev_path.exists() or prev_path.is_symlink():
-                    prev_path.unlink()
-                os.link(out_path, prev_path)
-            except Exception:
-                pass
-        os.replace(tmp_path, out_path)
-        size_mb = out_path.stat().st_size / (1024 * 1024)
-        print(f"[Checkpoint] Saved Base Checkpoint -> {out_path} ({size_mb:.2f} MB)", flush=True)
+        _write_one(out_path, payload)
+        if best_payload is not None:
+            # The large optimizer snapshot is no longer needed once the full
+            # file is durable. Release it before serializing weight-only best.
+            payload.pop("optimizer_state", None)
+            payload.pop("training_state", None)
+            _write_one(best_path, best_payload)
 
     if async_save:
         def _background_write() -> None:
@@ -885,6 +932,9 @@ def train(
     if _STOP_REQUESTED:
         raise SystemExit(128 + _STOP_REQUESTED)
     for step in range(start_step, max_steps + 1):
+        # Surface asynchronous disk failures promptly without waiting for an
+        # otherwise healthy writer before every optimizer step.
+        _raise_active_save_error()
         # Update learning rates for both parameter groups
         cur_slow_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, outer_lr)
         cur_fast_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, meta_fast_lr)
@@ -1126,10 +1176,8 @@ def train(
                     async_save=(step < max_steps and not _STOP_REQUESTED),
                     training_state={"data_cursor": batch_sampler.state_dict(), "rng": capture_training_rng(),
                                     "micro_batch_size": micro_batch_size, "grad_accum_steps": grad_accum_steps},
+                    best_save_path=str(Path(ckpt_path).with_suffix(".best.pt")) if improved else None,
                 )
-                if improved:
-                    best_path = str(Path(ckpt_path).with_suffix(".best.pt"))
-                    export_base_checkpoint(model, None, model_cfg, best_path, step, metrics)
                 checkpoint_saved = True
         if _STOP_REQUESTED and checkpoint_saved:
             _wait_for_active_save()

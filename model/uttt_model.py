@@ -693,7 +693,10 @@ class uTTTModel(nn.Module):
                 ce_counts.append((l_sub != -100).sum())
             total_valid = torch.stack(ce_counts).sum().clamp_min(1)
             ce_loss = torch.stack(ce_sums).sum() / total_valid
-            total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
+            # Multiplying a connected auxiliary graph by zero still traverses
+            # its complete higher-order backward. Keep the metric available,
+            # but omit that graph from the objective when it is disabled.
+            total_loss = ce_loss if surprise_aux_weight == 0.0 else ce_loss + surprise_aux_weight * mean_surprise_loss
             logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)
         elif labels is not None:
             h = self.norm(h)
@@ -706,7 +709,7 @@ class uTTTModel(nn.Module):
                 ignore_index=-100,
                 reduction="sum",
             ) / (shift_labels != -100).sum().clamp_min(1)
-            total_loss = ce_loss + surprise_aux_weight * mean_surprise_loss
+            total_loss = ce_loss if surprise_aux_weight == 0.0 else ce_loss + surprise_aux_weight * mean_surprise_loss
         elif logits_to_keep < 0:
             # Skip final norm and lm_head when logits are not needed (e.g. test_time_update)
             logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)

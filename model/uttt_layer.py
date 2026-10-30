@@ -618,6 +618,28 @@ class SharedFastWeightPool(nn.Module):
             view(self.ln_weight), view(self.ln_bias),
         )
 
+    def inference_read_weights(self, state: FastWeightState, dtype: torch.dtype, device: torch.device):
+        """Share versioned read copies between eager prefill and CUDA graphs.
+
+        The caller must serialize persona access and keep master weights frozen
+        while reading. Returned tensors are read-only; a matching-dtype down
+        tensor may alias its master and must never be modified by the decoder.
+        """
+        weights = (state.w_up, state.w_gate, state.w_down)
+        if torch.is_grad_enabled() or any(tensor.is_inference() for tensor in weights):
+            raise ValueError("Inference read caches require no-grad, version-tracked weights")
+        key = (dtype, device, tuple(
+            (id(tensor), tensor.data_ptr(), tensor._version, tensor.device, tensor.dtype, tuple(tensor.shape))
+            for tensor in weights
+        ))
+        if state._packed_up_gate is None or state._read_w_down is None or state._packed_key != key:
+            state._packed_up_gate = torch.cat(
+                (state.w_up.to(dtype=dtype), state.w_gate.to(dtype=dtype)), dim=-1
+            )
+            state._read_w_down = state.w_down.to(dtype=dtype)
+            state._packed_key = key
+        return state._packed_up_gate, state._read_w_down
+
     def forward_readout(self, x: torch.Tensor, state: FastWeightState) -> torch.Tensor:
         """Read out from current FastWeightState without modifying W_fast."""
         state = state.ensure_batch_size(x.shape[0])
@@ -626,18 +648,9 @@ class SharedFastWeightPool(nn.Module):
                 and not torch.is_grad_enabled() and not any(tensor.is_inference() for tensor in weights)):
             # Persona writes accumulate in FP32. Reuse activation-precision read
             # copies across layers/tokens while keeping every master bit intact.
-            key = (x.dtype, x.device, tuple(
-                (id(tensor), tensor.data_ptr(), tensor._version, tensor.device, tensor.dtype, tuple(tensor.shape))
-                for tensor in weights
-            ))
-            if state._packed_up_gate is None or state._read_w_down is None or state._packed_key != key:
-                state._packed_up_gate = torch.cat(
-                    (state.w_up.to(dtype=x.dtype), state.w_gate.to(dtype=x.dtype)), dim=-1
-                )
-                state._read_w_down = state.w_down.to(dtype=x.dtype)
-                state._packed_key = key
+            packed, down = self.inference_read_weights(state, x.dtype, x.device)
             return swiglu_packed_forward(
-                x, state._packed_up_gate, state._read_w_down, state.ln_weight, state.ln_bias, self.eps
+                x, packed, down, state.ln_weight, state.ln_bias, self.eps
             )
         return swiglu_fast_forward(
             x=x,

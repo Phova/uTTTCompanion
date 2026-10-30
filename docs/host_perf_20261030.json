@@ -1,0 +1,39 @@
+{
+  "torch": "2.11.0+cu128",
+  "inner_loop_protocol": "chunk_shared_fp32_exact_v1",
+  "sampler": {
+    "legacy": {
+      "build_to_first_batch_seconds": 0.0885695000179112,
+      "retry_to_first_batch_seconds": 0.11067029996775091,
+      "consume_batches_per_second": 8125309.781855408,
+      "consumed_batches": 100000,
+      "checksum": 175026229834,
+      "retry_same_first_batch": true,
+      "peak_python_index_bytes": 140157848
+    },
+    "optimized": {
+      "build_to_first_batch_seconds": 0.03450009995140135,
+      "retry_to_first_batch_seconds": 2.1099986042827368e-05,
+      "consume_batches_per_second": 12211082.865497038,
+      "consumed_batches": 100000,
+      "checksum": 175026229834,
+      "retry_same_first_batch": true,
+      "peak_python_index_bytes": 1584,
+      "retained_index_buffer_bytes": 28033064
+    }
+  },
+  "checkpoint": {
+    "model_parameters": 4425604,
+    "device": "cpu",
+    "legacy_model_cpu_copy_bytes": 68172832,
+    "optimized_model_cpu_copy_bytes": 17702416,
+    "legacy_primary_snapshot_seconds": 0.010884799994528294,
+    "legacy_total_seconds": 0.09145730000454932,
+    "optimized_return_seconds": 0.004327500006183982,
+    "optimized_total_seconds": 0.06802230002358556,
+    "legacy_total_checkpoint_bytes": 103633072,
+    "optimized_total_checkpoint_bytes": 70866613,
+    "loaded_weights_match": true
+  },
+  "scope": "CPU host overhead only; no large-model GPU throughput claim"
+}

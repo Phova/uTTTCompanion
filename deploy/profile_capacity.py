@@ -9,6 +9,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from model.uttt_model import uTTTConfig, uTTTModel
+from deploy.gpu_memory import GpuMemoryError, query_available_gpu_memory
+
+
+def available_memory():
+    device = torch.cuda.current_device()
+    free, _ = torch.cuda.mem_get_info(device)
+    properties = torch.cuda.get_device_properties(device)
+    return query_available_gpu_memory(
+        free, device_uuid=getattr(properties, "uuid", None), device_index=device,
+        visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+    )
 
 
 def candidate_config(width, layers, seq_len=1024):
@@ -24,11 +35,17 @@ def candidate_config(width, layers, seq_len=1024):
 
 def measure(config, seq_len, budget_gb, steps=2):
     torch.cuda.empty_cache()
+    # Recheck in each worker too: direct --worker execution must not bypass
+    # protection, and another process may allocate after the parent snapshot.
+    memory = available_memory()
+    budget_gb = min(budget_gb, memory["free_bytes"] / 1024**3 - 1.5)
+    if budget_gb < 4:
+        return {"status": "insufficient_global_memory", "available_memory": memory}
     # Reserve space for other live processes and reject candidates before allocation.
     with torch.device("meta"):
         count = uTTTModel(config).num_parameters()["total"]
     if count * 16 / 1024**3 + 1.5 > budget_gb:
-        return {"status": "static_budget_exceeded", "parameters": count}
+        return {"status": "static_budget_exceeded", "parameters": count, "available_memory": memory}
     torch.manual_seed(42)
     model = uTTTModel(config).cuda().train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
@@ -47,7 +64,7 @@ def measure(config, seq_len, budget_gb, steps=2):
     reserved = torch.cuda.max_memory_reserved() / 1024**3
     return {"status": "ok" if reserved <= budget_gb else "over_budget", "parameters": count,
             "peak_allocated_gb": peak, "peak_reserved_gb": reserved,
-            "seq_len": seq_len, "batch_size": 1, "steps": steps}
+            "seq_len": seq_len, "batch_size": 1, "steps": steps, "available_memory": memory}
 
 
 def main():
@@ -66,8 +83,11 @@ def main():
         return
     if not torch.cuda.is_available():
         parser.error("CUDA GPU required")
-    free, _ = torch.cuda.mem_get_info()
-    budget = min(args.budget_gb, free / 1024**3 - 1.5)
+    try:
+        memory = available_memory()
+    except GpuMemoryError as error:
+        parser.error(str(error))
+    budget = min(args.budget_gb, memory["free_bytes"] / 1024**3 - 1.5)
     if budget < 4:
         parser.error("Not enough free GPU memory; stop other GPU workloads first")
     candidates = [(1536, 24), (2048, 24), (2560, 24), (2560, 28), (2560, 32), (2560, 33), (2560, 34), (2560, 35), (3072, 24), (3072, 28)]
@@ -85,7 +105,8 @@ def main():
         reports.append(result)
         print(json.dumps(result), flush=True)
     passed = [result for result in reports if result["status"] == "ok"]
-    report = {"budget_gb": budget, "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL,
+    report = {"budget_gb": budget, "available_memory": memory,
+              "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL,
               "training_stage": "meta", "dynamic_state_precision": "float32",
               "candidates": reports,
               "largest_tested": max(passed, key=lambda result: result["parameters"]) if passed else None}

@@ -1,0 +1,42 @@
+{
+  "device": "cuda",
+  "config": {
+    "name": "uTTT-151M-Base",
+    "vocab_size": 512,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "d_ff_fast": 256,
+    "sliding_window_size": 64,
+    "max_seq_len": 4096,
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-05,
+    "dropout": 0.0,
+    "chunk_size": 16,
+    "base_inner_lr": 0.015,
+    "base_weight_decay": 0.005,
+    "momentum_beta": 0.9,
+    "max_inner_grad_norm": 1.0,
+    "normalize_loss_by_dim": true,
+    "surprise_threshold": 0.25,
+    "elastic_anchor_lambda": 0.02,
+    "max_weight_drift_ratio": 0.35,
+    "gradient_checkpointing": false,
+    "gradient_checkpointing_every": 1,
+    "tie_word_embeddings": true,
+    "write_schedule": "sequential",
+    "dspark_speculative_k": 0,
+    "dspark_conf_threshold": 0.82,
+    "tokenizer_json": null,
+    "repetition_penalty": 1.0
+  },
+  "iterations": 5,
+  "median_seconds": {
+    "old_zero_aux_graph": 0.7281942099798471,
+    "pruned_zero_aux_graph": 0.6882161179673858
+  },
+  "backward_step_speedup": 1.0580894445345668,
+  "gradient_parity": true,
+  "isolated_microbenchmark": true
+}

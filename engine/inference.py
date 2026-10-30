@@ -116,14 +116,27 @@ class CUDAGraphDecoder:
             raise ValueError("CUDA graph decode requires frozen CUDA FP16/BF16 weights, batch one and supported KV caches")
         self.model = model
         self.fast_state = fast_state
-        # Persona writes keep FP32 master state. Cast read weights once per graph,
-        # retaining the master's identity/version as the invalidation source.
-        self._read_state = SimpleNamespace(**{
-            name: getattr(fast_state, name).to(dtype=next(model.parameters()).dtype)
-            for name in self._FAST_NAMES
-        })
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
+        # Eager prefill has already prepared these versioned read copies. Reuse
+        # them rather than retaining an extra FP16/BF16 trio and another pack.
+        # The master state still supplies every invalidation identity/version.
+        self._packed_up_gate = None
+        if getattr(model.fast_weight_pool, "fused_inference_readout", False):
+            self._packed_up_gate, read_down = model.fast_weight_pool.inference_read_weights(
+                fast_state, self.dtype, self.device,
+            )
+            read_up = read_gate = None
+        else:
+            read_up, read_gate, read_down = (
+                getattr(fast_state, name).to(dtype=self.dtype)
+                for name in ("w_up", "w_gate", "w_down")
+            )
+        self._read_state = SimpleNamespace(
+            w_up=read_up, w_gate=read_gate, w_down=read_down,
+            ln_weight=fast_state.ln_weight.to(dtype=self.dtype),
+            ln_bias=fast_state.ln_bias.to(dtype=self.dtype),
+        )
         self._captured_model_key = self._model_key(model)
         self._captured_state_key = self._state_key(fast_state)
         self._position_limit = min(block.attn.rope.cos_cached.shape[0] for block in model.layers)
@@ -133,9 +146,6 @@ class CUDAGraphDecoder:
         self._kv_buffers = []
         # Keep all captured addresses alive, including optional disposable packs.
         self._qkv_packs = [block.attn._packed_qkv for block in model.layers]
-        self._packed_up_gate = None
-        if getattr(model.fast_weight_pool, "fused_inference_readout", False):
-            self._packed_up_gate = torch.cat((self._read_state.w_up, self._read_state.w_gate), dim=-1)
         for block in model.layers:
             attention = block.attn
             shape = (1, attention.n_kv_heads, attention.window_size, attention.head_dim)
