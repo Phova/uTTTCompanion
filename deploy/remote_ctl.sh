@@ -141,12 +141,51 @@ remote_exec_tty() {
     ssh -t "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@"
 }
 
-# Interactive viewers own only their SSH client. A forced remote PTY makes a
-# disconnected channel deliver HUP to its foreground viewer, even while idle.
-remote_view_tty() {
-    local VIEW_SSH_PID=""
+# Upload one small helper without putting its body into the SSH exec request.
+# This also avoids Windows DefaultShell command-length limits.
+remote_upload_helper() {
+    local HELPER_LOCAL="$1" HELPER_HASH HELPER_REMOTE HELPER_BOOTSTRAP HELPER_CODE HELPER_COMMAND
+    HELPER_HASH=$(sha256sum < "$HELPER_LOCAL")
+    HELPER_HASH=${HELPER_HASH%% *}
+    HELPER_REMOTE="${REMOTE_DIR}/.cache/remote-view/${HELPER_HASH}-$(basename "$HELPER_LOCAL")"
+    HELPER_BOOTSTRAP=$(cat <<'HELPER_UPLOAD'
+import hashlib,os,pathlib,sys,tempfile
+p=pathlib.Path(sys.argv[1]);d=sys.stdin.buffer.read()
+if hashlib.sha256(d).hexdigest()!=sys.argv[2]:raise SystemExit('Viewer upload checksum mismatch')
+p.parent.mkdir(parents=True,exist_ok=True)
+fd,t=tempfile.mkstemp(dir=p.parent)
+try:
+ with os.fdopen(fd,'wb') as f:f.write(d)
+ os.replace(t,p)
+finally:
+ if os.path.exists(t):os.unlink(t)
+HELPER_UPLOAD
+)
+    HELPER_CODE=$(printf '%s' "$HELPER_BOOTSTRAP" | base64 | tr -d '\r\n')
+    printf -v HELPER_COMMAND 'python3 -c "import base64;exec(base64.b64decode('\''%s'\''))" %q %q' \
+        "$HELPER_CODE" "$HELPER_REMOTE" "$HELPER_HASH"
+    if ! remote_exec "$HELPER_COMMAND" < "$HELPER_LOCAL"; then
+        log_error "Viewer helper upload failed; no viewer was started."
+        return 1
+    fi
+    printf -v "$2" '%s' "$HELPER_REMOTE"
+}
+
+# Windows ConPTY/default-shell combinations may drop remote command arguments.
+# Use non-PTY SSH with an anonymous stdin pipe; only this shell owns its write
+# end. Parent exit (even SIGKILL) therefore delivers EOF to the remote supervisor.
+# No heartbeat, sleep, FIFO or additional local pump process is needed.
+remote_view_stream() {
+    local VIEW_SSH_PID="" VIEW_STATUS=0 VIEW_STDIN_FD="" VIEW_UNUSED_FD="" VIEW_OUTPUT_FD=""
+    local VIEW_HELPER VIEW_COMMAND
+    remote_upload_helper "${SCRIPT_DIR}/remote_view.py" VIEW_HELPER || return 1
+    printf -v VIEW_COMMAND '%q ' python3 -u "$VIEW_HELPER" "$@"
     cleanup_view_connection() {
         trap - EXIT INT TERM HUP
+        if [[ -n "$VIEW_STDIN_FD" ]]; then
+            exec {VIEW_STDIN_FD}>&-
+            VIEW_STDIN_FD=""
+        fi
         if [[ -n "$VIEW_SSH_PID" ]]; then
             kill -TERM "$VIEW_SSH_PID" 2>/dev/null || true
             wait "$VIEW_SSH_PID" 2>/dev/null || true
@@ -154,11 +193,24 @@ remote_view_tty() {
     }
     trap cleanup_view_connection EXIT
     trap 'cleanup_view_connection; exit 0' INT TERM HUP
-    ssh -tt "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@" < /dev/null &
+    # Preserve panel output before coproc redirects its default stdout pipe.
+    exec {VIEW_OUTPUT_FD}>&1
+    coproc UTTT_VIEW_CONNECTION {
+        exec 1>&"$VIEW_OUTPUT_FD"
+        exec {VIEW_OUTPUT_FD}>&-
+        exec ssh -T "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$VIEW_COMMAND"
+    }
     VIEW_SSH_PID=$!
-    wait "$VIEW_SSH_PID" || true
+    VIEW_STDIN_FD=${UTTT_VIEW_CONNECTION[1]:-}
+    VIEW_UNUSED_FD=${UTTT_VIEW_CONNECTION[0]:-}
+    if [[ -n "$VIEW_UNUSED_FD" ]]; then
+        exec {VIEW_UNUSED_FD}<&-
+    fi
+    exec {VIEW_OUTPUT_FD}>&-
+    wait "$VIEW_SSH_PID" || VIEW_STATUS=$?
     VIEW_SSH_PID=""
     cleanup_view_connection
+    return "$VIEW_STATUS"
 }
 
 # ------------------------------------------------------------------------------
@@ -300,23 +352,7 @@ fi
 REMOTE_TRAIN
     log_ok "Training launched on the remote host."
     log_info "Streaming training loss (Ctrl+C detaches; remote training continues)..."
-    # Follow only this session's foreground pane/supervisor. GNU tail exits when
-    # that PID ends, and the PTY closes the viewer when the local panel closes.
-    local LOG_VIEW_COMMAND LOG_VIEW_SCRIPT
-    LOG_VIEW_SCRIPT='ROOT="$1"; SESSION="$2"
-TRAIN_PID=""
-if command -v tmux >/dev/null 2>&1; then
-    TRAIN_PID=$(tmux display-message -p -t "=$SESSION" "#{pane_pid}" 2>/dev/null) || true
-elif [[ -f "$ROOT/logs/$SESSION.pid" ]]; then
-    TRAIN_PID=$(cat "$ROOT/logs/$SESSION.pid")
-fi
-if [[ ! "$TRAIN_PID" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$TRAIN_PID" 2>/dev/null; then
-    printf "[Remote] Training session %s is no longer active.\n" "$SESSION"
-    exit 0
-fi
-exec tail --pid="$TRAIN_PID" -n +1 -F -- "$ROOT/logs/train_5090.log"'
-    printf -v LOG_VIEW_COMMAND 'exec bash -c %q -- %q %q' "$LOG_VIEW_SCRIPT" "$REMOTE_DIR" "$TMUX_TRAIN_SESSION"
-    remote_view_tty "$LOG_VIEW_COMMAND"
+    remote_view_stream --train-root "$REMOTE_DIR" --train-session "$TMUX_TRAIN_SESSION"
     log_info "Detached local training log view."
 }
 
@@ -481,7 +517,7 @@ cmd_status() {
             tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || true;
         "
     else
-        local INTERVAL_MS="${1:-200}" TARGET_HZ MONITOR_CODE REMOTE_COMMAND
+        local INTERVAL_MS="${1:-200}" TARGET_HZ MONITOR_REMOTE MONITOR_COLUMNS="${COLUMNS:-80}"
         if [[ ! "$INTERVAL_MS" =~ ^[0-9]{1,5}$ ]] || (( 10#$INTERVAL_MS < 1 || 10#$INTERVAL_MS > 60000 )); then
             log_error "Refresh interval must be an integer between 1 and 60000 milliseconds."
             return 1
@@ -489,27 +525,27 @@ cmd_status() {
         INTERVAL_MS=$((10#$INTERVAL_MS))
         TARGET_HZ=$(awk -v ms="$INTERVAL_MS" 'BEGIN {printf "%g", 1000/ms}')
         log_info "Live RTX 5090 Monitor on ${REMOTE_TARGET} (Refresh: ${INTERVAL_MS}ms / target ${TARGET_HZ}Hz | Ctrl+C to exit)"
-        MONITOR_CODE=$(base64 < "${SCRIPT_DIR}/monitor_status.py" | tr -d '\r\n')
-        # A remote PTY delivers HUP when the SSH channel closes. Sending the
-        # program as a command keeps stdin available to SSH instead of keeping
-        # an orphaned bash pipeline alive after a heredoc reaches EOF.
-        printf -v REMOTE_COMMAND 'stty -echo; exec python3 -u -c "$(printf %%s %q | base64 -d)" --root %q --interval-ms %q' \
-            "$MONITOR_CODE" "$REMOTE_DIR" "$INTERVAL_MS"
-        remote_view_tty "$REMOTE_COMMAND"
+        if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+            MONITOR_COLUMNS=$(tput cols 2>/dev/null) || MONITOR_COLUMNS=80
+        fi
+        if [[ ! "$MONITOR_COLUMNS" =~ ^[0-9]{2,5}$ ]] || (( 10#$MONITOR_COLUMNS < 20 || 10#$MONITOR_COLUMNS > 10000 )); then
+            MONITOR_COLUMNS=80
+        fi
+        remote_upload_helper "${SCRIPT_DIR}/monitor_status.py" MONITOR_REMOTE || return 1
+        remote_view_stream -- python3 -u "$MONITOR_REMOTE" --root "$REMOTE_DIR" --interval-ms "$INTERVAL_MS" --columns "$MONITOR_COLUMNS"
     fi
 }
 
 cmd_logs() {
     validate_config
-    local TARGET_MODE="${1:-train}" LOG_PATH LOG_VIEW_COMMAND
+    local TARGET_MODE="${1:-train}" LOG_PATH
     if [[ "$TARGET_MODE" != train && "$TARGET_MODE" != serve ]]; then
         log_error "Log target must be train or serve."
         return 1
     fi
     LOG_PATH="${REMOTE_DIR}/logs/${TARGET_MODE}_5090.log"
     log_info "Tailing remote log: ${LOG_PATH} (Press Ctrl+C to exit)..."
-    printf -v LOG_VIEW_COMMAND 'exec tail -n 100 -F -- %q' "$LOG_PATH"
-    remote_view_tty "$LOG_VIEW_COMMAND"
+    remote_view_stream -- tail -n 100 -F -- "$LOG_PATH"
 }
 
 cmd_stop() {

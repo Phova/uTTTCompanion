@@ -3,6 +3,7 @@ import argparse
 import io
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -14,6 +15,17 @@ from deploy.monitor_status import Monitor, compact_training_line, latest_trainin
 
 
 class MonitorDisplayTests(unittest.TestCase):
+    def test_non_pty_output_uses_forwarded_panel_width_without_wrapping(self):
+        output = io.StringIO()
+        monitor = Monitor('.', 10, output, columns=80)
+        try:
+            monitor.render(10)
+            clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', output.getvalue())
+            self.assertTrue(all(len(line.strip('\r')) < 80 for line in clean.splitlines()))
+            self.assertIn('target 100Hz / actual', clean)
+        finally:
+            monitor.close()
+
     def test_refresh_label_follows_interval_and_reports_measured_rate(self):
         self.assertEqual(target_hz(10), "100")
         self.assertEqual(target_hz(200), "5")

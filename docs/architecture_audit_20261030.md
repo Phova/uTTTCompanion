@@ -61,7 +61,7 @@ python deploy/diagnose_training.py --log logs/pretrain_20261029.log --stage pret
 
 ## 运行维护和恢复修复
 
-`status 10` 的目标频率应为 100 Hz；旧版固定打印 5 Hz。新面板分别显示目标和实际刷新率，元信息每秒更新一次，GPU 采集使用本监控独占的进程组。关闭终端、SSH/PTY 断开、输出断管及 HUP/TERM/INT 都会回收自己的采集进程，不再每帧创建 `sleep` 等进程。日志查看也使用可回收的 SSH/PTY，关闭面板不终止训练。
+`status 10` 的目标频率应为 100 Hz；旧版固定打印 5 Hz。新面板分别显示目标和实际刷新率，元信息每秒更新一次，GPU 采集使用本监控独占的进程组。实际 Windows SSH 兼容核查后，查看连接改为非 PTY，监督器检测 stdin EOF、断管及信号并回收自己的进程；不再每帧创建 `sleep`。关闭日志面板不终止训练，详见 [Windows SSH 修复与真实连接验证](windows_ssh_monitor_20261030.md)。
 
 已核实旧监控组 4331、16489、2253308 只包含 `bash -s`、相应监控采集或 `sleep`，随后定向清理，未匹配训练或其他日志查看进程。
 

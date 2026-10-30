@@ -14,6 +14,8 @@
 
 后续完成图缓存共享、零辅助损失反向剪枝、紧凑数据索引、full/best快照复用及WSL全局显存保护；实测范围与限制见 [本轮优化记录](docs/optimization_20261030.md)。
 
+Windows SSH 的 `exec request failed on channel 0` 已通过非PTY流连接和短命令上传修复，并在实际主机验证断线回收，见 [监控兼容记录](docs/windows_ssh_monitor_20261030.md)。
+
 ## 可靠性修复与兼容说明
 
 - 人格自动保存现在按顺序完成原子落盘后才返回 `Persona Saved`，磁盘写入失败会返回错误。相比后台保存，每轮结束可能增加少量磁盘等待时间。

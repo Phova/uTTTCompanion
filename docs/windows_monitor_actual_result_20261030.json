@@ -1,0 +1,21 @@
+{
+  "host_type": "Windows OpenSSH -> WSL",
+  "pty": false,
+  "maximum_remote_command_bytes": 691,
+  "cases": [
+    {
+      "mode": "stdin_eof",
+      "target_100hz_observed": true,
+      "ssh_returncode": 0,
+      "cleanup_complete": true,
+      "process_count": 2
+    },
+    {
+      "mode": "ssh_terminated",
+      "target_100hz_observed": true,
+      "ssh_returncode": 1,
+      "cleanup_complete": true,
+      "process_count": 2
+    }
+  ]
+}

@@ -54,10 +54,11 @@ def compact_training_line(line):
 
 
 class Monitor:
-    def __init__(self, root, interval_ms, output=None):
+    def __init__(self, root, interval_ms, output=None, columns=None):
         self.root = Path(root)
         self.interval_ms = interval_ms
         self.output = output if output is not None else sys.stdout
+        self.columns = columns
         self.stopping = False
         self.collector = None
         self.selector = selectors.DefaultSelector()
@@ -129,8 +130,9 @@ class Monitor:
             f"Train: {compact_training_line(self.training)}",
             "-" * 108,
         ]
-        if self.output.isatty():
-            columns = max(20, shutil.get_terminal_size(fallback=(140, 24)).columns)
+        if self.columns is not None or self.output.isatty():
+            columns = max(20, self.columns if self.columns is not None
+                          else shutil.get_terminal_size(fallback=(140, 24)).columns)
             lines = [line[:columns - 1] for line in lines]
         self.output.write("\033[5A" + "".join("\r\033[2K" + line + "\n" for line in lines))
         self.output.flush()
@@ -190,8 +192,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True)
     parser.add_argument("--interval-ms", type=positive_interval, default=200)
+    parser.add_argument("--columns", type=int, help="Local panel width when SSH has no remote PTY")
     args = parser.parse_args()
-    monitor = Monitor(args.root, args.interval_ms)
+    if args.columns is not None and not 20 <= args.columns <= 10000:
+        parser.error("columns must be between 20 and 10000")
+    monitor = Monitor(args.root, args.interval_ms, columns=args.columns)
     for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGPIPE"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), monitor.stop)
