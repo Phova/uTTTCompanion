@@ -129,9 +129,18 @@ def main():
             raise InterruptedError("Pipeline was stopped")
         update(stage="complete", status="complete", selected_checkpoint=str(best_sft))
         print("TRAINING_PIPELINE_COMPLETE", flush=True)
+    except InterruptedError as error:
+        if not stopping:
+            update(status="failed", error=str(error))
+            raise
+        update(status="interrupted", error=str(error))
+        print(f"[Pipeline] Interrupted: {error}", flush=True)
+        return
     except BaseException as error:
-        update(status="interrupted" if stopping or state.get("status") == "interrupted" else "failed", error=str(error))
+        update(status="failed", error=str(error))
         raise
+    finally:
+        run_lock.close()
 
 
 if __name__ == "__main__":

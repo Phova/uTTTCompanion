@@ -559,39 +559,57 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
 @torch.no_grad()
 def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype, max_new_tokens=48,
                                 sample_seed=42, sample_temperature=0.8, sample_top_p=0.9):
-    """Compare greedy and repeatable stochastic decoding without consuming training RNG."""
+    """Compare raw greedy and seeded standard AR without changing training state."""
     if not 0 < max_new_tokens < model.config.max_seq_len:
         raise ValueError("Validation generation must leave room for a prompt")
     if sample_temperature <= 0 or not 0 < sample_top_p <= 1:
         raise ValueError("Validation sampling requires positive temperature and top_p in (0, 1]")
     devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
     results = []
-    # Save CPU and the selected CUDA RNG only. Additional diagnostic sampling
-    # must not change dropout, random crops, or the next training update.
-    with torch.random.fork_rng(devices=devices):
-        for index, prompt in enumerate(prompts):
-            text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
-            ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
-            for decoding, temperature in (("greedy", 0.0), ("sampled", sample_temperature)):
-                seed = int(sample_seed) + index
-                if decoding == "sampled":
-                    torch.random.default_generator.manual_seed(seed)
-                    if device.type == "cuda":
-                        with torch.cuda.device(device):
-                            torch.cuda.manual_seed(seed)
-                with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+    was_training = model.training
+    previous_penalty = model.config.repetition_penalty
+    try:
+        model.eval()
+        # A penalty can hide the exact loops this diagnostic is meant to show.
+        model.config.repetition_penalty = 1.0
+        # Keep casts across prompts only while weights are fixed; this context
+        # exits before training can update parameters or reuse its AMP cache.
+        with torch.random.fork_rng(devices=devices), torch.autocast(
+            device.type, dtype=dtype, enabled=dtype != torch.float32,
+        ):
+            # Frozen generation never uses momentum. Reuse one read-only state
+            # rather than cloning three W/S pairs for every diagnostic reply.
+            read_state = model.fast_weight_pool.readonly_state(
+                batch_size=1, device=device, dtype=dtype, detach=True,
+            )
+            for index, prompt in enumerate(prompts):
+                text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
+                ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
+                for decoding, temperature in (("greedy", 0.0), ("sampled", sample_temperature)):
+                    seed = int(sample_seed) + index
+                    if decoding == "sampled":
+                        torch.random.default_generator.manual_seed(seed)
+                        if device.type == "cuda":
+                            with torch.cuda.device(device):
+                                torch.cuda.manual_seed(seed)
                     generated = list(model.stream_generate(
-                        torch.tensor([ids], device=device), model.init_fast_state(device=device, dtype=dtype, detach=True),
+                        torch.tensor([ids], device=device), read_state,
                         max_new_tokens=max_new_tokens, temperature=temperature, top_p=sample_top_p,
+                        speculative_draft_k=0, use_cuda_graph=False,
                     ))
-                reply = tokenizer.decode(generated).strip()
-                results.append({
-                    "prompt": prompt, "reply": reply, "decoding": decoding,
-                    "temperature": temperature, "top_p": sample_top_p,
-                    "seed": seed if decoding == "sampled" else None,
-                    "generated_tokens": len(generated), "eos_generated": tokenizer.EOS_ID in generated,
-                    **repetition_metrics(generated, reply),
-                })
+                    reply = tokenizer.decode(generated).strip()
+                    results.append({
+                        "prompt": prompt, "reply": reply, "decoding": decoding,
+                        "temperature": temperature, "top_p": sample_top_p,
+                        "repetition_penalty": 1.0, "speculative_draft_k": 0,
+                        "use_cuda_graph": False, "generation_backend": "standard_autoregressive",
+                        "seed": seed if decoding == "sampled" else None,
+                        "generated_tokens": len(generated), "eos_generated": tokenizer.EOS_ID in generated,
+                        **repetition_metrics(generated, reply),
+                    })
+    finally:
+        model.config.repetition_penalty = previous_penalty
+        model.train(was_training)
     return results
 
 

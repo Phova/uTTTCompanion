@@ -110,10 +110,18 @@ class SamplingDiagnosticsTests(unittest.TestCase):
                 return " ".join(map(str, tokens))
 
         class Model:
-            config = SimpleNamespace(max_seq_len=64)
+            config = SimpleNamespace(max_seq_len=64, repetition_penalty=1.7)
+            training = True
+            fast_weight_pool = SimpleNamespace(readonly_state=lambda **kwargs: None)
+
+            def eval(self):
+                self.training = False
+
+            def train(self, mode=True):
+                self.training = mode
 
             def init_fast_state(self, **kwargs):
-                return None
+                raise AssertionError("Validation should reuse a read-only state")
 
             def stream_generate(self, inputs, state, temperature, **kwargs):
                 if temperature == 0:

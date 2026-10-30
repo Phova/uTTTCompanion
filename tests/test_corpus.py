@@ -126,7 +126,7 @@ class CorpusTests(unittest.TestCase):
                 duplicate = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                 self.assertNotEqual(duplicate.returncode, 0)
                 parent.terminate()
-                self.assertNotEqual(parent.wait(timeout=10), 0)
+                self.assertEqual(parent.wait(timeout=10), 0)
                 state = json.loads((root / "logs/pipeline_test.json").read_text())
                 self.assertEqual(state["status"], "interrupted")
                 self.assertFalse((root / "logs/sft_test.log").exists())

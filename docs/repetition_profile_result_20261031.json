@@ -1,0 +1,129 @@
+{
+  "checkpoint_step": 21500,
+  "tokens_seen": 704512000,
+  "active_language_parameters": 1137973760,
+  "decoding_summaries": {
+    "raw_greedy": {
+      "samples": 4,
+      "eos_rate": 0.0,
+      "token_limit_rate": 1.0,
+      "mean_generated_tokens": 48.0,
+      "mean_token_4gram_repetition": 0.33333333333333337,
+      "mean_text_4gram_repetition": 0.5015880149728041,
+      "accepted_exact_matches": 0,
+      "accepted_tasks": 0
+    },
+    "raw_sampled": {
+      "samples": 4,
+      "eos_rate": 0.0,
+      "token_limit_rate": 1.0,
+      "mean_generated_tokens": 48.0,
+      "mean_token_4gram_repetition": 0.022222222222222227,
+      "mean_text_4gram_repetition": 0.10724799773741114,
+      "accepted_exact_matches": 0,
+      "accepted_tasks": 0
+    },
+    "controlled_sampled": {
+      "samples": 4,
+      "eos_rate": 0.0,
+      "token_limit_rate": 1.0,
+      "mean_generated_tokens": 48.0,
+      "mean_token_4gram_repetition": 0.0,
+      "mean_text_4gram_repetition": 0.0648733807912242,
+      "accepted_exact_matches": 0,
+      "accepted_tasks": 0
+    }
+  },
+  "evaluation_prefixes": [
+    "The purpose of scientific research is",
+    "To prepare a simple meal, first",
+    "科学研究的重要意义在于",
+    "为了养成良好的学习习惯，我们可以"
+  ],
+  "max_new_tokens": 48,
+  "seed": 42,
+  "corpus_audit": {
+    "samples": 5000,
+    "seq_len": 1024,
+    "seed": 42,
+    "ngram_size": 16,
+    "keep_occurrences": 2,
+    "summary": {
+      "windows": 5000,
+      "supervised_targets": 5110663,
+      "repeated_targets": 3384,
+      "windows_with_any_repeated_targets": 158,
+      "windows_fraction_at_least_0.01": 71,
+      "windows_fraction_at_least_0.05": 14,
+      "windows_fraction_at_least_0.1": 5,
+      "windows_fraction_at_least_0.25": 0,
+      "windows_fraction_at_least_0.5": 0,
+      "repeated_target_fraction": 0.0006621450093657125
+    },
+    "detected_language_groups": {
+      "latin_dominant": {
+        "windows": 3546,
+        "supervised_targets": 3624333,
+        "repeated_targets": 2668,
+        "windows_with_any_repeated_targets": 122,
+        "windows_fraction_at_least_0.01": 54,
+        "windows_fraction_at_least_0.05": 12,
+        "windows_fraction_at_least_0.1": 4,
+        "windows_fraction_at_least_0.25": 0,
+        "windows_fraction_at_least_0.5": 0,
+        "repeated_target_fraction": 0.0007361354489226017
+      },
+      "zh_or_mixed_cjk": {
+        "windows": 1452,
+        "supervised_targets": 1484284,
+        "repeated_targets": 702,
+        "windows_with_any_repeated_targets": 35,
+        "windows_fraction_at_least_0.01": 16,
+        "windows_fraction_at_least_0.05": 2,
+        "windows_fraction_at_least_0.1": 1,
+        "windows_fraction_at_least_0.25": 0,
+        "windows_fraction_at_least_0.5": 0,
+        "repeated_target_fraction": 0.0004729553104392421
+      },
+      "other_or_mixed": {
+        "windows": 2,
+        "supervised_targets": 2046,
+        "repeated_targets": 14,
+        "windows_with_any_repeated_targets": 1,
+        "windows_fraction_at_least_0.01": 1,
+        "windows_fraction_at_least_0.05": 0,
+        "windows_fraction_at_least_0.1": 0,
+        "windows_fraction_at_least_0.25": 0,
+        "windows_fraction_at_least_0.5": 0,
+        "repeated_target_fraction": 0.006842619745845552
+      }
+    }
+  },
+  "cache_comparison": {
+    "checkpoint_step": 21500,
+    "precision": "fp32_tf32_disabled",
+    "loaded_weights": "BF16 manager load then FP32 upcast; identical weights for both paths",
+    "tf32_enabled": false,
+    "comparison": "standard incremental KV cache versus complete-prefix forward",
+    "cases": [
+      {
+        "prompt": "The purpose of scientific research is",
+        "steps_checked": 8,
+        "greedy_matches": 8,
+        "maximum_absolute_logit_error": 4.5299530029296875e-06
+      },
+      {
+        "prompt": "科学研究的重要意义在于",
+        "steps_checked": 8,
+        "greedy_matches": 8,
+        "maximum_absolute_logit_error": 6.198883056640625e-06
+      }
+    ],
+    "all_passed": true
+  },
+  "limits": [
+    "Four short continuation prompts do not establish general language quality.",
+    "Decoded n-gram control does not change existing weights or establish that training repetition is resolved.",
+    "Corpus audit covers within-window exact long spans and does not exclude cross-document near duplicates."
+  ]
+}

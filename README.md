@@ -16,6 +16,8 @@
 
 Windows SSH 的 `exec request failed on channel 0` 已通过非PTY流连接和短命令上传修复，并在实际主机验证断线回收，见 [监控兼容记录](docs/windows_ssh_monitor_20261030.md)。
 
+第21500步保存后的 `InterruptedError` 属于计划停止，现已改为简短中断提示；同一检查点的贪心、随机采样、受控生成及语料重复审计见 [重复输出诊断](docs/repetition_training_audit_20261030.md)。模型仍处于早期预训练，解码约束的改善不等于权重质量已经合格。
+
 ## 可靠性修复与兼容说明
 
 - 人格自动保存现在按顺序完成原子落盘后才返回 `Persona Saved`，磁盘写入失败会返回错误。相比后台保存，每轮结束可能增加少量磁盘等待时间。

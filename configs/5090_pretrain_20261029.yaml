@@ -37,7 +37,11 @@ uttt:
 
 training:
   stage: pretrain
-  eval_prompts: ["The purpose of scientific research is", "科学研究的重要意义在于"]
+  eval_prompts:
+    - "The purpose of scientific research is"
+    - "科学研究的重要意义在于"
+    - "To make a cup of tea, first"
+    - "周末去公园散步时，可以"
   eval_new_tokens: 48
   tokenizer_path: data/pretrain_20261029/tokenized/tokenizer.json
   seed: 42
