@@ -141,6 +141,26 @@ remote_exec_tty() {
     ssh -t "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@"
 }
 
+# Interactive viewers own only their SSH client. A forced remote PTY makes a
+# disconnected channel deliver HUP to its foreground viewer, even while idle.
+remote_view_tty() {
+    local VIEW_SSH_PID=""
+    cleanup_view_connection() {
+        trap - EXIT INT TERM HUP
+        if [[ -n "$VIEW_SSH_PID" ]]; then
+            kill -TERM "$VIEW_SSH_PID" 2>/dev/null || true
+            wait "$VIEW_SSH_PID" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_view_connection EXIT
+    trap 'cleanup_view_connection; exit 0' INT TERM HUP
+    ssh -tt "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@" < /dev/null &
+    VIEW_SSH_PID=$!
+    wait "$VIEW_SSH_PID" || true
+    VIEW_SSH_PID=""
+    cleanup_view_connection
+}
+
 # ------------------------------------------------------------------------------
 # 3. Subcommand: sync (High-Speed Incremental Rsync)
 # ------------------------------------------------------------------------------
@@ -213,7 +233,8 @@ REMOTEEOF
 cmd_prepare_data() {
     validate_config
     cmd_sync
-    EXTRA_DATA_ARGS="$*"
+    local EXTRA_DATA_ARGS
+    printf -v EXTRA_DATA_ARGS '%q ' "$@"
     log_info "Downloading & formatting public Persona + Multi-Turn dataset on ${REMOTE_TARGET}..."
     remote_exec "cd '${REMOTE_DIR}' && python3 deploy/prepare_dataset.py ${EXTRA_DATA_ARGS}"
     log_ok "Remote public dataset prepared at ${REMOTE_DIR}/data/uttt_persona_train.jsonl"
@@ -235,55 +256,68 @@ cmd_python_tool() {
 cmd_train() {
     validate_config
     cmd_sync
-
-    EXTRA_TRAIN_ARGS="$*"
-    LOG_FILE="${REMOTE_DIR}/logs/train_5090.log"
-
-    log_info "Launching uTTT Meta-Training on ${REMOTE_TARGET} (session: ${TMUX_TRAIN_SESSION})..."
-
-    if [[ "${USE_DOCKER}" == "1" ]]; then
-        TRAIN_CMD="docker run --rm --gpus all --ipc=host -v '${REMOTE_DIR}/checkpoints:/workspace/uTTT/checkpoints' -v '${REMOTE_DIR}/logs:/workspace/uTTT/logs' ${DOCKER_IMAGE} python -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
-    else
-        TRAIN_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && export TORCH_CUDA_ARCH_LIST='12.0' && '${REMOTE_DIR}/.venv/bin/python3' -u train_5090.py --config configs/5090_config.yaml ${EXTRA_TRAIN_ARGS} 2>&1 | tee '${LOG_FILE}'"
+    local QUOTED_ARGS
+    printf -v QUOTED_ARGS '%q ' "${REMOTE_DIR}" "${TMUX_TRAIN_SESSION}" "${TMUX_SERVE_SESSION}" "${USE_DOCKER}" "${DOCKER_IMAGE}" "$@"
+    remote_exec "bash -s -- ${QUOTED_ARGS}" <<'REMOTE_TRAIN'
+set -euo pipefail
+ROOT="$1"; SESSION="$2"; SERVE_SESSION="$3"; DOCKER="$4"; IMAGE="$5"
+shift 5
+cd "$ROOT"
+mkdir -p logs checkpoints
+if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "=$SESSION" 2>/dev/null; then
+        echo "[ERROR] Training session $SESSION is already active. Stop it explicitly before starting another run." >&2
+        exit 1
     fi
-
-    remote_exec "bash -c \"
-        mkdir -p '${REMOTE_DIR}/logs' '${REMOTE_DIR}/checkpoints';
-        if command -v tmux >/dev/null 2>&1; then
-            tmux has-session -t '${TMUX_SERVE_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_SERVE_SESSION}';
-            if tmux has-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null; then
-                pkill -TERM -f 'train_5090.py' 2>/dev/null || true;
-                for _ in {1..10}; do
-                    ls '${REMOTE_DIR}/checkpoints/'*.tmp* >/dev/null 2>&1 || break;
-                    sleep 0.5;
-                done;
-                tmux kill-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null || true;
-            fi;
-            : > '${LOG_FILE}';
-            tmux new-session -d -s '${TMUX_TRAIN_SESSION}' \\\"${TRAIN_CMD}\\\";
-            echo '[Remote] Started tmux session: ${TMUX_TRAIN_SESSION}';
-        else
-            : > '${LOG_FILE}';
-            nohup bash -c \\\"${TRAIN_CMD}\\\" >/dev/null 2>&1 &
-            echo '[Remote] tmux not found; started background training via nohup (PID: '\$!')';
-        fi
-    \""
-
-    log_ok "Training started in background on remote RTX 5090."
-    log_info "Streaming real-time training loss from ${LOG_FILE} (Press Ctrl+C to detach local log view; remote training will continue)..."
-    trap 'printf "\n"; log_info "Detached local log view (remote training continues in tmux ${TMUX_TRAIN_SESSION})."; exit 0' INT TERM
-    remote_exec "LOG_FILE='${LOG_FILE}' TMUX_TRAIN_SESSION='${TMUX_TRAIN_SESSION}' bash -s" <<'EOF' || true
-trap 'kill ${TAIL_PID:-} 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
-sleep 1
-tail -n +1 -f "${LOG_FILE}" &
-TAIL_PID=$!
-while tmux has-session -t "${TMUX_TRAIN_SESSION}" 2>/dev/null; do
-    [[ $(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ') -eq 1 ]] && break
-    sleep 1
-done
-kill "${TAIL_PID}" 2>/dev/null || true
-echo "[Remote] Training session (${TMUX_TRAIN_SESSION}) finished."
-EOF
+    if tmux has-session -t "=$SERVE_SESSION" 2>/dev/null; then
+        echo "[ERROR] Serving session $SERVE_SESSION is using the GPU. Stop it before starting training." >&2
+        exit 1
+    fi
+elif [[ -f "logs/$SESSION.pid" ]] && kill -0 "$(cat "logs/$SESSION.pid")" 2>/dev/null; then
+    echo "[ERROR] Background training is already active; stop it explicitly first." >&2
+    exit 1
+fi
+if [[ "$DOCKER" == 1 ]]; then
+    COMMAND=(docker run --rm --name "$SESSION" --gpus all --ipc=host -v "$ROOT/checkpoints:/workspace/uTTT/checkpoints" -v "$ROOT/logs:/workspace/uTTT/logs" -v "$ROOT/data:/workspace/uTTT/data:ro" "$IMAGE" python -u train_5090.py --config configs/5090_config.yaml "$@")
+else
+    export PATH="$ROOT/.venv/bin:$PATH" TORCH_CUDA_ARCH_LIST='12.0'
+    COMMAND=("$ROOT/.venv/bin/python3" -u train_5090.py --config configs/5090_config.yaml "$@")
+fi
+printf -v RUN_COMMAND '%q ' "${COMMAND[@]}"
+printf -v LOG_PATH '%q' "$ROOT/logs/train_5090.log"
+RUN_COMMAND="set -o pipefail; $RUN_COMMAND 2>&1 | tee $LOG_PATH"
+: > logs/train_5090.log
+if command -v tmux >/dev/null 2>&1; then
+    printf -v RUN_SHELL '%q' "$RUN_COMMAND"
+    tmux new-session -d -s "$SESSION" "bash -c $RUN_SHELL"
+    echo "[Remote] Started tmux session: $SESSION"
+else
+    PID_FILE="logs/$SESSION.pid"
+    nohup bash -c "$RUN_COMMAND" >/dev/null 2>&1 &
+    echo "$!" > "$PID_FILE"
+    echo "[Remote] Started background training (PID: $!)"
+fi
+REMOTE_TRAIN
+    log_ok "Training launched on the remote host."
+    log_info "Streaming training loss (Ctrl+C detaches; remote training continues)..."
+    # Follow only this session's foreground pane/supervisor. GNU tail exits when
+    # that PID ends, and the PTY closes the viewer when the local panel closes.
+    local LOG_VIEW_COMMAND LOG_VIEW_SCRIPT
+    LOG_VIEW_SCRIPT='ROOT="$1"; SESSION="$2"
+TRAIN_PID=""
+if command -v tmux >/dev/null 2>&1; then
+    TRAIN_PID=$(tmux display-message -p -t "=$SESSION" "#{pane_pid}" 2>/dev/null) || true
+elif [[ -f "$ROOT/logs/$SESSION.pid" ]]; then
+    TRAIN_PID=$(cat "$ROOT/logs/$SESSION.pid")
+fi
+if [[ ! "$TRAIN_PID" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$TRAIN_PID" 2>/dev/null; then
+    printf "[Remote] Training session %s is no longer active.\n" "$SESSION"
+    exit 0
+fi
+exec tail --pid="$TRAIN_PID" -n +1 -F -- "$ROOT/logs/train_5090.log"'
+    printf -v LOG_VIEW_COMMAND 'exec bash -c %q -- %q %q' "$LOG_VIEW_SCRIPT" "$REMOTE_DIR" "$TMUX_TRAIN_SESSION"
+    remote_view_tty "$LOG_VIEW_COMMAND"
+    log_info "Detached local training log view."
 }
 
 # ------------------------------------------------------------------------------
@@ -339,29 +373,44 @@ cmd_serve() {
     validate_config
     cmd_sync
 
-    EXTRA_SERVE_ARGS="$*"
-    SERVE_LOG="${REMOTE_DIR}/logs/serve_5090.log"
-
-    log_info "Starting remote FastAPI + WebSocket Personalization Service (session: ${TMUX_SERVE_SESSION})..."
-
-    if [[ "${USE_DOCKER}" == "1" ]]; then
-        SERVE_CMD="docker run --rm --gpus all --ipc=host -p ${REMOTE_SERVICE_PORT}:${REMOTE_SERVICE_PORT} -v '${REMOTE_DIR}/checkpoints:/workspace/uTTT/checkpoints' -v '${REMOTE_DIR}/personas:/workspace/uTTT/personas' ${DOCKER_IMAGE} python -u -m server.app --host 0.0.0.0 --port ${REMOTE_SERVICE_PORT} --config configs/5090_config.yaml ${EXTRA_SERVE_ARGS} 2>&1 | tee '${SERVE_LOG}'"
-    else
-        SERVE_CMD="cd '${REMOTE_DIR}' && source .venv/bin/activate && '${REMOTE_DIR}/.venv/bin/python3' -u -m server.app --host 0.0.0.0 --port ${REMOTE_SERVICE_PORT} --config configs/5090_config.yaml ${EXTRA_SERVE_ARGS} 2>&1 | tee '${SERVE_LOG}'"
+    local SERVE_LOG="${REMOTE_DIR}/logs/serve_5090.log" QUOTED_ARGS
+    if [[ ! "${STARTUP_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "STARTUP_TIMEOUT must be a positive number of seconds."
+        return 1
     fi
-
-    remote_exec "bash -c \"
-        mkdir -p '${REMOTE_DIR}/logs' '${REMOTE_DIR}/personas/snapshots';
-        : > '${SERVE_LOG}';
-        if command -v tmux >/dev/null 2>&1; then
-            tmux has-session -t '${TMUX_SERVE_SESSION}' 2>/dev/null && tmux kill-session -t '${TMUX_SERVE_SESSION}';
-            tmux new-session -d -s '${TMUX_SERVE_SESSION}' \\\"${SERVE_CMD}\\\";
-            echo '[Remote] Started tmux session: ${TMUX_SERVE_SESSION}';
-        else
-            nohup bash -c \\\"${SERVE_CMD}\\\" >/dev/null 2>&1 &
-            echo '[Remote] Started background server via nohup (PID: '\$!')';
-        fi
-    \""
+    printf -v QUOTED_ARGS '%q ' "${REMOTE_DIR}" "${TMUX_SERVE_SESSION}" "${USE_DOCKER}" "${DOCKER_IMAGE}" "${REMOTE_SERVICE_PORT}" "$@"
+    remote_exec "bash -s -- ${QUOTED_ARGS}" <<'REMOTE_SERVE'
+set -euo pipefail
+ROOT="$1"; SESSION="$2"; DOCKER="$3"; IMAGE="$4"; PORT="$5"
+shift 5
+cd "$ROOT"
+mkdir -p logs personas/snapshots
+PYTHON=python3
+[[ ! -x "$ROOT/.venv/bin/python3" ]] || PYTHON="$ROOT/.venv/bin/python3"
+STOP_ARGS=(--workspace "$ROOT" --session "$SESSION" --pid-file "$ROOT/logs/$SESSION.pid" --kind serve)
+[[ "$DOCKER" != 1 ]] || STOP_ARGS+=(--container "$SESSION")
+"$PYTHON" deploy/stop_training.py "${STOP_ARGS[@]}"
+tmux kill-session -t "=$SESSION" 2>/dev/null || true
+if [[ "$DOCKER" == 1 ]]; then
+    COMMAND=(docker run --rm --name "$SESSION" --gpus all --ipc=host -p "$PORT:$PORT" -v "$ROOT/checkpoints:/workspace/uTTT/checkpoints" -v "$ROOT/personas:/workspace/uTTT/personas" "$IMAGE" python -u -m server.app --host 0.0.0.0 --port "$PORT" --config configs/5090_config.yaml "$@")
+else
+    export PATH="$ROOT/.venv/bin:$PATH"
+    COMMAND=("$ROOT/.venv/bin/python3" -u -m server.app --host 0.0.0.0 --port "$PORT" --config configs/5090_config.yaml "$@")
+fi
+printf -v RUN_COMMAND '%q ' "${COMMAND[@]}"
+printf -v LOG_PATH '%q' "$ROOT/logs/serve_5090.log"
+RUN_COMMAND="set -o pipefail; $RUN_COMMAND 2>&1 | tee $LOG_PATH"
+: > logs/serve_5090.log
+if command -v tmux >/dev/null 2>&1; then
+    printf -v RUN_SHELL '%q' "$RUN_COMMAND"
+    tmux new-session -d -s "$SESSION" "bash -c $RUN_SHELL"
+    echo "[Remote] Started tmux session: $SESSION"
+else
+    nohup bash -c "$RUN_COMMAND" >/dev/null 2>&1 &
+    echo "$!" > "logs/$SESSION.pid"
+    echo "[Remote] Started background server (PID: $!)"
+fi
+REMOTE_SERVE
 
     log_info "Waiting for remote FastAPI server on port ${REMOTE_SERVICE_PORT} to become ready (includes kernel warmup)..."
     local READY=0
@@ -432,93 +481,71 @@ cmd_status() {
             tail -n 6 '${REMOTE_DIR}/logs/train_5090.log' 2>/dev/null || true;
         "
     else
-        local INTERVAL_MS="${1:-200}"
-        [[ ! "${INTERVAL_MS}" =~ ^[0-9]+$ ]] && INTERVAL_MS=200
-        log_info "Live RTX 5090 High-Refresh Monitor on ${REMOTE_TARGET} (Refresh: ${INTERVAL_MS}ms / 5Hz | Ctrl+C to exit)"
-        trap 'printf "\n"; exit 0' INT TERM
-        ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "REMOTE_DIR='${REMOTE_DIR}' INTERVAL_MS='${INTERVAL_MS}' bash -s" <<'EOF' || true
-pkill -TERM -f 'nvidia-smi --query-gpu=' 2>/dev/null || true
-STAT_FILE="/dev/shm/uttt_gpu_stat"
-[[ ! -d /dev/shm ]] && STAT_FILE="/tmp/uttt_gpu_stat"
-echo "100, --, 26225, 32607, ---, ----, --" > "${STAT_FILE}"
-
-nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits -lms "${INTERVAL_MS}" 2>/dev/null | while IFS= read -r line; do
-    echo "${line}" > "${STAT_FILE}.tmp" && mv -f "${STAT_FILE}.tmp" "${STAT_FILE}"
-done &
-SMI_PID=$!
-trap 'kill -TERM ${SMI_PID} 2>/dev/null || true; pkill -TERM -f "nvidia-smi --query-gpu=" 2>/dev/null || true; exit 0' EXIT INT TERM HUP PIPE
-
-ESC=$(printf '\033')
-TICK=0
-TMUX_ST="checking..."
-CKPT_ST="checking..."
-LOG_ST="waiting for log..."
-SLEEP_SEC=$(awk "BEGIN {printf \"%.3f\", ${INTERVAL_MS}/1000}")
-printf '\n\n\n\n\n'
-
-while true; do
-    [[ $(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ') -eq 1 ]] && break
-    IFS=',' read -r U_GPU U_MEM M_USED M_TOT PWR CLK TMP < "${STAT_FILE}" 2>/dev/null || true
-    U_GPU="${U_GPU// /}"; U_MEM="${U_MEM// /}"; M_USED="${M_USED// /}"; M_TOT="${M_TOT// /}"
-    PWR="${PWR// /}"; CLK="${CLK// /}"; TMP="${TMP// /}"
-
-    if (( TICK % 5 == 0 )); then
-        TMUX_ST=$(tmux ls 2>/dev/null | awk -F: '{print $1}' | tr '\n' ',' | sed 's/,$//')
-        [[ -z "${TMUX_ST}" ]] && TMUX_ST="none"
-
-        CKPT_ST=$(ls -lht --time-style='+%H:%M:%S' "${REMOTE_DIR}/checkpoints/"*.pt 2>/dev/null | head -n 1 | awk '{n=split($7,a,"/"); printf "%s (%s updated %s)", a[n], $5, $6}')
-        [[ -z "${CKPT_ST}" ]] && CKPT_ST="none"
-
-        LOG_ST=$(tail -n 25 "${REMOTE_DIR}/logs/train_5090.log" 2>/dev/null | grep '\[Step ' | tail -n 1 | cut -c1-108)
-        [[ -z "${LOG_ST}" ]] && LOG_ST=$(tail -n 1 "${REMOTE_DIR}/logs/train_5090.log" 2>/dev/null | cut -c1-108)
-    fi
-    (( TICK++ )) || true
-
-    NOW_TS=$(date '+%H:%M:%S.%1N')
-
-    printf '%s[5A\r%s[2K%s[1;36m[uTTT 5090 5Hz]%s[0m %s | tmux: %s | (Ctrl+C to exit)\n\r%s[2K%s[1;32mGPU  :%s[0m Util: %3s%% | MemBW: %3s%% | VRAM: %s/%s MiB | Power: %6sW | %4sMHz | %sC\n\r%s[2K%s[1;33mCkpt :%s[0m %s\n\r%s[2K%s[1;35mTrain:%s[0m %s\n\r%s[2K------------------------------------------------------------------------------------------------------------\n' \
-        "${ESC}" "${ESC}" "${ESC}" "${ESC}" "${NOW_TS}" "${TMUX_ST}" \
-        "${ESC}" "${ESC}" "${ESC}" "${U_GPU}" "${U_MEM}" "${M_USED}" "${M_TOT}" "${PWR}" "${CLK}" "${TMP}" \
-        "${ESC}" "${ESC}" "${ESC}" "${CKPT_ST}" \
-        "${ESC}" "${ESC}" "${ESC}" "${LOG_ST}" \
-        "${ESC}" || break
-
-    sleep "${SLEEP_SEC}" || break
-done
-EOF
+        local INTERVAL_MS="${1:-200}" TARGET_HZ MONITOR_CODE REMOTE_COMMAND
+        if [[ ! "$INTERVAL_MS" =~ ^[0-9]{1,5}$ ]] || (( 10#$INTERVAL_MS < 1 || 10#$INTERVAL_MS > 60000 )); then
+            log_error "Refresh interval must be an integer between 1 and 60000 milliseconds."
+            return 1
+        fi
+        INTERVAL_MS=$((10#$INTERVAL_MS))
+        TARGET_HZ=$(awk -v ms="$INTERVAL_MS" 'BEGIN {printf "%g", 1000/ms}')
+        log_info "Live RTX 5090 Monitor on ${REMOTE_TARGET} (Refresh: ${INTERVAL_MS}ms / target ${TARGET_HZ}Hz | Ctrl+C to exit)"
+        MONITOR_CODE=$(base64 < "${SCRIPT_DIR}/monitor_status.py" | tr -d '\r\n')
+        # A remote PTY delivers HUP when the SSH channel closes. Sending the
+        # program as a command keeps stdin available to SSH instead of keeping
+        # an orphaned bash pipeline alive after a heredoc reaches EOF.
+        printf -v REMOTE_COMMAND 'stty -echo; exec python3 -u -c "$(printf %%s %q | base64 -d)" --root %q --interval-ms %q' \
+            "$MONITOR_CODE" "$REMOTE_DIR" "$INTERVAL_MS"
+        remote_view_tty "$REMOTE_COMMAND"
     fi
 }
 
 cmd_logs() {
     validate_config
-    TARGET_MODE="${1:-train}"
-    if [[ "${TARGET_MODE}" == "serve" ]]; then
-        LOG_PATH="${REMOTE_DIR}/logs/serve_5090.log"
-    else
-        LOG_PATH="${REMOTE_DIR}/logs/train_5090.log"
+    local TARGET_MODE="${1:-train}" LOG_PATH LOG_VIEW_COMMAND
+    if [[ "$TARGET_MODE" != train && "$TARGET_MODE" != serve ]]; then
+        log_error "Log target must be train or serve."
+        return 1
     fi
+    LOG_PATH="${REMOTE_DIR}/logs/${TARGET_MODE}_5090.log"
     log_info "Tailing remote log: ${LOG_PATH} (Press Ctrl+C to exit)..."
-    trap 'printf "\n"; exit 0' INT TERM
-    remote_exec "tail -n 100 -f '${LOG_PATH}'" || true
+    printf -v LOG_VIEW_COMMAND 'exec tail -n 100 -F -- %q' "$LOG_PATH"
+    remote_view_tty "$LOG_VIEW_COMMAND"
 }
 
 cmd_stop() {
     validate_config
-    TARGET_MODE="${1:-all}"
-    remote_exec "bash -c \"
-        if [[ '${TARGET_MODE}' == 'train' || '${TARGET_MODE}' == 'all' ]]; then
-            pkill -TERM -f 'train_5090.py' 2>/dev/null || true;
-            for _ in {1..10}; do
-                ls '${REMOTE_DIR}/checkpoints/'*.tmp* >/dev/null 2>&1 || break;
-                sleep 0.5;
-            done;
-            tmux kill-session -t '${TMUX_TRAIN_SESSION}' 2>/dev/null && echo 'Stopped ${TMUX_TRAIN_SESSION}' || true;
-        fi
-        if [[ '${TARGET_MODE}' == 'serve' || '${TARGET_MODE}' == 'all' ]]; then
-            tmux kill-session -t '${TMUX_SERVE_SESSION}' 2>/dev/null && echo 'Stopped ${TMUX_SERVE_SESSION}' || true;
-        fi
-    \""
-    log_ok "Requested stop (${TARGET_MODE}) completed."
+    local TARGET_MODE="${1:-all}" QUOTED_ARGS
+    if [[ "$TARGET_MODE" != train && "$TARGET_MODE" != serve && "$TARGET_MODE" != all ]]; then
+        log_error "Stop target must be train, serve or all."
+        return 1
+    fi
+    printf -v QUOTED_ARGS '%q ' "${REMOTE_DIR}" "$TARGET_MODE" "${TMUX_TRAIN_SESSION}" "${TMUX_SERVE_SESSION}" "${USE_DOCKER}"
+    remote_exec "bash -s -- ${QUOTED_ARGS}" <<'REMOTE_STOP'
+set -euo pipefail
+ROOT="$1"; MODE="$2"; TRAIN_SESSION="$3"; SERVE_SESSION="$4"; DOCKER="$5"
+cd "$ROOT"
+if [[ "$MODE" == train || "$MODE" == all ]]; then
+    PYTHON=python3
+    [[ ! -x "$ROOT/.venv/bin/python3" ]] || PYTHON="$ROOT/.venv/bin/python3"
+    STOP_ARGS=(--workspace "$ROOT" --session "$TRAIN_SESSION" --pid-file "$ROOT/logs/$TRAIN_SESSION.pid")
+    [[ "$DOCKER" != 1 ]] || STOP_ARGS+=(--container "$TRAIN_SESSION")
+    "$PYTHON" deploy/stop_training.py "${STOP_ARGS[@]}"
+    # The helper waits for the selected trainer/pipeline to exit after saving.
+    # A timeout exits above and leaves the session available for inspection.
+    tmux kill-session -t "=$TRAIN_SESSION" 2>/dev/null || true
+    rm -f -- "$ROOT/logs/$TRAIN_SESSION.pid"
+fi
+if [[ "$MODE" == serve || "$MODE" == all ]]; then
+    PYTHON=python3
+    [[ ! -x "$ROOT/.venv/bin/python3" ]] || PYTHON="$ROOT/.venv/bin/python3"
+    STOP_ARGS=(--workspace "$ROOT" --session "$SERVE_SESSION" --pid-file "$ROOT/logs/$SERVE_SESSION.pid" --kind serve)
+    [[ "$DOCKER" != 1 ]] || STOP_ARGS+=(--container "$SERVE_SESSION")
+    "$PYTHON" deploy/stop_training.py "${STOP_ARGS[@]}"
+    tmux kill-session -t "=$SERVE_SESSION" 2>/dev/null || true
+    rm -f -- "$ROOT/logs/$SERVE_SESSION.pid"
+fi
+REMOTE_STOP
+    log_ok "Requested stop ($TARGET_MODE) completed."
 }
 
 # ------------------------------------------------------------------------------

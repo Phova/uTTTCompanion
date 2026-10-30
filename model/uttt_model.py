@@ -12,7 +12,7 @@ Key Architectural Features:
 3. Explicit separation between Slow Weights (Theta_slow) and Meta-Initialized Fast
    Weights (W_0) for dual-track checkpointing (`base_uttt.pt` vs `personas/{user_id}_state.pt`).
 4. Native support for Gradient Checkpointing over tensorized FastWeightState to keep
-   RTX 5090 meta-training VRAM strictly under 28 GB.
+   memory use configurable; exact meta-training capacity must be measured separately.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class uTTTConfig:
     gradient_checkpointing: bool = True
     gradient_checkpointing_every: int = 1
     tie_word_embeddings: bool = True
-    write_schedule: str = "sequential"          # "sequential" (Eq. 14/17) or "aggregated" (Eq. 2)
+    write_schedule: str = "sequential"          # Chunk-first causal reads, sequential boundary writes
     dspark_speculative_k: int = 0               # DeepInfer DSpark speculative draft length (0=off)
     dspark_conf_threshold: float = 0.82         # Confidence gate for DSpark draft token proposal
     tokenizer_json: Optional[str] = None       # Embedded byte-level BPE for new checkpoints
@@ -268,6 +268,8 @@ class uTTTModel(nn.Module):
           and flows sequentially through `layers[0] -> layers[1] -> ... -> layers[L-1]`.
     """
 
+    INNER_LOOP_PROTOCOL = "chunk_shared_fp32_exact_v1"
+
     def __init__(self, config: uTTTConfig) -> None:
         super().__init__()
         self.config = config
@@ -421,6 +423,62 @@ class uTTTModel(nn.Module):
     # Forward Pass with Cross-Layer Fast-Weight State Passing
     # --------------------------------------------------------------------------
 
+    def _run_shared_chunk(self, hidden, tensors, kv_caches, attention_mask, start_pos, step_before):
+        """All layers read the chunk-start state; writes advance one shared cursor.
+
+        Advancing depth inside each chunk lets later chunks read writes from every
+        layer without exposing any write from the current chunk to its predictions.
+        Nested tensor arguments/outputs also support non-reentrant checkpointing.
+        """
+        names = ("w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")
+        read_state = FastWeightState(**dict(zip(names, tensors)), step=step_before)
+        cursor = read_state
+        next_caches, surprises = [], []
+        for index, block in enumerate(self.layers):
+            hidden, cursor, surprise, cache = block(
+                hidden, fast_pool=self.fast_weight_pool, fast_state=cursor,
+                read_state=read_state, attention_mask=attention_mask,
+                kv_cache=kv_caches[index], start_pos=start_pos, update_fast_weights=True,
+            )
+            # Keep differentiable history only within the local attention window.
+            window = block.attn.window_size
+            next_caches.append(tuple(value[:, :, -window:, :] for value in cache))
+            surprises.append(surprise)
+        return hidden, tuple(getattr(cursor, name) for name in names), next_caches, torch.stack(surprises)
+
+    def _forward_shared_chunks(self, hidden, state, attention_mask, kv_caches, start_pos):
+        if self.config.write_schedule != "sequential":
+            raise ValueError("Only the causal sequential write schedule is implemented; aggregated writes must not be silently treated as sequential")
+        names = ("w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")
+        caches = list(kv_caches) if kv_caches is not None else [None] * len(self.layers)
+        pieces, losses, token_counts = [], [], []
+        tensors = tuple(getattr(state, name) for name in names)
+        step = state.step
+        for offset in range(0, hidden.shape[1], self.config.chunk_size):
+            end = min(offset + self.config.chunk_size, hidden.shape[1])
+            mask = attention_mask[:, offset:end] if attention_mask is not None else None
+            args = (hidden[:, offset:end], tensors, caches, mask, start_pos + offset, step)
+            if self.training and self.gradient_checkpointing:
+                piece, tensors, caches, surprise = checkpoint(
+                    self._run_shared_chunk, *args, use_reentrant=False,
+                    preserve_rng_state=self.config.dropout > 0.0,
+                )
+            else:
+                piece, tensors, caches, surprise = self._run_shared_chunk(*args)
+            pieces.append(piece)
+            losses.append(surprise)
+            token_counts.append(mask.sum().to(dtype=surprise.dtype) if mask is not None
+                                else surprise.new_tensor(hidden.shape[0] * (end - offset)))
+            step += len(self.layers)
+        updated = FastWeightState(
+            **dict(zip(names, tensors)), step=step,
+            last_surprise_loss=state.last_surprise_loss,
+            surprise_history=list(state.surprise_history),
+        )
+        counts = torch.stack(token_counts)
+        per_layer = (torch.stack(losses) * counts[:, None]).sum(dim=0) / counts.sum().clamp_min(1)
+        return torch.cat(pieces, dim=1), updated, per_layer, caches
+
     def _checkpointed_block_forward(
         self,
         block: uTTTBlock,
@@ -486,9 +544,9 @@ class uTTTModel(nn.Module):
                 st_out.w_up,
                 st_out.w_gate,
                 st_out.w_down,
-                st_out.s_up.detach(),
-                st_out.s_gate.detach(),
-                st_out.s_down.detach(),
+                st_out.s_up,
+                st_out.s_gate,
+                st_out.s_down,
                 s_loss,
             )
 
@@ -498,9 +556,9 @@ class uTTTModel(nn.Module):
             fast_state.w_up,
             fast_state.w_gate,
             fast_state.w_down,
-            fast_state.s_up.detach(),
-            fast_state.s_gate.detach(),
-            fast_state.s_down.detach(),
+            fast_state.s_up,
+            fast_state.s_gate,
+            fast_state.s_down,
             fast_state.ln_weight,
             fast_state.ln_bias,
             use_reentrant=False,
@@ -545,13 +603,18 @@ class uTTTModel(nn.Module):
             input_ids:           (B, T) token indices
             fast_state:          Initial FastWeightState W^(0). If None, initialized from W_0.
             labels:              Optional (B, T) next-token targets for outer-loop training.
-            attention_mask:      Optional (B, T) mask (1 for valid tokens, 0 for pad).
+            attention_mask:      Optional right-padding (B, T) mask for inner writes
+                                 (1 for valid tokens, 0 for pad). Left padding and
+                                 internal holes are unsupported by SWA/KV caching.
+                                 Set padded labels to -100 separately for CE loss.
             kv_caches:           Optional per-layer SWA KV caches for incremental decoding.
             start_pos:           Starting token position for RoPE during decoding.
             update_fast_weights: Whether to update W_fast in each block's inner loop.
             surprise_aux_weight: Weight of inner-loop surprise loss in total meta-training loss.
         """
         bsz, seq_len = input_ids.shape
+        if seq_len == 0 or self.config.chunk_size < 1:
+            raise ValueError("input sequence and chunk_size must be non-empty/positive")
         h = self.tok_embeddings(input_ids)
         if torch.is_autocast_enabled():
             h = h.to(torch.get_autocast_dtype("cuda" if h.is_cuda else "cpu"))
@@ -572,63 +635,37 @@ class uTTTModel(nn.Module):
         layer_surprise_tensors: List[torch.Tensor] = []
         layer_surprise_floats: List[float] = []
 
-        cur_fast_state = fast_state
-        if update_fast_weights and logits_to_keep >= 0:
-            cur_fast_state._init_state = fast_state
-            cur_fast_state._chunk_states = None
-
-        # Sequentially thread `cur_fast_state` through Layer 0 -> Layer 1 -> ... -> Layer L-1
-        for idx, block in enumerate(self.layers):
-            if update_fast_weights and logits_to_keep >= 0 and idx > 0:
-                # Causal layers already restart from the pre-sequence state.
-                # Pass that shared storage directly into checkpointing instead of
-                # retaining unused end-of-sequence weights from every prior layer.
-                cur_fast_state = FastWeightState(
-                    **{name: getattr(fast_state, name) for name in (
-                        "w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias"
-                    )},
-                    step=cur_fast_state.step, _init_state=fast_state,
-                )
-            layer_kv = kv_caches[idx] if kv_caches is not None else None
-            use_ckpt = (
-                self.gradient_checkpointing
-                and self.training
-                and kv_caches is None
-                and idx % max(1, self.config.gradient_checkpointing_every) == 0
+        if update_fast_weights:
+            h, cur_fast_state, per_layer_surprises, new_kv_caches = self._forward_shared_chunks(
+                h, fast_state, attention_mask, kv_caches, start_pos,
             )
+            layer_surprise_tensors = list(per_layer_surprises.unbind())
+        else:
+            cur_fast_state = fast_state
+            for idx, block in enumerate(self.layers):
+                layer_kv = kv_caches[idx] if kv_caches is not None else None
+                use_ckpt = (self.gradient_checkpointing and self.training and kv_caches is None
+                            and idx % max(1, self.config.gradient_checkpointing_every) == 0)
+                if use_ckpt:
+                    h, cur_fast_state, s_loss = self._checkpointed_block_forward(
+                        block, h, cur_fast_state, attention_mask, False,
+                    )
+                else:
+                    h, cur_fast_state, s_loss, updated_kv = block(
+                        h, fast_pool=self.fast_weight_pool, fast_state=cur_fast_state,
+                        attention_mask=attention_mask, kv_cache=layer_kv,
+                        start_pos=start_pos, update_fast_weights=False,
+                    )
+                    new_kv_caches.append(updated_kv)
+                layer_surprise_tensors.append(s_loss)
 
-            if use_ckpt:
-                h, cur_fast_state, s_loss = self._checkpointed_block_forward(
-                    block, h, cur_fast_state, attention_mask, update_fast_weights
-                )
-            else:
-                h, cur_fast_state, s_loss, updated_kv = block(
-                    h,
-                    fast_pool=self.fast_weight_pool,
-                    fast_state=cur_fast_state,
-                    attention_mask=attention_mask,
-                    kv_cache=layer_kv,
-                    start_pos=start_pos,
-                    update_fast_weights=update_fast_weights,
-                )
-                new_kv_caches.append(updated_kv)
-
-            layer_surprise_tensors.append(s_loss)
-
-        # Break transient _init_state reference immediately so CUDACachingAllocator frees
-        # intermediate fast-weight tensors as soon as the micro-batch finishes
-        fast_state._init_state = None
-        cur_fast_state._init_state = None
-
-        stacked_surprises = torch.stack(layer_surprise_tensors)
-        mean_surprise_loss = stacked_surprises.mean()
+        mean_surprise_loss = torch.stack(layer_surprise_tensors).mean()
         if (not self.training and update_fast_weights) or not input_ids.is_cuda:
-            # Single vectorized GPU->CPU sync for all layers at the end of TTT update
-            layer_surprise_floats = [float(x) for x in stacked_surprises.detach().float().tolist()]
-            mean_val = sum(layer_surprise_floats) / max(len(layer_surprise_floats), 1)
-            cur_fast_state.last_surprise_loss = mean_val
+            layer_surprise_floats = [float(x) for x in torch.stack(layer_surprise_tensors).detach().float().tolist()]
+            cur_fast_state.last_surprise_loss = sum(layer_surprise_floats) / max(len(layer_surprise_floats), 1)
             if not self.training and update_fast_weights:
-                cur_fast_state.surprise_history = list(cur_fast_state.surprise_history[-(100 - len(layer_surprise_floats)):]) + layer_surprise_floats
+                cur_fast_state.surprise_history = (list(cur_fast_state.surprise_history)
+                                                 + layer_surprise_floats)[-100:]
         else:
             layer_surprise_floats = [0.0] * len(layer_surprise_tensors)
 

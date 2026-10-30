@@ -140,7 +140,7 @@ class TestuTTTPipeline(unittest.TestCase):
             config=cfg,
             save_path=base_ckpt_path,
             step=10,
-            metrics={"test": True},
+            metrics={"test": True, "training_stage": "meta", "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL},
         )
         self.assertTrue(base_ckpt_path.exists())
 

@@ -1,6 +1,7 @@
-# Largest candidate validated under the current 28 GiB process budget.
+# Largest candidate in the historical first-order capacity sweep (28 GiB budget).
 # Full FP32 weights/gradients/AdamW states, BF16 activations, no offload/quantization.
-# 1,583,879,748 unique parameters; two full meta-training steps measured 27.96 GiB reserved.
+# 1,583,879,748 parameters; old first-order meta measured 27.96 GiB reserved.
+# Remeasure exact meta with FP32 dynamic states before using stage=meta.
 hardware:
   device: cuda
   precision: bfloat16

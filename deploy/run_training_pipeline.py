@@ -3,6 +3,7 @@ import argparse
 import datetime
 import json
 import os
+import pickle
 import signal
 import subprocess
 import sys
@@ -11,8 +12,15 @@ from pathlib import Path
 
 def checkpoint_metrics(path):
     import torch
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    return {"step": int(checkpoint.get("step", 0)), "metrics": checkpoint.get("metrics", {})}
+    error = None
+    for candidate in (Path(path), Path(str(path) + ".prev")):
+        try:
+            checkpoint = torch.load(candidate, map_location="cpu", weights_only=False, mmap=True)
+            return {"step": int(checkpoint.get("step", 0)), "metrics": checkpoint.get("metrics", {}),
+                    "path": str(candidate)}
+        except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as caught:
+            error = caught
+    raise RuntimeError(f"No readable stage checkpoint: {path}") from error
 
 
 def main():
@@ -21,6 +29,10 @@ def main():
     parser.add_argument("--pretrain-steps", type=int, default=100000)
     parser.add_argument("--sft-steps", type=int, default=6000)
     args = parser.parse_args()
+    if args.pretrain_steps < 1 or args.sft_steps < 1:
+        parser.error("Training stage steps must be positive")
+    if not args.run_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in args.run_id):
+        parser.error("run-id may contain only letters, numbers, underscores and hyphens")
     root = Path(__file__).resolve().parents[1]
     os.chdir(root)
     state_path = root / "logs" / f"pipeline_{args.run_id}.json"
@@ -89,6 +101,8 @@ def main():
         if saved["step"] < expected_steps:
             update(status="interrupted", saved_step=saved["step"])
             raise RuntimeError(f"{stage} stopped at step {saved['step']} before target {expected_steps}; next stage was not started")
+        if saved["metrics"].get("training_stage") != stage or saved["metrics"].get("training_pipeline") != 3:
+            raise RuntimeError(f"{stage} checkpoint has incompatible training provenance; next stage was not started")
         update(status="stage_complete", saved_step=saved["step"], last_metrics=saved["metrics"])
 
     try:

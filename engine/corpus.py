@@ -5,7 +5,64 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
+
+
+class ResumableBatchSampler(Sampler):
+    """Keep the consumed cursor separate from DataLoader's speculative prefetch.
+
+    Iteration never commits progress. The trainer advances only after a batch
+    succeeds, and can restore the step's cursor before retrying an OOM.
+    """
+    def __init__(self, size, batch_size, seed=42):
+        if size < 1 or batch_size < 1:
+            raise ValueError("Dataset size and batch size must be positive")
+        self.size, self.batch_size, self.seed = int(size), int(batch_size), int(seed)
+        self.epoch, self.offset = 0, 0
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(self.size, generator=generator).tolist()
+        limit = self.size - self.size % self.batch_size if self.size >= self.batch_size else self.size
+        for start in range(self.offset, limit, self.batch_size):
+            end = min(start + self.batch_size, limit)
+            if end - start < self.batch_size and self.size >= self.batch_size:
+                break
+            yield order[start:end]
+
+    def __len__(self):
+        remaining = self.size - self.offset
+        return remaining // self.batch_size if self.size >= self.batch_size else int(remaining > 0)
+
+    def set_batch_size(self, batch_size):
+        if batch_size < 1:
+            raise ValueError("Batch size must be positive")
+        self.batch_size = int(batch_size)
+        if self.size >= self.batch_size and self.size - self.offset < self.batch_size:
+            self.epoch += 1
+            self.offset = 0
+
+    def advance(self, count):
+        expected = min(self.batch_size, self.size - self.offset)
+        if count != expected:
+            raise ValueError("Consumed batch does not match the data cursor")
+        self.offset += count
+        # Drop the incomplete tail exactly as the original training loader did.
+        if self.offset == self.size or (self.size >= self.batch_size and self.size - self.offset < self.batch_size):
+            self.epoch += 1
+            self.offset = 0
+
+    def state_dict(self):
+        return {"version": 1, "size": self.size, "seed": self.seed,
+                "epoch": self.epoch, "offset": self.offset}
+
+    def load_state_dict(self, state):
+        if state.get("version") != 1 or state.get("size") != self.size:
+            raise ValueError("Checkpoint data cursor is incompatible with the dataset")
+        epoch, offset = int(state["epoch"]), int(state["offset"])
+        if epoch < 0 or not 0 <= offset < self.size:
+            raise ValueError("Invalid checkpoint data cursor")
+        self.seed, self.epoch, self.offset = int(state["seed"]), epoch, offset
 
 
 def read_manifest(path):

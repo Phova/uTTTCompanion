@@ -53,7 +53,7 @@ def measure(config, seq_len, budget_gb, steps=2):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--budget-gb", type=float, default=29.0)
+    parser.add_argument("--budget-gb", type=float, default=28.0)
     parser.add_argument("--output", default="logs/capacity_report.json")
     parser.add_argument("--worker", nargs=2, type=int, metavar=("WIDTH", "LAYERS"))
     args = parser.parse_args()
@@ -85,7 +85,9 @@ def main():
         reports.append(result)
         print(json.dumps(result), flush=True)
     passed = [result for result in reports if result["status"] == "ok"]
-    report = {"budget_gb": budget, "candidates": reports,
+    report = {"budget_gb": budget, "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL,
+              "training_stage": "meta", "dynamic_state_precision": "float32",
+              "candidates": reports,
               "largest_tested": max(passed, key=lambda result: result["parameters"]) if passed else None}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

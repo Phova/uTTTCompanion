@@ -82,6 +82,7 @@ class FastWeightState:
     _init_state: Optional["FastWeightState"] = field(default=None, repr=False)
     _chunk_states: Optional[List["FastWeightState"]] = field(default=None, repr=False)
     _packed_up_gate: Optional[torch.Tensor] = field(default=None, repr=False)
+    _read_w_down: Optional[torch.Tensor] = field(default=None, repr=False)
     _packed_key: Optional[tuple] = field(default=None, repr=False)
 
     def clone(self, detach: bool = False) -> "FastWeightState":
@@ -231,10 +232,10 @@ def swiglu_fast_forward(
         out:       (B, T, D) reconstructed representations
     """
     orig_dtype = x.dtype
-    u = torch.bmm(x, w_up)                                      # (B, T, d_ff) contiguous
-    g = torch.bmm(x, w_gate)                                    # (B, T, d_ff) contiguous
+    u = torch.bmm(x, w_up.to(dtype=orig_dtype))                  # (B, T, d_ff) contiguous
+    g = torch.bmm(x, w_gate.to(dtype=orig_dtype))                # (B, T, d_ff) contiguous
     h = F.silu(g) * u                                           # (B, T, d_ff)
-    z = torch.bmm(h, w_down)                                    # (B, T, D)
+    z = torch.bmm(h, w_down.to(dtype=orig_dtype))                # (B, T, D)
     # Single fused CUDA LayerNorm kernel (accumulates FP32 stats in registers)
     ln_out = F.layer_norm(
         z, (z.shape[-1],), ln_weight.to(orig_dtype), ln_bias.to(orig_dtype), eps
@@ -247,8 +248,8 @@ def swiglu_packed_forward(
     ln_weight: torch.Tensor, ln_bias: torch.Tensor, eps: float = 1e-5,
 ) -> torch.Tensor:
     """Inference SwiGLU with one shared up/gate projection and fusible pointwise ops."""
-    up, gate = torch.bmm(x, packed_up_gate).chunk(2, dim=-1)
-    projected = torch.bmm(F.silu(gate) * up, w_down)
+    up, gate = torch.bmm(x, packed_up_gate.to(dtype=x.dtype)).chunk(2, dim=-1)
+    projected = torch.bmm(F.silu(gate) * up, w_down.to(dtype=x.dtype))
     return x + F.layer_norm(projected, (projected.shape[-1],), ln_weight.to(x.dtype), ln_bias.to(x.dtype), eps)
 
 
@@ -314,67 +315,69 @@ def analytical_swiglu_chunk_grad(
         surprise_loss: scalar tensor (mean unweighted L_TTT across valid tokens)
     """
     orig_dtype = k_chunk.dtype
+    compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
     bsz, chunk_len, dim = k_chunk.shape
 
     # --- 1. Batched Forward Pass through SwiGLU Fast Weights (Contiguous cuBLAS bmm) ---
-    # Keep u, g in BF16 across the bmm barrier and evaluate SiLU in FP32 registers,
-    # eliminating 368.8 MB/chunk of FP32 GDDR7 barrier traffic and saving 37% activation VRAM.
-    u = torch.bmm(k_chunk, w_up)                                # (B, C, d_ff)
-    g = torch.bmm(k_chunk, w_gate)                              # (B, C, d_ff)
-    h = (F.silu(g.float()) * u.float()).to(orig_dtype)          # (B, C, d_ff)
+    # Matmul/readout use the activation dtype while W/S may be FP32 master state.
+    # Match swiglu_fast_forward's activation rounding and retain all cast gradients.
+    w_up_read = w_up.to(dtype=orig_dtype)
+    w_gate_read = w_gate.to(dtype=orig_dtype)
+    w_down_read = w_down.to(dtype=orig_dtype)
+    u = torch.bmm(k_chunk, w_up_read)                           # (B, C, d_ff)
+    g = torch.bmm(k_chunk, w_gate_read)                         # (B, C, d_ff)
+    h = F.silu(g) * u                                          # (B, C, d_ff)
 
-    z = torch.bmm(h, w_down)                                    # (B, C, D)
+    z = torch.bmm(h, w_down_read)                               # (B, C, D)
 
     # LayerNorm statistics in FP32
-    z_fp32 = z.float()
+    z_fp32 = z.to(dtype=compute_dtype)
     mean = z_fp32.mean(dim=-1, keepdim=True)
     diff = z_fp32 - mean
     var = diff.square().mean(dim=-1, keepdim=True)
     rstd = torch.rsqrt(var + eps)
     z_hat = diff * rstd                                         # (B, C, D)
 
-    gamma = ln_weight.float().view(1, 1, dim)
-    beta = ln_bias.float().view(1, 1, dim)
-    v_hat = k_chunk.float() + (z_hat * gamma + beta)            # (B, C, D)
+    gamma = ln_weight.to(dtype=compute_dtype).view(1, 1, dim)
+    beta = ln_bias.to(dtype=compute_dtype).view(1, 1, dim)
+    v_hat = k_chunk.to(dtype=compute_dtype) + (z_hat * gamma + beta)
 
     # --- 2. Surprise Loss: L_t = 1/2 || f_W(k_t) - v_t ||_2^2 ---
-    err = v_hat - v_chunk.float()                               # (B, C, D)
+    err = v_hat - v_chunk.to(dtype=compute_dtype)                # (B, C, D)
     inv_scale = (1.0 / float(dim)) if normalize_by_dim else 1.0
     token_loss = 0.5 * err.square().sum(dim=-1) * inv_scale     # (B, C)
 
     if token_mask is not None:
-        mask_fp32 = token_mask.float()                          # (B, C)
+        mask_fp32 = token_mask.to(dtype=compute_dtype)          # (B, C)
         valid_counts = mask_fp32.sum(dim=-1, keepdim=True).clamp_min(1.0)
         surprise_loss = (token_loss * mask_fp32).sum() / mask_fp32.sum().clamp_min(1.0)
-        weight_factor = (eta_chunk.float() * mask_fp32.unsqueeze(-1)) / valid_counts.unsqueeze(-1)
+        weight_factor = (eta_chunk.to(dtype=compute_dtype) * mask_fp32.unsqueeze(-1)) / valid_counts.unsqueeze(-1)
     else:
         surprise_loss = token_loss.mean()
-        weight_factor = eta_chunk.float() * (1.0 / float(chunk_len))
+        weight_factor = eta_chunk.to(dtype=compute_dtype) * (1.0 / float(chunk_len))
 
     # --- 3. Analytical Backward through Residual & LayerNorm ---
-    # Gauss-Newton linearized LayerNorm Jacobian: detach second-order statistical
-    # scalars (rstd, z_hat) to prevent noisy 3rd-order variance derivatives in outer loop.
+    # Keep the complete derivative graph: the outer objective differentiates
+    # through these analytical inner gradients, including LayerNorm statistics.
     dz_hat = (weight_factor * inv_scale) * err * gamma          # (B, C, D)
-    rstd_d = rstd.detach()
-    z_hat_d = z_hat.detach()
 
     mean_dz_hat = dz_hat.mean(dim=-1, keepdim=True)
-    mean_dz_hat_z = (dz_hat * z_hat_d).mean(dim=-1, keepdim=True)
-    delta_z = (rstd_d * (dz_hat - mean_dz_hat - z_hat_d * mean_dz_hat_z)).to(orig_dtype)
+    mean_dz_hat_z = (dz_hat * z_hat).mean(dim=-1, keepdim=True)
+    delta_z = (rstd * (dz_hat - mean_dz_hat - z_hat * mean_dz_hat_z)).to(orig_dtype)
 
     # --- 4. Analytical Backward through W_down ---
     # grad_W_down = H^T @ delta_Z -> (B, d_ff, C) @ (B, C, D) = (B, d_ff, D)
     grad_w_down = torch.bmm(h.transpose(1, 2), delta_z)
     # delta_H = delta_Z @ W_down^T -> (B, C, D) @ (B, D, d_ff) = (B, C, d_ff)
-    delta_h = torch.bmm(delta_z, w_down.transpose(1, 2))
+    delta_h = torch.bmm(delta_z, w_down_read.transpose(1, 2))
 
     # --- 5. Analytical Backward through SwiGLU Activation (SRAM register recomputation) ---
-    g_fp32 = g.float()
-    u_fp32 = u.float()
-    delta_h_fp32 = delta_h.float()
+    g_fp32 = g.to(dtype=compute_dtype)
+    u_fp32 = u.to(dtype=compute_dtype)
+    delta_h_fp32 = delta_h.to(dtype=compute_dtype)
     sigma_g = torch.sigmoid(g_fp32)
     delta_u = (delta_h_fp32 * (g_fp32 * sigma_g)).to(orig_dtype)
-    dsilu_fp32 = (sigma_g * (1.0 + g_fp32 * (1.0 - sigma_g))).detach()
+    dsilu_fp32 = sigma_g * (1.0 + g_fp32 * (1.0 - sigma_g))
     delta_g = (delta_h_fp32 * u_fp32 * dsilu_fp32).to(orig_dtype)
 
     # --- 6. Analytical Backward through W_up and W_gate (Contiguous cuBLAS bmm) ---
@@ -404,6 +407,9 @@ def fused_chunk_ttt_step(
     max_inner_grad_norm: float,
     normalize_by_dim: bool,
     eps: float,
+    read_w_up: Optional[torch.Tensor] = None,
+    read_w_gate: Optional[torch.Tensor] = None,
+    read_w_down: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -416,8 +422,8 @@ def fused_chunk_ttt_step(
 ]:
     """
     End-to-end pure-tensor Chunk TTT Step designed for whole-step `torch.compile` fusion:
-    Fuses Analytical Gradient + 2-Stage Shape-Aligned Frobenius Norm Clipping +
-    First-Order Straight-Through Surprise-to-W0 Coupling + Momentum S_t + Decay W_t +
+    Fuses differentiable Analytical Gradient + Frobenius Norm Clipping +
+    Momentum S_t + Decay W_t +
     Strictly Causal SwiGLU Fast-Weight Readout into a single compiled graph.
     """
     bsz = q_chunk.shape[0]
@@ -425,72 +431,61 @@ def fused_chunk_ttt_step(
         k_chunk=k_chunk,
         v_chunk=v_chunk,
         eta_chunk=eta_chunk,
-        w_up=w_up.detach(),
-        w_gate=w_gate.detach(),
-        w_down=w_down.detach(),
-        ln_weight=ln_weight.detach(),
-        ln_bias=ln_bias.detach(),
+        w_up=w_up,
+        w_gate=w_gate,
+        w_down=w_down,
+        ln_weight=ln_weight,
+        ln_bias=ln_bias,
         token_mask=token_mask,
         normalize_by_dim=normalize_by_dim,
         eps=eps,
     )
 
-    # First-order Straight-Through Gradient Coupling from Surprise Loss to W_fast (W_0):
-    # Reuses already-computed analytical gradients (zero extra GEMMs, zero forward change).
-    if torch.is_grad_enabled() and w_up.requires_grad:
-        inv_eta_bar = 1.0 / eta_chunk.detach().float().mean().clamp_min(1e-4)
-        surp_w = (
-            (w_up * grad_up.detach()).sum()
-            + (w_gate * grad_gate.detach()).sum()
-            + (w_down * grad_down.detach()).sum()
-        ) * (inv_eta_bar / float(bsz))
-        surprise_loss = surprise_loss + (surp_w - surp_w.detach())
-
+    master_dtype = torch.float64 if w_up.dtype == torch.float64 else torch.float32
     if max_inner_grad_norm > 0.0:
         # 2-stage shape-aligned reduction across all 170 SMs (no `with torch.no_grad():` graph split)
-        gu_det = grad_up.detach().float()
-        gg_det = grad_gate.detach().float()
-        gd_det = grad_down.detach().float().view(bsz, w_up.shape[1], w_up.shape[2])
+        gu_master = grad_up.to(dtype=master_dtype)
+        gg_master = grad_gate.to(dtype=master_dtype)
+        gd_master = grad_down.to(dtype=master_dtype).reshape(bsz, w_up.shape[1], w_up.shape[2])
         grad_norm_sq = (
-            (gu_det.square() + gg_det.square() + gd_det.square())
+            (gu_master.square() + gg_master.square() + gd_master.square())
             .sum(dim=-1)
             .sum(dim=-1)
         )
         clip_view = (
             (max_inner_grad_norm * torch.rsqrt(grad_norm_sq + 1e-8))
             .clamp(max=1.0)
-            .to(grad_up.dtype)
             .view(bsz, 1, 1)
         )
-        step_up = grad_up * clip_view
-        step_gate = grad_gate * clip_view
-        step_down = grad_down * clip_view
+        step_up = grad_up.to(dtype=master_dtype) * clip_view
+        step_gate = grad_gate.to(dtype=master_dtype) * clip_view
+        step_down = grad_down.to(dtype=master_dtype) * clip_view
     else:
         step_up = grad_up
         step_gate = grad_gate
         step_down = grad_down
 
-    # Return detached momentum buffers (eliminating 138.4MB/chunk of unused backward tangents)
-    # while connecting the differentiable update directly into w_*_new.
-    s_up_base = momentum_beta * s_up.detach()
-    s_gate_base = momentum_beta * s_gate.detach()
-    s_down_base = momentum_beta * s_down.detach()
+    # W/S are the master state. FP32 accumulation keeps sub-BF16-ULP decay and
+    # increments across chunks; readout casts remain differentiable above.
+    s_up_base = momentum_beta * s_up.to(dtype=master_dtype)
+    s_gate_base = momentum_beta * s_gate.to(dtype=master_dtype)
+    s_down_base = momentum_beta * s_down.to(dtype=master_dtype)
 
-    s_up_new = s_up_base - step_up.detach()
-    s_gate_new = s_gate_base - step_gate.detach()
-    s_down_new = s_down_base - step_down.detach()
+    s_up_new = s_up_base - step_up.to(dtype=master_dtype)
+    s_gate_new = s_gate_base - step_gate.to(dtype=master_dtype)
+    s_down_new = s_down_base - step_down.to(dtype=master_dtype)
 
     if token_mask is None:
-        alpha_bar = alpha_chunk.mean(dim=1, keepdim=True).to(w_up.dtype)
+        alpha_bar = alpha_chunk.to(dtype=master_dtype).mean(dim=1, keepdim=True)
     else:
-        mask = token_mask.unsqueeze(-1).to(alpha_chunk.dtype)
-        alpha_bar = ((alpha_chunk * mask).sum(dim=1, keepdim=True)
-                     / mask.sum(dim=1, keepdim=True).clamp_min(1)).to(w_up.dtype)
+        mask = token_mask.unsqueeze(-1).to(dtype=master_dtype)
+        alpha_bar = ((alpha_chunk.to(dtype=master_dtype) * mask).sum(dim=1, keepdim=True)
+                     / mask.sum(dim=1, keepdim=True).clamp_min(1))
     decay = 1.0 - alpha_bar
 
-    w_up_new = decay * w_up + (s_up_base - step_up)
-    w_gate_new = decay * w_gate + (s_gate_base - step_gate)
-    w_down_new = decay * w_down + (s_down_base - step_down)
+    w_up_new = decay * w_up.to(dtype=master_dtype) + s_up_new
+    w_gate_new = decay * w_gate.to(dtype=master_dtype) + s_gate_new
+    w_down_new = decay * w_down.to(dtype=master_dtype) + s_down_new
 
     if token_mask is not None:
         active = token_mask.any(dim=1).view(bsz, 1, 1)
@@ -501,14 +496,14 @@ def fused_chunk_ttt_step(
         s_gate_new = torch.where(active, s_gate_new, s_gate)
         s_down_new = torch.where(active, s_down_new, s_down)
 
-    # Strictly Causal Chunk Readout: tokens in chunk `c` read from pre-chunk `w_up, w_gate, w_down`
-    # (updated only by past chunks 0..c-1), preventing intra-chunk future token leakage
-    # with zero extra tensor allocations.
+    # A shared layer-write cursor may already contain writes from this chunk.
+    # The scheduler supplies the immutable chunk-start weights for causal reads;
+    # a standalone step defaults to its own pre-update weights.
     out_chunk = swiglu_fast_forward(
         x=q_chunk,
-        w_up=w_up,
-        w_gate=w_gate,
-        w_down=w_down,
+        w_up=w_up if read_w_up is None else read_w_up,
+        w_gate=w_gate if read_w_gate is None else read_w_gate,
+        w_down=w_down if read_w_down is None else read_w_down,
         ln_weight=ln_weight,
         ln_bias=ln_bias,
         eps=eps,
@@ -626,14 +621,24 @@ class SharedFastWeightPool(nn.Module):
     def forward_readout(self, x: torch.Tensor, state: FastWeightState) -> torch.Tensor:
         """Read out from current FastWeightState without modifying W_fast."""
         state = state.ensure_batch_size(x.shape[0])
+        weights = (state.w_up, state.w_gate, state.w_down)
         if (getattr(self, "fused_inference_readout", False) and not self.training
-                and not torch.is_grad_enabled() and not state.w_up.is_inference() and not state.w_gate.is_inference()):
-            key = tuple((tensor.data_ptr(), tensor._version, tensor.device, tensor.dtype, tensor.shape)
-                        for tensor in (state.w_up, state.w_gate))
-            if state._packed_up_gate is None or state._packed_key != key:
-                state._packed_up_gate = torch.cat((state.w_up, state.w_gate), dim=-1)
+                and not torch.is_grad_enabled() and not any(tensor.is_inference() for tensor in weights)):
+            # Persona writes accumulate in FP32. Reuse activation-precision read
+            # copies across layers/tokens while keeping every master bit intact.
+            key = (x.dtype, x.device, tuple(
+                (id(tensor), tensor.data_ptr(), tensor._version, tensor.device, tensor.dtype, tuple(tensor.shape))
+                for tensor in weights
+            ))
+            if state._packed_up_gate is None or state._read_w_down is None or state._packed_key != key:
+                state._packed_up_gate = torch.cat(
+                    (state.w_up.to(dtype=x.dtype), state.w_gate.to(dtype=x.dtype)), dim=-1
+                )
+                state._read_w_down = state.w_down.to(dtype=x.dtype)
                 state._packed_key = key
-            return swiglu_packed_forward(x, state._packed_up_gate, state.w_down, state.ln_weight, state.ln_bias, self.eps)
+            return swiglu_packed_forward(
+                x, state._packed_up_gate, state._read_w_down, state.ln_weight, state.ln_bias, self.eps
+            )
         return swiglu_fast_forward(
             x=x,
             w_up=state.w_up,
@@ -654,6 +659,7 @@ class SharedFastWeightPool(nn.Module):
         alpha_chunk: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,
         update_fast_weights: bool = True,
+        read_state: Optional[FastWeightState] = None,
     ) -> Tuple[torch.Tensor, FastWeightState, torch.Tensor]:
         """
         Execute one Chunk-wise Parallel TTT step:
@@ -662,16 +668,18 @@ class SharedFastWeightPool(nn.Module):
         3. Update Momentum S_t and Fast Weights W_t:
                S_t = beta * S_{t-1} - eta_t * grad_W L_TTT(W_{t-1}; k_t, v_t)
                W_t = (1 - alpha_t) * W_{t-1} + S_t
-        4. Read out chunk representation using strictly causal pre-chunk state W_{t-1}:
+        4. Read out using read_state (the causal chunk-start snapshot), or the
+           incoming write state when no separate snapshot was provided:
                o_chunk = f_{W_{t-1}}(q_chunk)
         """
         bsz = q_chunk.shape[0]
         state = state.ensure_batch_size(bsz)
+        read_state = state if read_state is None else read_state.ensure_batch_size(bsz)
 
         if not update_fast_weights:
             # Frozen fast-weight inference mode (used during token streaming generation):
             # Only read out f_{W_t}(q_chunk); skip redundant k_chunk readout & syncs
-            out = self.forward_readout(q_chunk, state)
+            out = self.forward_readout(q_chunk, read_state)
             surprise_loss = q_chunk.new_zeros((), dtype=torch.float32)
             return out, state, surprise_loss
 
@@ -695,6 +703,9 @@ class SharedFastWeightPool(nn.Module):
                 max_inner_grad_norm=float(self.max_inner_grad_norm or 0.0),
                 normalize_by_dim=self.normalize_loss_by_dim,
                 eps=self.eps,
+                read_w_up=read_state.w_up,
+                read_w_gate=read_state.w_gate,
+                read_w_down=read_state.w_down,
             )
         )
 
@@ -1188,6 +1199,7 @@ class uTTTLayer(nn.Module):
         fast_state: FastWeightState,
         attention_mask: Optional[torch.Tensor] = None,
         update_fast_weights: bool = True,
+        read_state: Optional[FastWeightState] = None,
     ) -> Tuple[torch.Tensor, FastWeightState, torch.Tensor]:
         """
         Process sequence `x` in parallel chunks of length `C = self.chunk_size`,
@@ -1238,27 +1250,6 @@ class uTTTLayer(nn.Module):
             and torch.is_grad_enabled()
             and num_chunks > 1
         )
-
-        init_st = fast_state._init_state
-        if init_st is not None:
-            # Start each layer's causal chunk sweep from initial pre-sequence state W_0
-            # (preventing end-of-sequence chunks of layer l-1 from leaking into chunk 0 of layer l)
-            # while preserving accumulated inner-loop step count across layers.
-            cur_state = FastWeightState(
-                w_up=init_st.w_up,
-                w_gate=init_st.w_gate,
-                w_down=init_st.w_down,
-                s_up=init_st.s_up,
-                s_gate=init_st.s_gate,
-                s_down=init_st.s_down,
-                ln_weight=init_st.ln_weight,
-                ln_bias=init_st.ln_bias,
-                step=fast_state.step,
-                last_surprise_loss=fast_state.last_surprise_loss,
-                surprise_history=fast_state.surprise_history,
-                _init_state=init_st,
-            )
-
 
         if use_seg_ckpt:
             seg_size = max(1, (num_chunks + self.chunk_checkpoint_segments - 1) // self.chunk_checkpoint_segments)
@@ -1329,6 +1320,7 @@ class uTTTLayer(nn.Module):
                             alpha_chunk=alpha_s[:, cs:ce, :],
                             token_mask=mc,
                             update_fast_weights=True,
+                            read_state=read_state,
                         )
                         seg_outs.append(oc)
                         seg_losses.append(lc)
@@ -1337,9 +1329,9 @@ class uTTTLayer(nn.Module):
                         st.w_up,
                         st.w_gate,
                         st.w_down,
-                        st.s_up.detach(),
-                        st.s_gate.detach(),
-                        st.s_down.detach(),
+                        st.s_up,
+                        st.s_gate,
+                        st.s_down,
                         torch.stack(seg_losses).mean(),
                     )
 
@@ -1353,9 +1345,9 @@ class uTTTLayer(nn.Module):
                     cur_state.w_up,
                     cur_state.w_gate,
                     cur_state.w_down,
-                    cur_state.s_up.detach(),
-                    cur_state.s_gate.detach(),
-                    cur_state.s_down.detach(),
+                    cur_state.s_up,
+                    cur_state.s_gate,
+                    cur_state.s_down,
                     use_reentrant=False,
                 )
                 cur_state = FastWeightState(
@@ -1394,11 +1386,10 @@ class uTTTLayer(nn.Module):
                     alpha_chunk=alpha_c,
                     token_mask=mask_c,
                     update_fast_weights=True,
+                    read_state=read_state,
                 )
                 chunk_outputs.append(out_c)
                 chunk_losses.append(loss_c)
-
-        cur_state._init_state = init_st
 
         out = torch.cat(chunk_outputs, dim=1)                       # (B, T, D)
         mean_surprise_loss = torch.stack(chunk_losses).sum() / num_chunks
@@ -1460,6 +1451,7 @@ class uTTTBlock(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         start_pos: int = 0,
         update_fast_weights: bool = True,
+        read_state: Optional[FastWeightState] = None,
     ) -> Tuple[torch.Tensor, FastWeightState, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # 1. Local Sliding Window Attention
         attn_out, new_kv_cache = self.attn(
@@ -1474,6 +1466,7 @@ class uTTTBlock(nn.Module):
             fast_state=fast_state,
             attention_mask=attention_mask,
             update_fast_weights=update_fast_weights,
+            read_state=read_state,
         )
         out = h + uttt_out
         return out, updated_fast_state, surprise_loss, new_kv_cache

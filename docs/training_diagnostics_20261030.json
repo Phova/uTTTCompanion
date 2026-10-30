@@ -1,0 +1,126 @@
+{
+  "stage": "pretrain",
+  "ttt_updates_enabled": false,
+  "surprise_loss_measured": false,
+  "latest_training": {
+    "stage": "pretrain",
+    "step": 16210,
+    "target_steps": 100000,
+    "ce_loss": 3.429,
+    "total_loss": 3.429,
+    "surprise_loss": 0.0,
+    "tokens_per_second": 7358.0
+  },
+  "validation": {
+    "count": 34,
+    "first": {
+      "stage": "pretrain",
+      "step": 1,
+      "ce": 10.9037,
+      "frozen_ce": 10.9037,
+      "tokens_seen": 32768
+    },
+    "latest": {
+      "stage": "pretrain",
+      "step": 16000,
+      "ce": 3.3604,
+      "frozen_ce": 3.3604,
+      "tokens_seen": 524288000
+    },
+    "best": {
+      "stage": "pretrain",
+      "step": 16000,
+      "ce": 3.3604,
+      "frozen_ce": 3.3604,
+      "tokens_seen": 524288000
+    },
+    "recent_ce_delta": -0.03970000000000029,
+    "recent": [
+      {
+        "stage": "pretrain",
+        "step": 14500,
+        "ce": 3.4001,
+        "frozen_ce": 3.4001,
+        "tokens_seen": 475136000
+      },
+      {
+        "stage": "pretrain",
+        "step": 15000,
+        "ce": 3.3786,
+        "frozen_ce": 3.3786,
+        "tokens_seen": 491520000
+      },
+      {
+        "stage": "pretrain",
+        "step": 15500,
+        "ce": 3.3688,
+        "frozen_ce": 3.3688,
+        "tokens_seen": 507904000
+      },
+      {
+        "stage": "pretrain",
+        "step": 16000,
+        "ce": 3.3604,
+        "frozen_ce": 3.3604,
+        "tokens_seen": 524288000
+      }
+    ],
+    "latest_perplexity": 28.800708859036757
+  },
+  "samples": {
+    "count": 68,
+    "repetition_flagged": 65,
+    "recent": [
+      {
+        "prompt": "The purpose of scientific research is",
+        "reply": "to understand the mechanisms of evolution and the mechanisms of evolution.\nThe scientific method is a scientific method that uses scientific methods to study the evolution of organisms.\nThe scientific method is a scientific method that uses scientific methods to study the evolution of",
+        "eos_generated": false,
+        "text_4gram_repetition": 0.6099290780141844,
+        "stage": "pretrain",
+        "step": 15500,
+        "repetition_flagged": true
+      },
+      {
+        "prompt": "科学研究的重要意义在于",
+        "reply": "，是“科学”和“科学”的结合，是“科学”和“科学”的结合，是“科学”和“科学”的结合，是“科学”和“科学”的结合，是“科学”和“科学",
+        "eos_generated": false,
+        "text_4gram_repetition": 0.7936507936507937,
+        "stage": "pretrain",
+        "step": 15500,
+        "repetition_flagged": true
+      },
+      {
+        "prompt": "The purpose of scientific research is",
+        "reply": "to understand the causes and consequences of disease and to develop new treatments.\nThe scientific method is based on the theory that the body is made up of many different parts, and that the body is made up of many different parts.\nThe",
+        "eos_generated": false,
+        "text_4gram_repetition": 0.27896995708154504,
+        "stage": "pretrain",
+        "step": 16000,
+        "repetition_flagged": false
+      },
+      {
+        "prompt": "科学研究的重要意义在于",
+        "reply": "，是“生命之源”的体现，是“生命之源”的体现，是“生命之源”的体现，是“生命之源”的体现，是“生命之源”的体现，是“",
+        "eos_generated": false,
+        "text_4gram_repetition": 0.8,
+        "stage": "pretrain",
+        "step": 16000,
+        "repetition_flagged": true
+      }
+    ],
+    "malformed_rows": 0
+  },
+  "nonfinite_metrics": {
+    "count": 0,
+    "recent": []
+  },
+  "notes": [
+    "TTT writes and surprise measurement are disabled for this language-training stage; legacy zero is a placeholder.",
+    "Recent continuation samples contain repeated text; inspect both greedy and sampled outputs.",
+    "Samples are legacy/greedy-only; they do not distinguish greedy decoding loops from general generation quality.",
+    "Pretraining samples test text continuation. Instruction following requires separate SFT and task evaluation.",
+    "This is a log-only report; it does not verify that the training process is alive."
+  ],
+  "log_path": "/root/uTTT/logs/pretrain_20261029.log",
+  "log_age_seconds": 15.924220085144043
+}

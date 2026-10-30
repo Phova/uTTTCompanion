@@ -1,5 +1,7 @@
 """Incremental text decoding with a compatible prefix-decoding fallback."""
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 
@@ -103,7 +105,8 @@ class CUDAGraphDecoder:
                 return False
         for name in cls._FAST_NAMES:
             tensor = getattr(fast_state, name)
-            if tensor.device != first.device or tensor.dtype != first.dtype or tensor.requires_grad or tensor.is_inference():
+            if (tensor.device != first.device or tensor.dtype not in (first.dtype, torch.float32)
+                    or tensor.requires_grad or tensor.is_inference()):
                 return False
         return fast_state.w_up.shape[0] == 1 and fast_state.w_gate.shape[0] == 1 and fast_state.w_down.shape[0] == 1
 
@@ -113,6 +116,12 @@ class CUDAGraphDecoder:
             raise ValueError("CUDA graph decode requires frozen CUDA FP16/BF16 weights, batch one and supported KV caches")
         self.model = model
         self.fast_state = fast_state
+        # Persona writes keep FP32 master state. Cast read weights once per graph,
+        # retaining the master's identity/version as the invalidation source.
+        self._read_state = SimpleNamespace(**{
+            name: getattr(fast_state, name).to(dtype=next(model.parameters()).dtype)
+            for name in self._FAST_NAMES
+        })
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         self._captured_model_key = self._model_key(model)
@@ -126,7 +135,7 @@ class CUDAGraphDecoder:
         self._qkv_packs = [block.attn._packed_qkv for block in model.layers]
         self._packed_up_gate = None
         if getattr(model.fast_weight_pool, "fused_inference_readout", False):
-            self._packed_up_gate = torch.cat((fast_state.w_up, fast_state.w_gate), dim=-1)
+            self._packed_up_gate = torch.cat((self._read_state.w_up, self._read_state.w_gate), dim=-1)
         for block in model.layers:
             attention = block.attn
             shape = (1, attention.n_kv_heads, attention.window_size, attention.head_dim)
@@ -178,7 +187,7 @@ class CUDAGraphDecoder:
 
     def _forward(self):
         """Capture-only tensor path: no model.forward bookkeeping or CPU syncs."""
-        model, state = self.model, self.fast_state
+        model, state = self.model, self._read_state
         hidden = F.embedding(self._input, model.tok_embeddings.weight)
         for index, block in enumerate(model.layers):
             attention = block.attn

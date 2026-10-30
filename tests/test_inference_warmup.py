@@ -8,7 +8,7 @@ import torch
 
 import engine.personalizer as personalization
 from engine.personalizer import uTTTPersonalizer
-from model.uttt_model import uTTTConfig
+from model.uttt_model import uTTTConfig, uTTTModel
 
 
 class InferenceWarmupTests(unittest.TestCase):
@@ -20,6 +20,7 @@ class InferenceWarmupTests(unittest.TestCase):
         result._warmup_complete = False
         result._warmup_compiled = False
         result.model = MagicMock()
+        result.model.INNER_LOOP_PROTOCOL = uTTTModel.INNER_LOOP_PROTOCOL
         result.model.stream_generate.side_effect = lambda **kwargs: iter(())
         return result
 
@@ -44,6 +45,20 @@ class InferenceWarmupTests(unittest.TestCase):
             result = uTTTPersonalizer(manager)
         self.assertIsNone(result._ttt_stream)
         stream.assert_not_called()
+
+    def test_only_compatible_meta_checkpoint_allocates_ttt_stream(self):
+        model = MagicMock()
+        model.INNER_LOOP_PROTOCOL = uTTTModel.INNER_LOOP_PROTOCOL
+        manager = SimpleNamespace(
+            model=model, config=uTTTConfig(vocab_size=512),
+            device=torch.device("cuda"), dtype=torch.bfloat16,
+            training_metadata={"training_stage": "meta", "inner_loop_protocol": model.INNER_LOOP_PROTOCOL},
+        )
+        with patch.object(torch.cuda, "Stream") as stream:
+            result = uTTTPersonalizer(manager)
+        self.assertTrue(result.online_updates_enabled)
+        self.assertIs(result._ttt_stream, stream.return_value)
+        stream.assert_called_once()
 
     def test_language_warmup_skips_memory_write_and_is_idempotent(self):
         result = self.personalizer(False)

@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from contextlib import nullcontext
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,10 +44,12 @@ from torch.utils.data import DataLoader, Dataset
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
-from engine.corpus import TokenizedCorpusDataset, read_manifest
+from engine.corpus import ResumableBatchSampler, TokenizedCorpusDataset, read_manifest
+from deploy.training_diagnostics import repetition_metrics
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
 _ACTIVE_SAVE_ERROR: Optional[Exception] = None
+_STOP_REQUESTED: Optional[int] = None
 
 
 def _wait_for_active_save() -> None:
@@ -63,11 +66,17 @@ atexit.register(_wait_for_active_save)
 
 
 def _graceful_signal_handler(signum: int, _frame: Any) -> None:
+    global _STOP_REQUESTED
+    if _STOP_REQUESTED is not None:
+        _STOP_REQUESTED = signum
+        print(f"[Train] Stop requested (signal {signum}); finishing the optimizer step and saving before exit.", flush=True)
+        return
     _wait_for_active_save()
     sys.exit(128 + signum)
 
 
 signal.signal(signal.SIGTERM, _graceful_signal_handler)
+signal.signal(signal.SIGINT, _graceful_signal_handler)
 if hasattr(signal, "SIGHUP"):
     signal.signal(signal.SIGHUP, _graceful_signal_handler)
 
@@ -389,6 +398,7 @@ def export_base_checkpoint(
     step: int,
     metrics: Dict[str, Any],
     async_save: bool = False,
+    training_state: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     Export the dual-track Base Checkpoint (`checkpoints/base_uttt.pt`).
@@ -418,6 +428,8 @@ def export_base_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict())
+    if training_state is not None:
+        payload["training_state"] = _cpu_copy_nested(training_state)
 
     def _write_to_disk() -> None:
         tmp_path = Path(str(out_path) + ".tmp")
@@ -498,17 +510,41 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
 
 
 @torch.no_grad()
-def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype, max_new_tokens=48):
+def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype, max_new_tokens=48,
+                                sample_seed=42, sample_temperature=0.8, sample_top_p=0.9):
+    """Compare greedy and repeatable stochastic decoding without consuming training RNG."""
+    if not 0 < max_new_tokens < model.config.max_seq_len:
+        raise ValueError("Validation generation must leave room for a prompt")
+    if sample_temperature <= 0 or not 0 < sample_top_p <= 1:
+        raise ValueError("Validation sampling requires positive temperature and top_p in (0, 1]")
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
     results = []
-    for prompt in prompts:
-        text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
-        ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
-        with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
-            generated = list(model.stream_generate(
-                torch.tensor([ids], device=device), model.init_fast_state(device=device, dtype=dtype, detach=True),
-                max_new_tokens=max_new_tokens, temperature=0.0,
-            ))
-        results.append({"prompt": prompt, "reply": tokenizer.decode(generated).strip(), "eos_generated": tokenizer.EOS_ID in generated})
+    # Save CPU and the selected CUDA RNG only. Additional diagnostic sampling
+    # must not change dropout, random crops, or the next training update.
+    with torch.random.fork_rng(devices=devices):
+        for index, prompt in enumerate(prompts):
+            text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
+            ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
+            for decoding, temperature in (("greedy", 0.0), ("sampled", sample_temperature)):
+                seed = int(sample_seed) + index
+                if decoding == "sampled":
+                    torch.random.default_generator.manual_seed(seed)
+                    if device.type == "cuda":
+                        with torch.cuda.device(device):
+                            torch.cuda.manual_seed(seed)
+                with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+                    generated = list(model.stream_generate(
+                        torch.tensor([ids], device=device), model.init_fast_state(device=device, dtype=dtype, detach=True),
+                        max_new_tokens=max_new_tokens, temperature=temperature, top_p=sample_top_p,
+                    ))
+                reply = tokenizer.decode(generated).strip()
+                results.append({
+                    "prompt": prompt, "reply": reply, "decoding": decoding,
+                    "temperature": temperature, "top_p": sample_top_p,
+                    "seed": seed if decoding == "sampled" else None,
+                    "generated_tokens": len(generated), "eos_generated": tokenizer.EOS_ID in generated,
+                    **repetition_metrics(generated, reply),
+                })
     return results
 
 
@@ -525,6 +561,33 @@ def same_training_data(saved_metrics, current_fingerprint: str, current_source: 
     return saved_metrics.get("data_source") == current_source
 
 
+def capture_training_rng():
+    state = {"cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_training_rng(state):
+    torch.set_rng_state(state["cpu"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def training_session(function):
+    @wraps(function)
+    def run(*args, **kwargs):
+        global _STOP_REQUESTED
+        previous, _STOP_REQUESTED = _STOP_REQUESTED, 0
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _STOP_REQUESTED = previous
+            _wait_for_active_save()
+    return run
+
+
+@training_session
 def train(
     config_path: str = "configs/5090_config.yaml",
     data_path: Optional[str] = None,
@@ -648,6 +711,8 @@ def train(
     grad_accum_steps = int(train_cfg.get("large_grad_accum_steps", 32) if large_preset else train_cfg.get("grad_accum_steps", 8))
     seq_len = override_seq_len or int(train_cfg.get("seq_len", 1024))
     max_steps = override_steps or int(train_cfg.get("max_steps", 2000))
+    if min(micro_batch_size, grad_accum_steps, max_steps) < 1 or seq_len < 2:
+        raise ValueError("Batch size, accumulation and steps must be positive; sequence length must be at least 2")
     warmup_steps = min(int(train_cfg.get("warmup_steps", 100)), max(1, max_steps // 5))
     max_outer_grad_norm = float(train_cfg.get("max_outer_grad_norm", 1.0))
     # Directly minimizing a learned reconstruction task has a trivial solution.
@@ -679,22 +744,22 @@ def train(
                 validation_fraction=float(train_cfg["validation_fraction"]), split_seed=seed,
             )
             print(f"[Data] Deduplicated train={len(dataset):,}, validation={len(validation_dataset):,} conversations; split before windowing.")
-    use_workers = device.type == "cuda" and os.name != "nt"
+    # Persona windows use torch.randint for random cropping. Keep them in the
+    # main process so checkpoint/OOM RNG restoration also restores their crops.
+    use_workers = device.type == "cuda" and os.name != "nt" and isinstance(dataset, TokenizedCorpusDataset)
+    batch_sampler = ResumableBatchSampler(len(dataset), micro_batch_size, seed)
 
     def _build_loader(mb_size: int) -> DataLoader:
+        batch_sampler.set_batch_size(mb_size)
         return DataLoader(
             dataset,
-            batch_size=mb_size,
-            shuffle=True,
-            drop_last=len(dataset) >= mb_size,
+            batch_sampler=batch_sampler,
+            generator=torch.Generator().manual_seed(seed),
             pin_memory=(device.type == "cuda"),
             num_workers=2 if use_workers else 0,
             persistent_workers=use_workers,
             prefetch_factor=4 if use_workers else None,
         )
-
-    loader = _build_loader(micro_batch_size)
-    data_iter = iter(loader)
 
     start_step = 1
     tokens_seen = 0
@@ -718,6 +783,8 @@ def train(
                 print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
         if saved is not None:
             metadata = saved.get("metrics", {})
+            if training_stage == "meta" and metadata.get("inner_loop_protocol") != model.INNER_LOOP_PROTOCOL:
+                raise ValueError("Resume checkpoint uses a different meta inner-loop protocol. Use a new output path and --init-from for an intentional protocol transition.")
             if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
                     or metadata.get("dataset_fingerprint") != dataset.fingerprint
                     or saved.get("config", {}).get("tokenizer_json") != model_cfg.tokenizer_json):
@@ -732,9 +799,13 @@ def train(
                     and saved_cfg.get("n_layers") == model_cfg.n_layers
                     and saved_cfg.get("d_ff_fast") == model_cfg.d_ff_fast
                     and saved_cfg.get("vocab_size") == model_cfg.vocab_size
+                    and saved_cfg.get("n_heads") == model_cfg.n_heads
+                    and saved_cfg.get("n_kv_heads") == model_cfg.n_kv_heads
                 )
                 is_causal_v2 = bool(saved_metrics.get("causal_ttt_v2", False))
                 same_data = same_training_data(saved_metrics, dataset.fingerprint, cur_data_tag)
+                if not dims_match or not is_causal_v2 or not same_data or saved_step < 1 or not math.isfinite(saved_loss):
+                    raise ValueError("Checkpoint model dimensions or training state are incompatible; use a new output path")
                 if dims_match and is_causal_v2 and same_data and saved_step >= max_steps and math.isfinite(saved_loss):
                     print(f"[Resume] Checkpoint already reached step {saved_step} (requested {max_steps}); leaving it unchanged.", flush=True)
                     return loaded_from
@@ -749,6 +820,15 @@ def train(
                     start_step = saved_step + 1
                     tokens_seen = int(saved_metrics.get("tokens_seen", 0))
                     best_validation_ce = float(saved_metrics.get("best_validation_ce", float("inf")))
+                    training_state = saved.get("training_state")
+                    if training_state is not None:
+                        batch_sampler.load_state_dict(training_state["data_cursor"])
+                        restore_training_rng(training_state["rng"])
+                        if (training_state.get("micro_batch_size") != micro_batch_size
+                                or training_state.get("grad_accum_steps") != grad_accum_steps):
+                            print("[Resume] Batch settings changed; data cursor restored, but numerical trajectory may differ.", flush=True)
+                    else:
+                        print("[Resume] Legacy checkpoint has no data cursor/RNG state; exact sample-order continuation is unavailable.", flush=True)
                     print(
                         f"[Resume] Resumed from {loaded_from} at step {saved_step}/{max_steps} "
                         f"(Last Loss: {saved_loss:.4f})",
@@ -766,7 +846,10 @@ def train(
             except Exception as exc:
                 raise RuntimeError(f"Could not restore state from {loaded_from}; checkpoint preserved") from exc
         else:
-            print(f"[Resume] No readable checkpoint found at {ckpt_file}; starting fresh.", flush=True)
+            raise RuntimeError(f"No readable checkpoint at {ckpt_file} or its backup; files preserved")
+
+    loader = _build_loader(micro_batch_size)
+    data_iter = iter(loader)
 
     # Compile full uTTTBlocks after weights are loaded so state_dict keys remain clean
     maybe_compile_inner_loop(
@@ -784,7 +867,7 @@ def train(
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
-        f"AccumulationAmpCache={cache_across_accumulation}",
+        f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -799,6 +882,8 @@ def train(
     steps_since_log = 0
     t_start = time.perf_counter()
 
+    if _STOP_REQUESTED:
+        raise SystemExit(128 + _STOP_REQUESTED)
     for step in range(start_step, max_steps + 1):
         # Update learning rates for both parameter groups
         cur_slow_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, outer_lr)
@@ -807,10 +892,12 @@ def train(
         optimizer.param_groups[1]["lr"] = cur_fast_lr
 
         optimizer.zero_grad(set_to_none=True)
+        step_cursor = batch_sampler.state_dict()
+        step_rng = capture_training_rng()
 
         # Runtime Elastic OOM Self-Healing Guard:
         # If any step exceeds VRAM, automatically enable Layer Checkpointing (Stage 1),
-        # halve micro_batch_size (Stage 2), or enable 2-level Chunk Checkpointing (Stage 3).
+        # disable cached casts, or reduce micro-batches while preserving effective batch.
         while True:
             try:
                 step_loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
@@ -856,6 +943,7 @@ def train(
                         with (torch.amp.autocast(autocast_device_type, enabled=False)
                               if cache_across_accumulation else nullcontext()):
                             scaled_loss.backward()
+                        batch_sampler.advance(input_ids.shape[0])
 
                         step_loss_gpu += out.loss.detach().float() * inv_accum
                         step_ce_gpu += out.ce_loss.detach().float() * inv_accum
@@ -864,10 +952,13 @@ def train(
                 break
             except torch.OutOfMemoryError:
                 optimizer.zero_grad(set_to_none=True)
+                # Release the failed graph before asking the CUDA allocator to
+                # free cached blocks; otherwise the retry can retain its peak.
+                out = scaled_loss = input_ids = labels = attention_mask = None
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 if not model.gradient_checkpointing:
-                    # Stage 1: Enable Layer Gradient Checkpointing while keeping full MicroBatch=8
+                    # Enable the checkpointing path implemented by this stage.
                     model.gradient_checkpointing = True
                     model_cfg.gradient_checkpointing = True
                     print(
@@ -889,10 +980,9 @@ def train(
                     )
                 elif micro_batch_size > 1:
                     # Stage 2: Halve MicroBatch and double GradAccum (preserving EffectiveBatch)
-                    micro_batch_size = max(1, micro_batch_size // 2)
-                    grad_accum_steps = grad_accum_steps * 2
-                    loader = _build_loader(micro_batch_size)
-                    data_iter = iter(loader)
+                    effective_batch = micro_batch_size * grad_accum_steps
+                    micro_batch_size = math.gcd(effective_batch, max(1, micro_batch_size // 2))
+                    grad_accum_steps = effective_batch // micro_batch_size
                     print(
                         f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM! Dynamically scaled to "
                         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps} "
@@ -900,19 +990,20 @@ def train(
                         flush=True,
                     )
                 else:
-                    # Stage 3: Enable 2-level Intra-Layer Chunk Segment Checkpointing
-                    max_segments = (seq_len + model_cfg.chunk_size - 1) // model_cfg.chunk_size
-                    if all(blk.uttt.chunk_checkpoint_segments >= max_segments for blk in model.layers):
-                        raise RuntimeError("CUDA OOM persists at batch size 1 with maximal checkpointing; reduce sequence/model size")
-                    for blk in model.layers:
-                        blk.uttt.chunk_checkpoint_segments = min(
-                            max_segments, max(4, blk.uttt.chunk_checkpoint_segments * 2)
-                        )
-                    print(
-                        f"[VRAM-Guard][Step {step:04d}] Caught CUDA OOM at MicroBatch=1! Enabled 2-level "
-                        f"Chunk Segment Checkpointing (segments={model.layers[0].uttt.chunk_checkpoint_segments}). Retrying...",
-                        flush=True,
+                    # Frozen reads do not run per-layer chunk segments, and
+                    # shared meta writes checkpoint whole causal chunks.
+                    # Increasing the old segment knob cannot reduce either
+                    # path's memory and only repeats the same failed work.
+                    raise RuntimeError(
+                        "CUDA OOM persists at batch size 1 after all effective checkpoint/cache mitigations; "
+                        "reduce sequence/model size or use optimizer offload"
                     )
+                # Prefetch may have run ahead, but the committed step cursor and
+                # random state are authoritative. Retry the same samples.
+                batch_sampler.load_state_dict(step_cursor)
+                restore_training_rng(step_rng)
+                loader = _build_loader(micro_batch_size)
+                data_iter = iter(loader)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -931,7 +1022,7 @@ def train(
         steps_since_log += 1
 
         should_log = (step % log_interval == 0) or (step == start_step)
-        should_save = (step % save_interval == 0) or (step == max_steps)
+        should_save = (step % save_interval == 0) or (step == max_steps) or bool(_STOP_REQUESTED)
 
         improved = False
         if validation_dataset is not None and (step % evaluation_interval == 0 or step == start_step or step == max_steps):
@@ -941,14 +1032,19 @@ def train(
             )
             improved = validation_metrics["validation_ce"] < best_validation_ce
             best_validation_ce = min(best_validation_ce, validation_metrics["validation_ce"])
-            print(f"[Validation {step}] CE={validation_metrics['validation_ce']:.4f} | Frozen CE={validation_metrics['validation_frozen_ce']:.4f} | Tokens seen={tokens_seen:,}", flush=True)
+            print(f"[Validation {step}] CE={validation_metrics['validation_ce']:.4f} | Frozen CE={validation_metrics['validation_frozen_ce']:.4f} | Tokens seen={tokens_seen:,} | Stage: {training_stage} | TTT: {'enabled' if update_fast_weights else 'disabled'}", flush=True)
             if train_cfg.get("eval_prompts"):
                 validation_metrics["validation_samples"] = generate_validation_samples(
                     model, tokenizer, train_cfg["eval_prompts"], training_stage, device, amp_dtype,
                     max_new_tokens=int(train_cfg.get("eval_new_tokens", 48)),
+                    sample_seed=int(train_cfg.get("eval_sample_seed", seed)),
+                    sample_temperature=float(train_cfg.get("eval_sample_temperature", 0.8)),
+                    sample_top_p=float(train_cfg.get("eval_sample_top_p", 0.9)),
                 )
                 for sample in validation_metrics["validation_samples"]:
                     print("[Validation sample] " + json.dumps(sample, ensure_ascii=False), flush=True)
+        should_save = should_save or bool(_STOP_REQUESTED)
+        checkpoint_saved = False
         if should_log or should_save or improved:
             sync_vals = torch.stack(
                 [
@@ -990,9 +1086,9 @@ def train(
                     else 0.0
                 )
                 print(
-                    f"[Step {step:04d}/{max_steps:04d}] "
+                    f"[Step {step:04d}/{max_steps:04d}] Stage: {training_stage} | "
                     f"Total Loss: {avg_loss:.4f} | CE Loss: {avg_ce:.4f} | "
-                    f"Surprise Loss: {avg_surp:.4f} | GradNorm: {grad_norm_val:.3f} | "
+                    f"Surprise Loss: {f'{avg_surp:.6f}' if update_fast_weights else 'disabled'} | GradNorm: {grad_norm_val:.3f} | "
                     f"LR: {cur_slow_lr:.2e} | Speed: {tok_per_sec:,.0f} tok/s | "
                     f"Peak VRAM: {vram_gb:.2f} GB",
                     flush=True,
@@ -1004,8 +1100,11 @@ def train(
                     "total_loss": step_loss_accum,
                     "ce_loss": step_ce_accum,
                     "surprise_loss": step_surprise_accum,
+                    "ttt_updates_enabled": update_fast_weights,
+                    "surprise_loss_measured": update_fast_weights,
                     "causal_ttt_v2": True,
                     "training_pipeline": 3, "training_stage": training_stage,
+                    "inner_loop_protocol": model.INNER_LOOP_PROTOCOL,
                     "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),
                     "run_id": os.environ.get("UTTT_RUN_ID"),
                     "dataset_fingerprint": dataset.fingerprint, "tokens_seen": tokens_seen,
@@ -1024,11 +1123,17 @@ def train(
                     save_path=ckpt_path,
                     step=step,
                     metrics=metrics,
-                    async_save=(step < max_steps),
+                    async_save=(step < max_steps and not _STOP_REQUESTED),
+                    training_state={"data_cursor": batch_sampler.state_dict(), "rng": capture_training_rng(),
+                                    "micro_batch_size": micro_batch_size, "grad_accum_steps": grad_accum_steps},
                 )
                 if improved:
                     best_path = str(Path(ckpt_path).with_suffix(".best.pt"))
                     export_base_checkpoint(model, None, model_cfg, best_path, step, metrics)
+                checkpoint_saved = True
+        if _STOP_REQUESTED and checkpoint_saved:
+            _wait_for_active_save()
+            raise SystemExit(128 + _STOP_REQUESTED)
 
     _wait_for_active_save()
     return Path(ckpt_path)

@@ -176,12 +176,26 @@ async def _on_engine_thread(func, *args, **kwargs):
     future = asyncio.get_running_loop().run_in_executor(
         app.state.engine_executor, partial(func, *args, **kwargs)
     )
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        # Do not release the operation lock while its worker is still running.
-        await asyncio.shield(future)
-        raise
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError:
+            if future.done():
+                if not future.cancelled():
+                    future.exception()  # Retrieve any worker exception before propagating cancellation.
+                raise
+            # Repeated cancellation (disconnect followed by shutdown/timeout)
+            # must not release the operation lock while the worker still runs.
+            cancelled = True
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError() from None
+            raise
+    if cancelled:
+        raise asyncio.CancelledError()
+    return result
 
 
 async def _run_engine(func, *args, **kwargs):
@@ -206,7 +220,9 @@ async def _stream_engine(engine, req):
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
     engine = get_personalizer()
-    pool = engine.ckpt_manager.pool_status()
+    # pool_status takes the manager's lock, which may be held by a worker doing
+    # disk I/O or a GPU->CPU copy. Never block the WebSocket event loop on it.
+    pool = await asyncio.to_thread(engine.ckpt_manager.pool_status)
     vram_allocated_gb = (
         torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
     )

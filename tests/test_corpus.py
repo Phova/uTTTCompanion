@@ -93,7 +93,9 @@ class CorpusTests(unittest.TestCase):
             saved = torch.load(checkpoint, weights_only=False)
             self.assertEqual(saved["metrics"]["dataset_fingerprint"], "fixture:train")
             self.assertIn("validation_ce", saved["metrics"])
-            self.assertEqual(len(saved["metrics"]["validation_samples"]), 1)
+            samples = saved["metrics"]["validation_samples"]
+            self.assertEqual([sample["decoding"] for sample in samples], ["greedy", "sampled"])
+            self.assertIsNotNone(samples[1]["seed"])
             self.assertIsNotNone(saved["config"]["tokenizer_json"])
 
     @unittest.skipUnless(os.name == "posix", "Linux/WSL pipeline")

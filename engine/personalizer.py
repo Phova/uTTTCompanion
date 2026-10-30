@@ -74,10 +74,10 @@ def format_ttt_status_bar(
     Format the canonical single-line CLI status bar required by MODULE 2:
         `[TTT Status] Surprise Loss: 0.42 | Weight Drift from Base: 3.18% | Persona Saved`
     """
-    if persona_saved:
+    if not gate_triggered:
+        save_label = "Gate Skipped (Low Surprise)" + (" | Persona Saved" if persona_saved else "")
+    elif persona_saved:
         save_label = "Persona Saved"
-    elif not gate_triggered:
-        save_label = "Gate Skipped (Low Surprise)"
     else:
         save_label = "In-Memory Updated"
 
@@ -123,7 +123,14 @@ class uTTTPersonalizer:
         self.device = self.ckpt_manager.device
         self.dtype = self.ckpt_manager.dtype
         self.tokenizer = build_tokenizer(self.config)
-        self.online_updates_enabled = self.ckpt_manager.training_metadata.get("training_stage") not in {"pretrain", "sft"}
+        metadata = self.ckpt_manager.training_metadata
+        protocol = getattr(self.model, "INNER_LOOP_PROTOCOL", None)
+        self.online_updates_enabled = (
+            metadata.get("training_stage") == "meta" and isinstance(protocol, str)
+            and metadata.get("inner_loop_protocol") == protocol
+        )
+        if not self.online_updates_enabled:
+            print("[Personalizer] Online TTT disabled: memory writes require compatible meta-training.")
 
         # Stability Guard hyperparameters (auto-calibrate when normalize_loss_by_dim=True)
         raw_thresh = (
@@ -144,6 +151,12 @@ class uTTTPersonalizer:
             if max_weight_drift_ratio is not None
             else float(self.config.max_weight_drift_ratio)
         )
+        if not math.isfinite(self.surprise_threshold) or self.surprise_threshold < 0:
+            raise ValueError("surprise_threshold must be finite and non-negative")
+        if not math.isfinite(self.elastic_anchor_lambda) or not 0 <= self.elastic_anchor_lambda <= 1:
+            raise ValueError("elastic_anchor_lambda must be finite and between 0 and 1")
+        if not math.isfinite(self.max_weight_drift_ratio) or self.max_weight_drift_ratio < 0:
+            raise ValueError("max_weight_drift_ratio must be finite and non-negative")
         self.auto_save_every_turn = auto_save_every_turn
         self.default_max_new_tokens = default_max_new_tokens
         self.temperature = temperature
@@ -373,7 +386,7 @@ class uTTTPersonalizer:
         autocast_dev = "cuda" if self.device.type == "cuda" else "cpu"
 
         with torch.amp.autocast(autocast_dev, dtype=self.dtype, enabled=self.dtype != torch.float32):
-            for tok_id in self.model.stream_generate(
+            generation = self.model.stream_generate(
                 input_ids=input_tensor,
                 fast_state=user_state,
                 max_new_tokens=max_tokens,
@@ -381,12 +394,18 @@ class uTTTPersonalizer:
                 top_p=tp,
                 eos_token_id=self.tokenizer.EOS_ID,
                 use_cuda_graph=os.environ.get("UTTT_CUDA_GRAPH", "1") != "0",
-            ):
-                generated_ids.append(tok_id)
-                piece = text_stream.push(tok_id)
-                if piece:
-                    emitted_len += len(piece)
-                    yield {"type": "token", "content": piece}
+            )
+            try:
+                for tok_id in generation:
+                    generated_ids.append(tok_id)
+                    piece = text_stream.push(tok_id)
+                    if piece:
+                        emitted_len += len(piece)
+                        yield {"type": "token", "content": piece}
+            finally:
+                close = getattr(generation, "close", None)
+                if callable(close):
+                    close()
 
         reply_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).replace("\ufffd", "").strip()
         if len(reply_text) > emitted_len:
@@ -406,7 +425,7 @@ class uTTTPersonalizer:
                 gate_triggered=False, weight_drift_frobenius=float(drift["drift_frobenius"]),
                 weight_drift_pct=float(drift["drift_pct"]), persona_saved=False,
                 persona_path=str(primary_path), step=int(drift["step"]),
-                status_bar="[LM Status] Online TTT disabled until the meta-training stage.",
+                status_bar="[LM Status] Online TTT disabled: memory writes require compatible meta-training.",
                 drift_details=drift,
             )
             yield {"type": "ttt_status", "result": result.to_dict()}
@@ -456,6 +475,8 @@ class uTTTPersonalizer:
         # ======================================================================
         # Step 3 (Stability Guard): Surprise Threshold Gate + Elastic Anchor Pull
         # ======================================================================
+        if not math.isfinite(surprise_loss) or surprise_loss < 0:
+            raise ValueError("Test-time update returned a non-finite or negative surprise loss; persona was not changed")
         gate_triggered = bool(surprise_loss > self.surprise_threshold)
         persona_saved = False
         primary_path, _ = self.ckpt_manager.get_persona_paths(user_id)
@@ -475,11 +496,12 @@ class uTTTPersonalizer:
             )
             persona_saved = saved_path is not None
         else:
-            # Below surprise threshold tau: skip weight modification, record surprise metric
-            user_state.last_surprise_loss = surprise_loss
-            if self.auto_save_every_turn and not primary_path.exists():
-                self.ckpt_manager.save_user_state(user_id)
-                persona_saved = True
+            # Preserve weights/step while durably recording every completed turn,
+            # including later gated-off turns after the persona already exists.
+            saved_path = self.ckpt_manager.record_user_turn(
+                user_id, surprise_loss, auto_save=self.auto_save_every_turn,
+            )
+            persona_saved = saved_path is not None
 
         drift_metrics = self.ckpt_manager.compute_user_drift(user_id)
         drift_fro = float(drift_metrics["drift_frobenius"])

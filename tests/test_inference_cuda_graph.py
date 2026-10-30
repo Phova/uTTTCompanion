@@ -122,6 +122,18 @@ class CUDAGraphDecodeTests(unittest.TestCase):
             model.layers[0].attn.wq.weight.add_(0.125)
         self.assertFalse(decoder.matches(model, state))
 
+    def test_fp32_persona_master_uses_bf16_graph_reads_without_losing_master_bits(self):
+        model, state = self.make_model()
+        state = state.to(dtype=torch.float32)
+        state.w_up.add_(1e-5)
+        before = state.w_up.clone()
+        caches = self.prefill(model, state, self.tokens(3, 371))
+        self.assertTrue(CUDAGraphDecoder.is_supported(model, state, caches, 3))
+        decoder = CUDAGraphDecoder(model, state, caches, 3)
+        self.check_steps(model, state, decoder, caches, 3, self.tokens(13, 372))
+        self.assertEqual(state.w_up.dtype, torch.float32)
+        torch.testing.assert_close(state.w_up, before, atol=0, rtol=0)
+
     def test_exported_window_resumes_eager_in_chronological_order(self):
         model, state = self.make_model()
         caches = self.prefill(model, state, self.tokens(3, 400))
