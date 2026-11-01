@@ -22,6 +22,8 @@ Windows SSH 的 `exec request failed on channel 0` 已通过非PTY流连接和�
 
 2026-11-01 在已有 DeepInfer 风格运行时优化之上继续审计，修复长上下文相位、人格缓存事务、长输入模板、续训状态和采样边界；新增每请求独立随机流。适用范围、实测与后续路线见 [增量优化与 uTTT 训练阶段核查](docs/deepinfer_uttt_audit_20261101.md)。**当前自动任务为 pretrain → SFT → evaluate，不包含 meta；其产物尚未学习在线记忆写入。** `surprise_aux_loss_weight=0` 不等于关闭内循环，区别见该记录。
 
+后续保存到55859步应用更新；真实1.584B验证耗时2.888→2.647秒、CE一致，新增单次采样复制优化。选择性元训练在T1024和T256的精确反向均未通过28GiB预算，详见[应用与GPU实测](docs/applied_optimization_20261101.md)。
+
 ## 可靠性修复与兼容说明
 
 - 人格自动保存现在按顺序完成原子落盘后才返回 `Persona Saved`，磁盘写入失败会返回错误。相比后台保存，每轮结束可能增加少量磁盘等待时间。

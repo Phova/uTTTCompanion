@@ -971,7 +971,9 @@ class uTTTModel(nn.Module):
             raise ValueError("Sampling logits must have batch and vocabulary dimensions")
         if active_vocab_limit is not None and active_vocab_limit <= SimpleUTF8Tokenizer.EOS_ID:
             raise ValueError("Active vocabulary must include EOS")
-        work_logits = logits.float().clone()
+        # Convert and make independent storage in one operation. float().clone()
+        # performs two copies when incoming logits are FP16/BF16.
+        work_logits = logits.to(dtype=torch.float32, copy=True)
         # Mask out PAD/BOS/UNK and unallocated upper vocab IDs
         # A finite sentinel can win against valid logits below -1e9.
         work_logits[:, SimpleUTF8Tokenizer.PAD_ID] = -torch.inf
