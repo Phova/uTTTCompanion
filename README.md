@@ -20,6 +20,8 @@ Windows SSH 的 `exec request failed on channel 0` 已通过非PTY流连接和�
 
 第21500步保存后的 `InterruptedError` 属于计划停止，现已改为简短中断提示；同一检查点的贪心、随机采样、受控生成及语料重复审计见 [重复输出诊断](docs/repetition_training_audit_20261030.md)。模型仍处于早期预训练，解码约束的改善不等于权重质量已经合格。
 
+2026-11-01 在已有 DeepInfer 风格运行时优化之上继续审计，修复长上下文相位、人格缓存事务、长输入模板、续训状态和采样边界；新增每请求独立随机流。适用范围、实测与后续路线见 [增量优化与 uTTT 训练阶段核查](docs/deepinfer_uttt_audit_20261101.md)。**当前自动任务为 pretrain → SFT → evaluate，不包含 meta；其产物尚未学习在线记忆写入。** `surprise_aux_loss_weight=0` 不等于关闭内循环，区别见该记录。
+
 ## 可靠性修复与兼容说明
 
 - 人格自动保存现在按顺序完成原子落盘后才返回 `Persona Saved`，磁盘写入失败会返回错误。相比后台保存，每轮结束可能增加少量磁盘等待时间。
@@ -196,6 +198,7 @@ DOCKER_IMAGE=uttt-rtx5090:latest     # USE_DOCKER=1 时的镜像名称
 | 参数 | 类型 / 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `--config` | `str` (`configs/5090_config.yaml`) | 指定 YAML 配置文件路径 |
+| `--stage` | `pretrain` / `sft` / `meta`（默认取配置） | 只有 `meta` 执行可微的快权重写入；当前默认配置为 `pretrain` |
 | `--data-path` | `str` (`None`) | 指定外部训练语料路径（支持 `.jsonl` 含 `text`/`content` 字段或纯文本 `.txt`；不传则默认使用内置 `PersonaMetaDataset` 合成多轮偏好记忆数据） |
 | `--output-ckpt` | `str` (`checkpoints/base_uttt.pt`) | 自定义导出的 Base Checkpoint 保存路径 |
 | `--steps` | `int` (`2000`) | 覆盖配置文件中的总训练步数 `max_steps` |
@@ -205,11 +208,11 @@ DOCKER_IMAGE=uttt-rtx5090:latest     # USE_DOCKER=1 时的镜像名称
 
 **常用训练指令示例**：
 ```bash
-# 1. 快速冒烟验证（跑 50 步轻量模型，验证训练与 base_uttt.pt 导出）
-./deploy/remote_ctl.sh train --lightweight --steps 50
+# 1. 轻量元训练冒烟验证，使用独立的输出路径
+./deploy/remote_ctl.sh train --stage meta --lightweight --steps 50 --output-ckpt checkpoints/meta_smoke.pt
 
-# 2. 完整 RTX 5090 生产级元训练（默认 2000 步，每 200 步自动原子保存 base_uttt.pt）
-./deploy/remote_ctl.sh train
+# 2. 元训练接口示例；正式模型先验证完整元训练容量与初始化配置
+./deploy/remote_ctl.sh train --stage meta --output-ckpt checkpoints/base_meta.pt
 
 # 3. 使用自定义 JSONL 数据集训练 5000 步
 ./deploy/remote_ctl.sh train --data-path /workspace/data/dialogues.jsonl --steps 5000 --batch-size 4 --seq-len 1024
@@ -334,7 +337,7 @@ python -m server.app \
    ```
 
 5. **全双工流式生成与 TTT 更新 (`WS /ws/chat/{user_id}`)**：
-   - **客户端发送**：`{"prompt": "你好", "max_new_tokens": 64, "temperature": 0.7}`
+   - **客户端发送**：`{"prompt": "你好", "max_new_tokens": 64, "temperature": 0.7, "seed": 42}`；`seed` 可省略。固定种子隔离本请求的目标采样随机流，复现仍需相同模型、人格状态、输入及算子设置。
    - **服务端流式推送**：
      - 连接就绪帧：`{"type": "session_ready", "user_id": "alex", "step": 4, "weight_drift_pct": 1.25}`
      - 流式 Token 帧：`{"type": "token", "content": "..."}`

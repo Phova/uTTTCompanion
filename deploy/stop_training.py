@@ -1,5 +1,7 @@
 """Stop only a selected tmux/nohup training tree and wait for checkpoint writes."""
 import argparse
+import json
+import re
 import os
 from pathlib import Path
 import signal
@@ -106,16 +108,48 @@ def stop(roots, workspace, timeout=300, scripts=TRAINING_SCRIPTS):
     return selected
 
 
-def stop_container(name, timeout):
-    def running():
-        result = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
-                                capture_output=True, text=True)
-        return result.returncode == 0 and result.stdout.strip() == "true"
-    if not running():
+def _inspect_container(name):
+    result = subprocess.run(["docker", "inspect", "--type", "container", name],
+                            capture_output=True, text=True)
+    if result.returncode:
+        if any(message in result.stderr.lower() for message in ("no such object:", "no such container:")):
+            return None
+        raise RuntimeError(f"Cannot inspect Docker container {name}: {result.stderr.strip()}")
+    records = json.loads(result.stdout)
+    if len(records) != 1 or not isinstance(records[0].get("State", {}).get("Running"), bool):
+        raise RuntimeError("Docker returned an invalid container state; refusing stop")
+    return records[0]
+
+
+def stop_container(name, timeout, workspace):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+        raise ValueError("Container must be an exact Docker name or ID")
+    record = _inspect_container(name)
+    if record is None:
         return
-    subprocess.run(["docker", "kill", "--signal", "TERM", name], check=True)
+    # Both train and serve mount this exact directory. Resolve symlinks so an
+    # immutable snapshot's checkpoints link remains a valid owned mount.
+    expected = (workspace.resolve() / "checkpoints").resolve()
+    owned = any(mount.get("Type") == "bind"
+                and mount.get("Destination") == "/workspace/uTTT/checkpoints"
+                and mount.get("Source") and Path(mount["Source"]).is_absolute()
+                and Path(mount.get("Source", "")).resolve() == expected
+                for mount in record.get("Mounts", []))
+    if not owned:
+        raise RuntimeError("Container checkpoint mount belongs to another workspace; refusing stop")
+    container_id = record.get("Id", "")
+    if not re.fullmatch(r"[a-fA-F0-9]{64}", container_id):
+        raise RuntimeError("Docker returned an invalid container ID; refusing stop")
+    if not record["State"]["Running"]:
+        return
+    # Pin the immutable ID before signaling/waiting. A new container reusing
+    # the original name must never be selected later in this operation.
+    subprocess.run(["docker", "kill", "--signal", "TERM", container_id], check=True)
     deadline = time.monotonic() + timeout
-    while running():
+    while True:
+        current = _inspect_container(container_id)
+        if current is None or not current["State"]["Running"]:
+            return
         if time.monotonic() >= deadline:
             raise RuntimeError("Container is still stopping; it was preserved for inspection")
         time.sleep(0.2)
@@ -128,7 +162,7 @@ def main():
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--kind", choices=["training", "serve"], default="training")
-    parser.add_argument("--container", help="Also gracefully stop this exact named Docker container")
+    parser.add_argument("--container", help="Stop this workspace's exact Docker container instead of a native process tree")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("timeout must be positive")
@@ -140,9 +174,17 @@ def main():
     if args.pid_file is not None and args.pid_file.exists():
         roots.append(int(args.pid_file.read_text().strip()))
     scripts = TRAINING_SCRIPTS if args.kind == "training" else {"server.app"}
-    stopped = stop(roots, args.workspace, args.timeout, scripts)
     if args.container:
-        stop_container(args.container, args.timeout)
+        workspace = args.workspace.resolve()
+        table = process_table()
+        if any(pid in table and not table[pid]["cwd"].is_relative_to(workspace) for pid in roots):
+            raise RuntimeError("Live session/PID root belongs to another workspace; refusing container stop")
+        # Container processes are children of the Docker daemon, not the tmux
+        # pane's docker client. Native tree discovery cannot find them.
+        stop_container(args.container, args.timeout, workspace)
+        stopped = []
+    else:
+        stopped = stop(roots, args.workspace, args.timeout, scripts)
     print(f"Stopped selected {args.kind} processes: {stopped}", flush=True)
 
 

@@ -45,6 +45,7 @@ import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
 from engine.corpus import ResumableBatchSampler, TokenizedCorpusDataset, read_manifest
+from engine.prompting import encode_chat_prompt
 from deploy.training_diagnostics import repetition_metrics
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
@@ -533,21 +534,32 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
     try:
         count_batches = min(len(dataset), max_batches)
         indices = [index * (len(dataset) - 1) // max(1, count_batches - 1) for index in range(count_batches)]
-        for index in indices:
-            batch = dataset[index]
-            count = int((batch["labels"][1:] != -100).sum())
-            if not count:
-                continue
-            inputs = {name: value.unsqueeze(0).to(device) for name, value in batch.items()}
-            with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
-                result = model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0)
+        # Weights stay fixed for this complete pass. Reuse autocast's parameter
+        # casts between samples, then discard them before training can update W.
+        with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+            # Match forward's embedding/activation dtype policy. Reusing this
+            # view also avoids explicitly recasting the shared W for every item.
+            read_dtype = (torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled()
+                          else model.tok_embeddings.weight.dtype)
+            frozen_state = model.fast_weight_pool.readonly_state(
+                batch_size=1, device=device, dtype=read_dtype, detach=True,
+            )
+            for index in indices:
+                batch = dataset[index]
+                count = int((batch["labels"][1:] != -100).sum())
+                if not count:
+                    continue
+                inputs = {name: value.unsqueeze(0).to(device) for name, value in batch.items()}
+                result = model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0,
+                               return_fast_state=False, fast_state=None if update_fast_weights else frozen_state)
                 nll += float(result.ce_loss) * count
                 if update_fast_weights:
-                    frozen = model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0)
+                    frozen = model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0,
+                                   return_fast_state=False, fast_state=frozen_state)
                     frozen_nll += float(frozen.ce_loss) * count
                 else:
                     frozen_nll += float(result.ce_loss) * count
-            targets += count
+                targets += count
         if not targets:
             raise ValueError("Validation split has no supervised next-token targets")
         return {"validation_ce": nll / targets, "validation_frozen_ce": frozen_nll / targets,
@@ -583,8 +595,9 @@ def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype,
                 batch_size=1, device=device, dtype=dtype, detach=True,
             )
             for index, prompt in enumerate(prompts):
-                text = prompt if stage == "pretrain" else f"<|user|> {prompt}\n<|assistant|> "
-                ids = tokenizer.encode(text, add_bos=True, max_length=model.config.max_seq_len - max_new_tokens)
+                prompt_budget = model.config.max_seq_len - max_new_tokens
+                ids = (tokenizer.encode(prompt, add_bos=True, max_length=prompt_budget)
+                       if stage == "pretrain" else encode_chat_prompt(tokenizer, prompt, prompt_budget))
                 for decoding, temperature in (("greedy", 0.0), ("sampled", sample_temperature)):
                     seed = int(sample_seed) + index
                     if decoding == "sampled":
@@ -637,6 +650,48 @@ def restore_training_rng(state):
     torch.set_rng_state(state["cpu"])
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def validate_resume_optimizer_state(optimizer, saved_state, saved_step):
+    """Reject weight-only or malformed Adam resumes before any model mutation.
+
+    Parameters with no gradients legitimately have no Adam state (e.g. frozen
+    language-stage writers). Validate the states that do exist, without scanning
+    the multi-gigabyte moment tensors or requiring inactive states to be created.
+    """
+    if not isinstance(saved_state, dict) or not saved_state.get("state"):
+        raise ValueError("Resume requires a full checkpoint with AdamW optimizer state; use --init-from for weights only")
+    saved_groups = saved_state.get("param_groups", [])
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise ValueError("Resume AdamW parameter groups do not match the model")
+    parameters = {}
+    for current, saved in zip(optimizer.param_groups, saved_groups):
+        saved_ids = saved.get("params", [])
+        if (len(saved_ids) != len(current["params"])
+                or ("name" in saved and saved["name"] != current.get("name"))):
+            raise ValueError("Resume AdamW parameter groups do not match the model")
+        for key, parameter in zip(saved_ids, current["params"]):
+            if key in parameters:
+                raise ValueError("Resume AdamW parameter IDs are duplicated")
+            parameters[key] = parameter
+    for key, state in saved_state["state"].items():
+        if key not in parameters or not isinstance(state, dict):
+            raise ValueError("Resume AdamW state refers to an unknown parameter")
+        for name in ("exp_avg", "exp_avg_sq"):
+            tensor = state.get(name)
+            if not isinstance(tensor, torch.Tensor) or tensor.shape != parameters[key].shape:
+                raise ValueError(f"Resume AdamW {name} shape does not match its parameter")
+        if "max_exp_avg_sq" in state and state["max_exp_avg_sq"].shape != parameters[key].shape:
+            raise ValueError("Resume AdamW max_exp_avg_sq shape does not match its parameter")
+        raw_step = state.get("step")
+        if isinstance(raw_step, torch.Tensor) and raw_step.numel() != 1:
+            raise ValueError("Resume AdamW step must be a scalar")
+        try:
+            step = float(raw_step)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError("Resume AdamW step is missing or invalid") from exc
+        if not math.isfinite(step) or not step.is_integer() or not 0 < step <= saved_step:
+            raise ValueError("Resume AdamW step is inconsistent with the saved training step")
 
 
 def training_session(function):
@@ -871,6 +926,7 @@ def train(
                 same_data = same_training_data(saved_metrics, dataset.fingerprint, cur_data_tag)
                 if not dims_match or not is_causal_v2 or not same_data or saved_step < 1 or not math.isfinite(saved_loss):
                     raise ValueError("Checkpoint model dimensions or training state are incompatible; use a new output path")
+                validate_resume_optimizer_state(optimizer, saved.get("optimizer_state"), saved_step)
                 if dims_match and is_causal_v2 and same_data and saved_step >= max_steps and math.isfinite(saved_loss):
                     print(f"[Resume] Checkpoint already reached step {saved_step} (requested {max_steps}); leaving it unchanged.", flush=True)
                     return loaded_from
@@ -880,8 +936,7 @@ def train(
                         saved["init_fast_weights"],
                         strict=True,
                     )
-                    if "optimizer_state" in saved:
-                        optimizer.load_state_dict(saved["optimizer_state"])
+                    optimizer.load_state_dict(saved["optimizer_state"])
                     start_step = saved_step + 1
                     tokens_seen = int(saved_metrics.get("tokens_seen", 0))
                     best_validation_ce = float(saved_metrics.get("best_validation_ce", float("inf")))
@@ -945,6 +1000,7 @@ def train(
     running_ce_gpu = torch.zeros((), device=device, dtype=torch.float32)
     running_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
     steps_since_log = 0
+    tokens_since_log = 0
     t_start = time.perf_counter()
 
     if _STOP_REQUESTED:
@@ -1088,6 +1144,7 @@ def train(
         running_ce_gpu += step_ce_gpu
         running_surprise_gpu += step_surprise_gpu
         steps_since_log += 1
+        tokens_since_log += step_tokens
 
         should_log = (step % log_interval == 0) or (step == start_step)
         should_save = (step % save_interval == 0) or (step == max_steps) or bool(_STOP_REQUESTED)
@@ -1146,8 +1203,10 @@ def train(
                 steps_since_log = 0
 
                 elapsed = max(1e-6, time.perf_counter() - t_start)
-                tokens_processed = divisor * micro_batch_size * grad_accum_steps * seq_len
-                tok_per_sec = tokens_processed / elapsed
+                # Match tokens_seen: padding and a dataset smaller than the
+                # requested micro-batch must not inflate the throughput figure.
+                tok_per_sec = tokens_since_log / elapsed
+                tokens_since_log = 0
                 vram_gb = (
                     torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                     if device.type == "cuda"

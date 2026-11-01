@@ -143,7 +143,7 @@ while True:
     def is_running(pid):
         try:
             return Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0] != "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
 
     def test_hup_and_term_clean_collector_descendants(self):

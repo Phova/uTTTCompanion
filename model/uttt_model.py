@@ -73,8 +73,8 @@ class uTTTConfig:
     gradient_checkpointing_every: int = 1
     tie_word_embeddings: bool = True
     write_schedule: str = "sequential"          # Chunk-first causal reads, sequential boundary writes
-    dspark_speculative_k: int = 0               # DeepInfer DSpark speculative draft length (0=off)
-    dspark_conf_threshold: float = 0.82         # Confidence gate for DSpark draft token proposal
+    dspark_speculative_k: int = 0               # Legacy name: experimental self-draft length (0=off)
+    dspark_conf_threshold: float = 0.82         # Confidence gate; not an official DeepInfer implementation
     tokenizer_json: Optional[str] = None       # Embedded byte-level BPE for new checkpoints
     repetition_penalty: float = 1.0            # Character tokens must not penalize common letters
 
@@ -747,15 +747,23 @@ class uTTTModel(nn.Module):
         speculative_draft_k: Optional[int] = None,
         dspark_conf_threshold: Optional[float] = None,
         use_cuda_graph: bool = False,
+        generator: Optional[torch.Generator] = None,
     ) -> Iterator[int]:
         """
         Step 1 of `interact_and_evolve`:
         Freeze `fast_state` (update_fast_weights=False) and stream-generate reply tokens
-        autoregressively using Sliding-Window KV caching and optional DeepInfer DSpark
-        Confidence-Scheduled Self-Speculative Decoding.
+        autoregressively using Sliding-Window KV caching. Optional self-speculative
+        verification is experimental and disabled by default; the dspark_* names
+        remain for compatibility, not as an official DeepInfer implementation.
+        An optional per-request generator must match the logits device; None keeps
+        the default global-RNG behavior.
         """
-        was_training = self.training
-        self.eval()
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be nonnegative")
+        if max_new_tokens == 0:
+            return
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+            raise ValueError("Streaming generation requires one non-empty prompt")
 
         draft_k = (
             speculative_draft_k
@@ -768,7 +776,9 @@ class uTTTModel(nn.Module):
             else float(getattr(self.config, "dspark_conf_threshold", 0.82))
         )
 
+        was_training = self.training
         try:
+            self.eval()
             # Prefill prompt with frozen fast weights (only compute last token's logits)
             prefill_out = self.forward(
                 input_ids=input_ids,
@@ -795,6 +805,7 @@ class uTTTModel(nn.Module):
                     recent_tokens=recent_tokens,
                     active_vocab_limit=active_limit,
                     repetition_penalty=self.config.repetition_penalty,
+                    generator=generator,
                 )
                 token_id = int(next_token.item())
                 if token_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):
@@ -808,7 +819,7 @@ class uTTTModel(nn.Module):
                 if generated_count >= max_new_tokens:
                     break
 
-                # DeepInfer DSpark Confidence-Scheduled Self-Speculative Decoding:
+                # Experimental confidence-scheduled self-speculative decoding:
                 # When draft_k > 0 and top-1 confidence >= conf_thresh, use the universal
                 # SharedFastWeightPool readout head to propose up to `draft_k` tokens and
                 # verify them in a single batched forward pass.
@@ -856,6 +867,7 @@ class uTTTModel(nn.Module):
                                 top_p=top_p, recent_tokens=recent_tokens,
                                 active_vocab_limit=active_limit,
                                 repetition_penalty=self.config.repetition_penalty,
+                                generator=generator,
                             )
                             target_id = int(target_tok.item())
                             if target_id in (SimpleUTF8Tokenizer.USER_ID, SimpleUTF8Tokenizer.ASSISTANT_ID):
@@ -903,8 +915,13 @@ class uTTTModel(nn.Module):
                                 cached.reset(kv_caches, cur_pos)
                                 graph_decoder = cached
                             else:
+                                # Release the previous persona's graph before
+                                # allocating another graph's private CUDA pool.
+                                self._cuda_graph_decoder = None
+                                cached = None
                                 graph_decoder = CUDAGraphDecoder(self, fast_state, kv_caches, cur_pos)
                                 self._cuda_graph_decoder = graph_decoder
+                            cached = None
                     except (RuntimeError, ValueError) as error:
                         self._cuda_graph_decoder = None
                         print(f"[Inference] CUDA graph unavailable; using standard decode ({error})")
@@ -941,15 +958,27 @@ class uTTTModel(nn.Module):
         recent_tokens: Optional[List[int]] = None,
         repetition_penalty: float = 1.18,
         active_vocab_limit: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Top-p (nucleus) sampling with repetition penalty and active vocabulary masking."""
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and nonnegative")
+        if not math.isfinite(top_p) or not 0 < top_p <= 1:
+            raise ValueError("top_p must be finite and in (0, 1]")
+        if not math.isfinite(repetition_penalty):
+            raise ValueError("repetition_penalty must be finite")
+        if logits.ndim != 2 or logits.shape[-1] <= SimpleUTF8Tokenizer.UNK_ID:
+            raise ValueError("Sampling logits must have batch and vocabulary dimensions")
+        if active_vocab_limit is not None and active_vocab_limit <= SimpleUTF8Tokenizer.EOS_ID:
+            raise ValueError("Active vocabulary must include EOS")
         work_logits = logits.float().clone()
         # Mask out PAD/BOS/UNK and unallocated upper vocab IDs
-        work_logits[:, SimpleUTF8Tokenizer.PAD_ID] = -1e9
-        work_logits[:, SimpleUTF8Tokenizer.BOS_ID] = -1e9
-        work_logits[:, SimpleUTF8Tokenizer.UNK_ID] = -1e9
+        # A finite sentinel can win against valid logits below -1e9.
+        work_logits[:, SimpleUTF8Tokenizer.PAD_ID] = -torch.inf
+        work_logits[:, SimpleUTF8Tokenizer.BOS_ID] = -torch.inf
+        work_logits[:, SimpleUTF8Tokenizer.UNK_ID] = -torch.inf
         if active_vocab_limit is not None and active_vocab_limit < work_logits.shape[-1]:
-            work_logits[:, active_vocab_limit:] = -1e9
+            work_logits[:, active_vocab_limit:] = -torch.inf
 
         if recent_tokens and repetition_penalty > 1.0:
             unique_recent = list(set(recent_tokens[-48:]))
@@ -970,10 +999,10 @@ class uTTTModel(nn.Module):
             sorted_mask = cumulative_probs - sorted_probs > top_p
             sorted_probs[sorted_mask] = 0.0
             sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            sampled_in_sorted = torch.multinomial(sorted_probs, num_samples=1)
+            sampled_in_sorted = torch.multinomial(sorted_probs, num_samples=1, generator=generator)
             return sorted_indices.gather(-1, sampled_in_sorted).squeeze(-1)
 
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
     @torch.no_grad()
     def test_time_update(

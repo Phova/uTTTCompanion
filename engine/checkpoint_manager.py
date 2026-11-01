@@ -26,6 +26,7 @@ import threading
 import tempfile
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -245,16 +246,43 @@ class DualTrackCheckpointManager:
                 break
             # Persist to disk before offloading to CPU RAM
             self._save_state_to_disk(victim_uid, victim_state)
+            cpu_state = victim_state.to(device="cpu", non_blocking=False)
             self._gpu_lru.pop(victim_uid)
             self._release_decode_cache(victim_state)
-
-            cpu_state = victim_state.to(device="cpu", non_blocking=False)
             self._cpu_lru[victim_uid] = cpu_state
             self._cpu_lru.move_to_end(victim_uid)
 
             while len(self._cpu_lru) > self.max_cpu_users:
                 cold_uid, _ = self._cpu_lru.popitem(last=False)
                 self._user_metadata.pop(cold_uid, None)
+
+    @contextmanager
+    def _reserve_gpu_slot(self, user_id: str):
+        """Protect an incoming CPU persona while evicting the current GPU user.
+
+        Without removing it first, a full CPU cache evicts the very state we
+        are about to promote. Keep it available for rollback until publication.
+        Caller holds _lock for the complete operation.
+        """
+        if user_id in self._gpu_lru:
+            yield None
+            return
+        pending_cpu = self._cpu_lru.pop(user_id, None)
+        pending_metadata = self._user_metadata.get(user_id)
+        try:
+            self._evict_gpu_lru_if_needed(exclude_user=user_id)
+            yield pending_cpu
+        except BaseException:
+            if pending_cpu is not None:
+                self._cpu_lru[user_id] = pending_cpu
+                if pending_metadata is not None:
+                    self._user_metadata[user_id] = pending_metadata
+                # Any other removed CPU entry was already persisted before
+                # being offloaded, and remains recoverable from disk.
+                while len(self._cpu_lru) > self.max_cpu_users:
+                    cold_uid, _ = self._cpu_lru.popitem(last=False)
+                    self._user_metadata.pop(cold_uid, None)
+            raise
 
     def _release_decode_cache(self, state: Optional[FastWeightState]) -> None:
         """A cached CUDA graph must not keep an evicted/replaced persona in VRAM."""
@@ -277,67 +305,75 @@ class DualTrackCheckpointManager:
                 self._gpu_lru.move_to_end(safe_uid)
                 return self._gpu_lru[safe_uid]
 
-            # Prepare slot in GPU VRAM
-            self._evict_gpu_lru_if_needed(exclude_user=safe_uid)
+            with self._reserve_gpu_slot(safe_uid) as cpu_state:
+                # Tier 2: CPU RAM Hit
+                if cpu_state is not None:
+                    gpu_state = cpu_state.to(device=self.device)
+                    self._gpu_lru[safe_uid] = gpu_state
+                    return gpu_state
 
-            # Tier 2: CPU RAM Hit
-            if safe_uid in self._cpu_lru:
-                cpu_state = self._cpu_lru.pop(safe_uid)
-                gpu_state = cpu_state.to(device=self.device)
-                self._gpu_lru[safe_uid] = gpu_state
-                return gpu_state
+                # Tier 3: Disk Persona Checkpoint Hit
+                disk_path = self._find_existing_persona_file(safe_uid)
+                if disk_path is not None:
+                    loaded_state = None
+                    loaded_metadata = None
+                    try:
+                        payload = torch.load(disk_path, map_location="cpu", weights_only=False)
+                        if payload.get("user_id", safe_uid) != safe_uid:
+                            raise ValueError("Persona file belongs to another user")
+                        saved_sig = payload.get("base_signature")
+                        saved_fingerprint = payload.get("base_fingerprint")
+                        compatible = (
+                            saved_fingerprint == self.base_fingerprint
+                            if saved_fingerprint is not None
+                            else saved_sig == self.base_signature
+                        )
+                        if compatible:
+                            fast_dict = payload.get("fast_state", payload)
+                            # Validate CPU tensors before allocating any GPU memory
+                            # for a malformed or non-finite saved persona.
+                            loaded_state = FastWeightState.from_state_dict(fast_dict)
+                            if self._valid_state_shapes(loaded_state) and self._valid_state_values(loaded_state):
+                                loaded_metadata = dict(payload.get("metadata", {}))
+                            else:
+                                loaded_state = None
+                        if loaded_metadata is None:
+                            print(
+                                f"[CheckpointManager] Persona '{safe_uid}' on disk was created under a "
+                                "different or incompatible Base Checkpoint; "
+                                "auto-resetting to current Base W_0.",
+                                flush=True,
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[CheckpointManager] Could not load persona '{safe_uid}' from {disk_path} ({exc}); "
+                            "re-initializing from Base W_0.",
+                            flush=True,
+                        )
+                        loaded_state = None
+                    if loaded_state is not None and loaded_metadata is not None:
+                        # Allocation/transfer failures do not make a valid disk
+                        # persona corrupt. Propagate them so a smaller fresh
+                        # state cannot silently replace an FP32 master persona.
+                        gpu_state = loaded_state.to(device=self.device)
+                        self._user_metadata[safe_uid] = loaded_metadata
+                        self._gpu_lru[safe_uid] = gpu_state
+                        return gpu_state
 
-            # Tier 3: Disk Persona Checkpoint Hit
-            disk_path = self._find_existing_persona_file(safe_uid)
-            if disk_path is not None:
-                try:
-                    payload = torch.load(disk_path, map_location="cpu", weights_only=False)
-                    if payload.get("user_id", safe_uid) != safe_uid:
-                        raise ValueError("Persona file belongs to another user")
-                    saved_sig = payload.get("base_signature")
-                    saved_fingerprint = payload.get("base_fingerprint")
-                    compatible = (
-                        saved_fingerprint == self.base_fingerprint
-                        if saved_fingerprint is not None
-                        else saved_sig == self.base_signature
-                    )
-                    if compatible:
-                        fast_dict = payload.get("fast_state", payload)
-                        # Validate CPU tensors before allocating any GPU memory
-                        # for a malformed or non-finite saved persona.
-                        loaded_state = FastWeightState.from_state_dict(fast_dict, device="cpu")
-                        if self._valid_state_shapes(loaded_state) and self._valid_state_values(loaded_state):
-                            gpu_state = loaded_state.to(device=self.device)
-                            self._user_metadata[safe_uid] = dict(payload.get("metadata", {}))
-                            self._gpu_lru[safe_uid] = gpu_state
-                            return gpu_state
-                    print(
-                        f"[CheckpointManager] Persona '{safe_uid}' on disk was created under a "
-                        "different or incompatible Base Checkpoint; "
-                        "auto-resetting to current Base W_0.",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        f"[CheckpointManager] Could not load persona '{safe_uid}' from {disk_path} ({exc}); "
-                        "re-initializing from Base W_0.",
-                        flush=True,
-                    )
-
-            # Cold Start: Clone W_0 from SharedFastWeightPool
-            fresh_state = self.model.init_fast_state(
-                batch_size=1,
-                device=self.device,
-                dtype=self.dtype,
-                detach=True,
-            )
-            self._user_metadata[safe_uid] = {
-                "user_id": safe_uid,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "turns": 0,
-            }
-            self._gpu_lru[safe_uid] = fresh_state
-            return fresh_state
+                # Cold Start: Clone W_0 from SharedFastWeightPool
+                fresh_state = self.model.init_fast_state(
+                    batch_size=1,
+                    device=self.device,
+                    dtype=self.dtype,
+                    detach=True,
+                )
+                self._user_metadata[safe_uid] = {
+                    "user_id": safe_uid,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "turns": 0,
+                }
+                self._gpu_lru[safe_uid] = fresh_state
+                return fresh_state
 
     def update_user_state(
         self,
@@ -350,37 +386,37 @@ class DualTrackCheckpointManager:
         with self._lock:
             # Master W/S may be FP32 even when serving parameters are BF16.
             # Device moves and persistence must preserve those accumulated bits.
-            gpu_state = new_state.detach().to(device=self.device)
-            if not self._valid_state_shapes(gpu_state) or not self._valid_state_values(gpu_state):
+            if not self._valid_state_shapes(new_state) or not self._valid_state_values(new_state):
                 raise ValueError("Persona state must have valid shapes and finite weights, momentum and metrics")
-            if safe_uid not in self._gpu_lru:
-                self._evict_gpu_lru_if_needed(exclude_user=safe_uid)
-            previous_meta = self._user_metadata.get(safe_uid)
-            meta = dict(previous_meta) if previous_meta is not None else {
-                "user_id": safe_uid,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "turns": 0,
-            }
-            meta["turns"] = int(meta.get("turns", 0)) + 1
-            meta.pop("_cached_drift", None)
-            meta.pop("_cached_drift_step", None)
-            meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            self._user_metadata[safe_uid] = meta
-            try:
-                saved_path = self._save_state_to_disk(safe_uid, gpu_state) if auto_save else None
-            except BaseException:
-                if previous_meta is None:
-                    self._user_metadata.pop(safe_uid, None)
-                else:
-                    self._user_metadata[safe_uid] = previous_meta
-                raise
-            # Publish only after persistence succeeds, so failed turns cannot
-            # leave an unacknowledged state active while disk retains old weights.
-            self._release_decode_cache(self._gpu_lru.get(safe_uid))
-            self._gpu_lru[safe_uid] = gpu_state
-            self._gpu_lru.move_to_end(safe_uid)
-            self._cpu_lru.pop(safe_uid, None)
-            return saved_path
+            with self._reserve_gpu_slot(safe_uid):
+                gpu_state = new_state.detach().to(device=self.device)
+                previous_meta = self._user_metadata.get(safe_uid)
+                meta = dict(previous_meta) if previous_meta is not None else {
+                    "user_id": safe_uid,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "turns": 0,
+                }
+                meta["turns"] = int(meta.get("turns", 0)) + 1
+                meta.pop("_cached_drift", None)
+                meta.pop("_cached_drift_step", None)
+                meta.pop("_cached_drift_state_key", None)
+                meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self._user_metadata[safe_uid] = meta
+                try:
+                    saved_path = self._save_state_to_disk(safe_uid, gpu_state) if auto_save else None
+                except BaseException:
+                    if previous_meta is None:
+                        self._user_metadata.pop(safe_uid, None)
+                    else:
+                        self._user_metadata[safe_uid] = previous_meta
+                    raise
+                # Publish only after persistence succeeds, so failed turns cannot
+                # leave an unacknowledged state active while disk retains old weights.
+                self._release_decode_cache(self._gpu_lru.get(safe_uid))
+                self._gpu_lru[safe_uid] = gpu_state
+                self._gpu_lru.move_to_end(safe_uid)
+                self._cpu_lru.pop(safe_uid, None)
+                return saved_path
 
     def record_user_turn(self, user_id: str, surprise_loss: float, auto_save: bool = True) -> Optional[Path]:
         """Commit a gated-off turn's metrics without copying/changing fast weights."""
@@ -478,34 +514,33 @@ class DualTrackCheckpointManager:
         """
         safe_uid = _sanitize_id(user_id)
         with self._lock:
-            if safe_uid not in self._gpu_lru:
-                self._evict_gpu_lru_if_needed(exclude_user=safe_uid)
-            fresh_state = self.model.init_fast_state(
-                batch_size=1,
-                device=self.device,
-                dtype=self.dtype,
-                detach=True,
-            )
-            previous_meta = self._user_metadata.get(safe_uid)
-            self._user_metadata[safe_uid] = {
-                "user_id": safe_uid,
-                "reset_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "turns": 0,
-            }
-            try:
-                if persist:
-                    self._save_state_to_disk(safe_uid, fresh_state)
-            except BaseException:
-                if previous_meta is None:
-                    self._user_metadata.pop(safe_uid, None)
-                else:
-                    self._user_metadata[safe_uid] = previous_meta
-                raise
-            self._release_decode_cache(self._gpu_lru.get(safe_uid))
-            self._gpu_lru[safe_uid] = fresh_state
-            self._gpu_lru.move_to_end(safe_uid)
-            self._cpu_lru.pop(safe_uid, None)
-            return fresh_state
+            with self._reserve_gpu_slot(safe_uid):
+                fresh_state = self.model.init_fast_state(
+                    batch_size=1,
+                    device=self.device,
+                    dtype=self.dtype,
+                    detach=True,
+                )
+                previous_meta = self._user_metadata.get(safe_uid)
+                self._user_metadata[safe_uid] = {
+                    "user_id": safe_uid,
+                    "reset_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "turns": 0,
+                }
+                try:
+                    if persist:
+                        self._save_state_to_disk(safe_uid, fresh_state)
+                except BaseException:
+                    if previous_meta is None:
+                        self._user_metadata.pop(safe_uid, None)
+                    else:
+                        self._user_metadata[safe_uid] = previous_meta
+                    raise
+                self._release_decode_cache(self._gpu_lru.get(safe_uid))
+                self._gpu_lru[safe_uid] = fresh_state
+                self._gpu_lru.move_to_end(safe_uid)
+                self._cpu_lru.pop(safe_uid, None)
+                return fresh_state
 
     def save_snapshot(self, user_id: str, snapshot_tag: Optional[str] = None) -> Path:
         """
@@ -596,13 +631,24 @@ class DualTrackCheckpointManager:
         with self._lock:
             state = self.get_user_state(safe_uid)
             meta = self._user_metadata.get(safe_uid, {})
-            if meta.get("_cached_drift_step") == state.step and "_cached_drift" in meta:
+            pool = self.model.fast_weight_pool
+            weights = (state.w_up, state.w_gate, state.w_down,
+                       pool.w_up_init, pool.w_gate_init, pool.w_down_init)
+            # A public state can be edited in place without advancing step.
+            # Track both sides of the norm; inference tensors have no versions
+            # and must be recomputed instead of trusting a scalar step cache.
+            state_key = None if any(tensor.is_inference() for tensor in weights) else tuple(
+                (id(tensor), tensor.data_ptr(), tensor._version) for tensor in weights
+            )
+            if (state_key is not None and meta.get("_cached_drift_state_key") == state_key
+                    and meta.get("_cached_drift_step") == state.step and "_cached_drift" in meta):
                 drift = dict(meta["_cached_drift"])
                 drift["last_surprise_loss"] = state.last_surprise_loss
             else:
                 drift = self.model.fast_weight_pool.compute_drift(state)
                 meta["_cached_drift"] = dict(drift)
                 meta["_cached_drift_step"] = state.step
+                meta["_cached_drift_state_key"] = state_key
             primary_path, _ = self.get_persona_paths(safe_uid)
             drift["user_id"] = safe_uid
             drift["persona_file"] = str(primary_path)

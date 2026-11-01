@@ -1,5 +1,6 @@
 """Measure full AdamW training capacity in isolated subprocesses, without saving weights."""
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -34,6 +35,12 @@ def candidate_config(width, layers, seq_len=1024):
 
 
 def measure(config, seq_len, budget_gb, steps=2):
+    # A one-chunk CE forward has no later read of its writes. Its writer Adam
+    # states stay unallocated, so it cannot establish full meta-training capacity.
+    if seq_len <= config.chunk_size + 1:
+        raise ValueError("Meta capacity requires at least two chunks and a next-token target after the first write")
+    if steps < 2:
+        raise ValueError("Capacity requires at least two optimizer steps to include persistent Adam states")
     torch.cuda.empty_cache()
     # Recheck in each worker too: direct --worker execution must not bypass
     # protection, and another process may allocate after the parent snapshot.
@@ -49,12 +56,13 @@ def measure(config, seq_len, budget_gb, steps=2):
     torch.manual_seed(42)
     model = uTTTModel(config).cuda().train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
-    ids = torch.randint(16, 21000, (1, seq_len), device="cuda")
+    ids = torch.randint(6, model.active_vocab_limit, (1, seq_len), device="cuda")
     torch.cuda.reset_peak_memory_stats()
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = model(ids, labels=ids, update_fast_weights=True, surprise_aux_weight=0.0)
+            out = model(ids, labels=ids, update_fast_weights=True, surprise_aux_weight=0.0,
+                        return_fast_state=False)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
         optimizer.step()
@@ -64,19 +72,32 @@ def measure(config, seq_len, budget_gb, steps=2):
     reserved = torch.cuda.max_memory_reserved() / 1024**3
     return {"status": "ok" if reserved <= budget_gb else "over_budget", "parameters": count,
             "peak_allocated_gb": peak, "peak_reserved_gb": reserved,
-            "seq_len": seq_len, "batch_size": 1, "steps": steps, "available_memory": memory}
+            "seq_len": seq_len, "batch_size": 1, "steps": steps, "available_memory": memory,
+            "active_vocab_limit": model.active_vocab_limit,
+            "optimizer_state_parameters": len(optimizer.state),
+            "optimizer_state_elements": sum(parameter.numel() for parameter in optimizer.state)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--budget-gb", type=float, default=28.0)
+    parser.add_argument("--tokenizer-path", help="Use the actual training tokenizer JSON instead of the legacy token mapping")
     parser.add_argument("--output", default="logs/capacity_report.json")
     parser.add_argument("--worker", nargs=2, type=int, metavar=("WIDTH", "LAYERS"))
     args = parser.parse_args()
+    if args.seq_len <= 129:
+        parser.error("Meta capacity requires seq-len >= chunk-size + 2 (130), otherwise memory writers receive no CE gradient")
+    tokenizer_json = None
+    tokenizer_path = None
+    if args.tokenizer_path:
+        tokenizer_path = Path(args.tokenizer_path).resolve()
+        tokenizer_json = tokenizer_path.read_text(encoding="utf-8")
     if args.worker:
         try:
-            result = measure(candidate_config(*args.worker, args.seq_len), args.seq_len, args.budget_gb)
+            config = candidate_config(*args.worker, args.seq_len)
+            config.tokenizer_json = tokenizer_json
+            result = measure(config, args.seq_len, args.budget_gb)
         except torch.OutOfMemoryError:
             result = {"status": "oom"}
         print("CAPACITY_RESULT " + json.dumps(result), flush=True)
@@ -93,10 +114,13 @@ def main():
     candidates = [(1536, 24), (2048, 24), (2560, 24), (2560, 28), (2560, 32), (2560, 33), (2560, 34), (2560, 35), (3072, 24), (3072, 28)]
     reports = []
     for width, layers in candidates:
-        completed = subprocess.run([
+        command = [
             sys.executable, str(Path(__file__).resolve()), "--worker", str(width), str(layers),
             "--seq-len", str(args.seq_len), "--budget-gb", str(budget),
-        ], capture_output=True, text=True, env={**os.environ, "OMP_NUM_THREADS": "2"})
+        ]
+        if tokenizer_path is not None:
+            command += ["--tokenizer-path", str(tokenizer_path)]
+        completed = subprocess.run(command, capture_output=True, text=True, env={**os.environ, "OMP_NUM_THREADS": "2"})
         result = next((json.loads(line.removeprefix("CAPACITY_RESULT "))
                        for line in completed.stdout.splitlines() if line.startswith("CAPACITY_RESULT ")), None)
         if result is None:
@@ -108,6 +132,8 @@ def main():
     report = {"budget_gb": budget, "available_memory": memory,
               "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL,
               "training_stage": "meta", "dynamic_state_precision": "float32",
+              "tokenizer_sha256": hashlib.sha256(tokenizer_json.encode()).hexdigest() if tokenizer_json else None,
+              "legacy_token_mapping": tokenizer_json is None,
               "candidates": reports,
               "largest_tested": max(passed, key=lambda result: result["parameters"]) if passed else None}
     output = Path(args.output)

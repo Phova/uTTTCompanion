@@ -870,19 +870,40 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, max_seq_len: int = 4096, theta: float = 10000.0) -> None:
         super().__init__()
         self.head_dim = head_dim
+        self.theta = float(theta)
         inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+        # Module.half()/bfloat16() also cast nonpersistent buffers. Rebuild the
+        # original frequencies in FP32 instead of using rounded inv_freq or
+        # low-precision position integers (BF16 already aliases positions >256).
+        device = self.inv_freq.device
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2, device=device,
+                                                   dtype=torch.float32) / self.head_dim))
+        self.inv_freq = inv_freq
+        old_cos = getattr(self, "cos_cached", None)
+        old_sin = getattr(self, "sin_cached", None)
+        prefix_len = old_cos.shape[0] if old_cos is not None else 0
+        if seq_len <= prefix_len:
+            return
+        t = torch.arange(prefix_len, seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        cos, sin = emb.cos(), emb.sin()
+        if old_cos is not None:
+            # Existing KV entries used these exact phases. Preserve their bits
+            # when extending, including after a low-precision device/dtype move.
+            cos = torch.cat((old_cos, cos.to(dtype=old_cos.dtype)), dim=0)
+            sin = torch.cat((old_sin, sin.to(dtype=old_sin.dtype)), dim=0)
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = x.shape[2]
+        if start_pos < 0:
+            raise ValueError("RoPE start_pos must be nonnegative")
         if start_pos + seq_len > self.cos_cached.shape[0]:
             self._build_cache(start_pos + seq_len + 512)
         cos = self.cos_cached[start_pos : start_pos + seq_len].to(dtype=x.dtype)
@@ -907,13 +928,13 @@ def apply_rope(
 
 class SlidingWindowAttention(nn.Module):
     """
-    Local Sliding Window Grouped-Query Attention (SWA) with DeepInfer Optimizations:
+    Local Sliding Window Grouped-Query Attention (SWA):
         1. Fused QKV Projection (`F.linear` over concatenated [wq, wk, wv]).
         2. Native GQA (`enable_gqa=True`) avoiding 4x KV `repeat_interleave` VRAM copies.
         3. Hardware FlashAttention-2 fast-path (`is_causal=True` when within window) +
            cached sliding-window mask buffer.
-        4. DeepInfer `SWA Bounded Replay`: caps KV replay tail to `window_size` during
-           long-context prefill/decoding while earlier chunks reside in `SharedFastWeightPool`.
+        4. Bounded KV storage: caps the returned replay tail to `window_size`
+           during long-context prefill/decoding.
     """
 
     def __init__(
@@ -945,7 +966,7 @@ class SlidingWindowAttention(nn.Module):
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len, theta=rope_theta)
         self._cached_mask: Optional[torch.Tensor] = None
-        self._cached_mask_key: Optional[Tuple[int, int, torch.device]] = None
+        self._cached_mask_key: Optional[Tuple[int, int, int, torch.device]] = None
         self.register_buffer("_packed_qkv", None, persistent=False)
         self._packed_qkv_key = None
 
@@ -975,7 +996,7 @@ class SlidingWindowAttention(nn.Module):
     def _get_sliding_causal_mask(
         self, seq_len: int, kv_len: int, device: torch.device
     ) -> torch.Tensor:
-        key = (seq_len, kv_len, device)
+        key = (seq_len, kv_len, self.window_size, device)
         if self._cached_mask is None or self._cached_mask_key != key:
             q_idx = torch.arange(kv_len - seq_len, kv_len, device=device).unsqueeze(1)
             k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
@@ -1046,7 +1067,7 @@ class SlidingWindowAttention(nn.Module):
         kv_len = k.shape[2]
         drop_p = self.dropout if self.training else 0.0
 
-        # Native PyTorch 2.5+ GQA + Triton FlexAttention BlockMask (16.8x faster than bool mask SDPA)
+        # Native GQA and optional Triton FlexAttention for long-window attention.
         try:
             if seq_len == 1:
                 attn_out = F.scaled_dot_product_attention(

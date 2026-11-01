@@ -1,0 +1,125 @@
+{
+  "baseline_revision": "fd78f375deab363b9629acf093855cc0c9957854",
+  "scope": "Small CPU overhead benchmark and small CUDA correctness checks; no large-model throughput or full-meta capacity claim",
+  "cpu_regression": {
+    "tests": 248,
+    "skipped": 16,
+    "failures": 0,
+    "errors": 0
+  },
+  "cuda_graph_regression": {
+    "tests": 12,
+    "skipped": 0,
+    "peak_allocated_mib": 98.92333984375,
+    "peak_reserved_mib": 252.0
+  },
+  "cpu_validation": {
+    "baseline": {
+      "validation_ce": 6.256748899817467,
+      "init_state_calls": 32,
+      "readonly_state_calls": 0,
+      "median_seconds": 0.025517999980365857,
+      "times_seconds": [
+        0.024918799987062812,
+        0.02594439999666065,
+        0.024894900008803234,
+        0.025517999980365857,
+        0.02709849999519065,
+        0.02588820000528358,
+        0.024764300003880635
+      ]
+    },
+    "optimized": {
+      "validation_ce": 6.256748899817467,
+      "init_state_calls": 0,
+      "readonly_state_calls": 1,
+      "median_seconds": 0.02332509998814203,
+      "times_seconds": [
+        0.023578799999086186,
+        0.023420799989253283,
+        0.023830499994801357,
+        0.022503799991682172,
+        0.022516900004120544,
+        0.02332509998814203,
+        0.022500499995658174
+      ]
+    }
+  },
+  "cpu_validation_shape": {
+    "d_model": 128,
+    "n_layers": 2,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "d_ff_fast": 256,
+    "vocab_size": 512,
+    "max_seq_len": 256
+  },
+  "cpu_validation_workload": {
+    "samples": 32,
+    "sequence_tokens": 64,
+    "warmup_passes": 2,
+    "measured_passes": 7,
+    "threads": 2,
+    "precision": "float32"
+  },
+  "cuda_validation": {
+    "baseline": {
+      "validation_ce": 6.2459676861763,
+      "validation_frozen_ce": 6.2459676861763,
+      "validation_targets": 248
+    },
+    "optimized": {
+      "validation_ce": 6.2459676861763,
+      "validation_frozen_ce": 6.2459676861763,
+      "validation_targets": 248
+    },
+    "precision": "bfloat16"
+  },
+  "inner_outer_probe": {
+    "False": {
+      "ce": 6.250167369842529,
+      "total": 6.250167369842529,
+      "inner_surprise": 0.0,
+      "writer_grad_norms": {
+        "layers.0.uttt.w_k.weight": null,
+        "layers.0.uttt.w_v.weight": null,
+        "layers.0.uttt.w_eta.weight": null,
+        "layers.0.uttt.w_eta.bias": null,
+        "layers.0.uttt.w_alpha.weight": null,
+        "layers.0.uttt.w_alpha.bias": null,
+        "layers.1.uttt.w_k.weight": null,
+        "layers.1.uttt.w_v.weight": null,
+        "layers.1.uttt.w_eta.weight": null,
+        "layers.1.uttt.w_eta.bias": null,
+        "layers.1.uttt.w_alpha.weight": null,
+        "layers.1.uttt.w_alpha.bias": null
+      }
+    },
+    "True": {
+      "ce": 6.258969306945801,
+      "total": 6.258969306945801,
+      "inner_surprise": 1.3252158164978027,
+      "writer_grad_norms": {
+        "layers.0.uttt.w_k.weight": 0.47441887855529785,
+        "layers.0.uttt.w_v.weight": 0.2961636483669281,
+        "layers.0.uttt.w_eta.weight": 0.012765197083353996,
+        "layers.0.uttt.w_eta.bias": 0.0034743542782962322,
+        "layers.0.uttt.w_alpha.weight": 2.5377896236022934e-05,
+        "layers.0.uttt.w_alpha.bias": 8.636192433186807e-06,
+        "layers.1.uttt.w_k.weight": 0.24081185460090637,
+        "layers.1.uttt.w_v.weight": 0.149086132645607,
+        "layers.1.uttt.w_eta.weight": 0.00522000202909112,
+        "layers.1.uttt.w_eta.bias": 0.00011586886830627918,
+        "layers.1.uttt.w_alpha.weight": 9.684880751592573e-06,
+        "layers.1.uttt.w_alpha.bias": 6.139998276921688e-06
+      }
+    }
+  },
+  "selective_meta_ledger": {
+    "total_parameters": 1583879748,
+    "memory_projection_and_init_parameters": 944727108,
+    "frozen_backbone_parameters": 639152640,
+    "fp32_adam_gradient_state_reduction_gib": 7.143087387084961,
+    "scope": "Static parameter ledger only; not a meta-training capacity or quality measurement"
+  }
+}

@@ -36,6 +36,7 @@ from model.uttt_layer import FastWeightState
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
 from engine.inference import TokenTextStream
+from engine.prompting import encode_chat_prompt
 
 _INFERENCE_KERNELS_COMPILED: set[str] = set()
 
@@ -59,6 +60,7 @@ class EvolutionResult:
     is_command: bool = False
     command_name: Optional[str] = None
     drift_details: Optional[Dict[str, Any]] = None
+    seed: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -336,6 +338,7 @@ class uTTTPersonalizer:
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> Generator[Dict[str, Any], None, EvolutionResult]:
         """
         Streaming generator version of `interact_and_evolve` for WebSocket/CLI streaming:
@@ -357,25 +360,26 @@ class uTTTPersonalizer:
 
         if not prompt.strip():
             raise ValueError("Prompt must not be blank")
-        if not isinstance(max_tokens, int) or not 1 <= max_tokens < self.config.max_seq_len:
+        if type(max_tokens) is not int or not 1 <= max_tokens < self.config.max_seq_len:
             raise ValueError(f"max_new_tokens must be between 1 and {self.config.max_seq_len - 1}")
         if not math.isfinite(temp) or not 0.0 <= temp <= 2.0:
             raise ValueError("temperature must be finite and between 0 and 2")
         if not math.isfinite(tp) or not 0.0 < tp <= 1.0:
             raise ValueError("top_p must be finite and in (0, 1]")
+        if seed is not None and (type(seed) is not int or not 0 <= seed < 2 ** 63):
+            raise ValueError("seed must be an integer between 0 and 2**63 - 1")
 
-        # Retrieve user's isolated FastWeightState on GPU
-        user_state = self.ckpt_manager.get_user_state(user_id)
-
-        # Format prompt & encode
-        formatted_prompt = f"<|user|> {prompt.strip()}\n<|assistant|> "
-        prompt_ids = self.tokenizer.encode(
-            formatted_prompt,
-            add_bos=True,
-            add_eos=False,
-            max_length=self.config.max_seq_len - max_tokens,
+        # Validate the full template before loading or evicting a persona.
+        prompt_ids = encode_chat_prompt(
+            self.tokenizer, prompt, self.config.max_seq_len - max_tokens,
         )
+        user_state = self.ckpt_manager.get_user_state(user_id)
         input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        sampling_options = {}
+        if seed is not None:
+            # A private stream of target draws cannot be shifted by another
+            # request's sampling or by unrelated global random-number use.
+            sampling_options["generator"] = torch.Generator(device=self.device).manual_seed(seed)
 
         # ======================================================================
         # Step 1 (Forward): Freeze Fast Weights & Stream-Generate Reply Tokens
@@ -394,6 +398,7 @@ class uTTTPersonalizer:
                 top_p=tp,
                 eos_token_id=self.tokenizer.EOS_ID,
                 use_cuda_graph=os.environ.get("UTTT_CUDA_GRAPH", "1") != "0",
+                **sampling_options,
             )
             try:
                 for tok_id in generation:
@@ -407,9 +412,13 @@ class uTTTPersonalizer:
                 if callable(close):
                     close()
 
-        reply_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).replace("\ufffd", "").strip()
-        if len(reply_text) > emitted_len:
-            yield {"type": "token", "content": reply_text[emitted_len:]}
+        # Complete any decoder tail against the original text. Trimming first
+        # shifts character offsets when the stream began with whitespace, and
+        # deleting U+FFFD also deletes legitimate replacement characters.
+        decoded_reply = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if len(decoded_reply) > emitted_len:
+            yield {"type": "token", "content": decoded_reply[emitted_len:]}
+        reply_text = decoded_reply.strip()
         if not reply_text:
             reply_text = "[Acknowledged]"
             yield {"type": "token", "content": reply_text}
@@ -427,6 +436,7 @@ class uTTTPersonalizer:
                 persona_path=str(primary_path), step=int(drift["step"]),
                 status_bar="[LM Status] Online TTT disabled: memory writes require compatible meta-training.",
                 drift_details=drift,
+                seed=seed,
             )
             yield {"type": "ttt_status", "result": result.to_dict()}
             return result
@@ -531,6 +541,7 @@ class uTTTPersonalizer:
             layer_surprise_losses=layer_surprises,
             is_command=False,
             drift_details=drift_metrics,
+            seed=seed,
         )
 
         yield {"type": "ttt_status", "result": result.to_dict()}
@@ -543,6 +554,7 @@ class uTTTPersonalizer:
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> EvolutionResult:
         """
         Execute the full 3-step Test-Time Personalization cycle for `(user_id, prompt)`:
@@ -556,6 +568,7 @@ class uTTTPersonalizer:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
+            seed=seed,
         )
         final_result: Optional[EvolutionResult] = None
         try:

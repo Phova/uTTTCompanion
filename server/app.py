@@ -42,6 +42,7 @@ class ChatRequest(BaseModel):
     max_new_tokens: Optional[int] = Field(default=None, ge=1, le=1024)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    seed: Optional[int] = Field(default=None, strict=True, ge=0, lt=2 ** 63)
 
 
 class CommandRequest(BaseModel):
@@ -249,6 +250,7 @@ async def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
             max_new_tokens=req.max_new_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
+            seed=req.seed,
         )
         return result.to_dict()
     except ValueError as exc:

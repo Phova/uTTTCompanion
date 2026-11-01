@@ -90,7 +90,7 @@ class CapacityWorkerGuardTests(unittest.TestCase):
         with mock.patch.object(profile_capacity, 'available_memory', return_value=memory), \
                 mock.patch.object(profile_capacity.torch.cuda, 'empty_cache'), \
                 mock.patch.object(profile_capacity, 'uTTTModel') as constructor:
-            result = profile_capacity.measure(None, 1024, 28)
+            result = profile_capacity.measure(SimpleNamespace(chunk_size=128), 1024, 28)
         constructor.assert_not_called()
         self.assertEqual(result['status'], 'insufficient_global_memory')
         self.assertEqual(result['available_memory'], memory)

@@ -19,6 +19,7 @@ class TokenTextStream:
         self.ids = []
         self.emitted_length = 0
         self._native = None
+        self._needs_flush = False
         if self.backend is not None:
             try:
                 from tokenizers.decoders import DecodeStream
@@ -35,14 +36,25 @@ class TokenTextStream:
         if self._native is not None:
             try:
                 piece = self._native.step(self.backend, int(token_id)) or ""
-                piece = piece.replace("\ufffd", "")
                 self.emitted_length += len(piece)
+                if piece:
+                    self._needs_flush = False
+                elif token_id >= 6:
+                    self._needs_flush = True
+                if token_id == self.tokenizer.EOS_ID and self._needs_flush:
+                    # DecodeStream uses a trailing replacement character to
+                    # detect partial UTF-8. At EOS the character may also be a
+                    # genuine U+FFFD; match the complete tokenizer decode.
+                    decoded = self.tokenizer.decode(self.ids, skip_special_tokens=True)
+                    piece += decoded[self.emitted_length:]
+                    self.emitted_length = len(decoded)
+                    self._needs_flush = False
                 return piece
             except Exception:
                 # Keep all IDs for compatibility with older/custom decoder builds.
                 self._native = None
         decoded = self.tokenizer.decode(self.ids, skip_special_tokens=True)
-        clean = decoded.rstrip("\ufffd").replace("\ufffd", "")
+        clean = decoded if token_id == self.tokenizer.EOS_ID else decoded.rstrip("\ufffd")
         if len(clean) <= self.emitted_length:
             return ""
         piece = clean[self.emitted_length:]
@@ -78,7 +90,16 @@ class CUDAGraphDecoder:
              _tensor_key(block.attn._packed_qkv) if block.attn._packed_qkv is not None else None)
             for block in model.layers
         )
-        return (model.training, weights, tables, bool(getattr(model.fast_weight_pool, "fused_inference_readout", False)))
+        # These Python attributes become constants during graph capture. Their
+        # changes must invalidate the graph even when no parameter was written.
+        behavior = tuple(
+            (block.attn.d_model, block.attn.n_heads, block.attn.n_kv_heads,
+             block.attn.n_rep, block.attn.head_dim, block.attn.window_size,
+             block.attn_norm.eps, block.uttt_norm.eps, block.uttt.q_norm.eps)
+            for block in model.layers
+        )
+        return (model.training, weights, tables, behavior, model.norm.eps, model.fast_weight_pool.eps,
+                bool(getattr(model.fast_weight_pool, "fused_inference_readout", False)))
 
     @classmethod
     def is_supported(cls, model, fast_state, prefill_kv_caches, start_pos):

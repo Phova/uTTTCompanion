@@ -14,7 +14,7 @@ class RemoteViewSupervisorTests(unittest.TestCase):
     def running(self, pid):
         try:
             return Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1][0] != 'Z'
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
 
     def test_stdin_eof_reaps_child_even_when_output_is_full_and_unread(self):
