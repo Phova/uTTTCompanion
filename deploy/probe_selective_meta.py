@@ -94,11 +94,18 @@ def writer_gradients(named_parameters):
     }
 
 
-def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2):
+def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2, meta_checkpoint_layers=0,
+          meta_checkpoint_time_chunks=True, meta_checkpoint_reentrant=False):
     if chunk_size < 1 or seq_len <= chunk_size + 1:
         raise ValueError("Meta probe requires seq-len >= chunk-size + 2")
     if steps < 2:
         raise ValueError("Meta probe requires at least two Adam steps")
+    if type(meta_checkpoint_layers) is not int or meta_checkpoint_layers < 0:
+        raise ValueError("meta-checkpoint-layers must be a nonnegative integer")
+    if type(meta_checkpoint_time_chunks) is not bool or type(meta_checkpoint_reentrant) is not bool:
+        raise ValueError("Meta checkpoint time/reentrant switches must be boolean")
+    if meta_checkpoint_reentrant and not meta_checkpoint_layers:
+        raise ValueError("Reentrant meta checkpointing requires positive meta-checkpoint-layers")
     checkpoint = load_probe_checkpoint(checkpoint_path)
     config = uTTTConfig.from_dict(checkpoint["config"])
     if not config.tokenizer_json:
@@ -108,6 +115,9 @@ def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2
     config.chunk_size = chunk_size
     config.gradient_checkpointing = True
     config.gradient_checkpointing_every = 1
+    config.meta_checkpoint_layers = meta_checkpoint_layers
+    config.meta_checkpoint_time_chunks = meta_checkpoint_time_chunks
+    config.meta_checkpoint_reentrant = meta_checkpoint_reentrant
     tokenizer = build_tokenizer(config)
     if tokenizer.vocab_size <= 6:
         raise ValueError("BPE vocabulary has no ordinary tokens")
@@ -130,6 +140,12 @@ def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2
         "seq_len": seq_len, "chunk_size": chunk_size, "batch_size": 1, "requested_steps": steps,
         "inner_loop_protocol": uTTTModel.INNER_LOOP_PROTOCOL,
         "gradient_checkpointing": True, "gradient_checkpointing_every": 1,
+        "meta_checkpoint_layers": meta_checkpoint_layers,
+        "meta_checkpoint_time_chunks": meta_checkpoint_time_chunks,
+        "meta_checkpoint_reentrant": meta_checkpoint_reentrant,
+        "allocator_configuration": os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+        "model_shape": {name: getattr(config, name) for name in (
+            "d_model", "d_ff_fast", "n_layers", "n_heads", "n_kv_heads", "vocab_size")},
         "parameter_dtype": "float32", "gradient_dtype": "float32", "adam_moment_dtype": "float32",
         "activation_dtype": "bfloat16", "dynamic_state_precision": "float32",
         "update_fast_weights": True, "surprise_aux_weight": 0.0, "return_fast_state": False,
@@ -152,6 +168,18 @@ def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2
         model.load_dual_base_state(checkpoint["slow_weights"], checkpoint["init_fast_weights"], strict=True)
         del checkpoint
         model = model.to(device=torch.device("cuda", device), dtype=torch.float32).train()
+        init_fast_state = model.init_fast_state
+
+        def audited_init_fast_state(*args, **kwargs):
+            state = init_fast_state(*args, **kwargs)
+            dtypes = {name: str(getattr(state, name).dtype) for name in (
+                "w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")}
+            report["initial_dynamic_state_dtypes"] = dtypes
+            if any(dtype != "torch.float32" for dtype in dtypes.values()):
+                raise ValueError("Automatic meta-state initialization must retain FP32 masters under autocast")
+            return state
+
+        model.init_fast_state = audited_init_fast_state
         selected = scoped_parameters(model, scope)
         parameters = [parameter for _, parameter in selected]
         optimizer = torch.optim.AdamW(parameters, lr=1e-4, weight_decay=0.1, fused=True)
@@ -166,6 +194,11 @@ def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2
                 output = model(ids, labels=ids, update_fast_weights=True, surprise_aux_weight=0.0,
                                return_fast_state=False)
             report["phase"] = "backward"
+            report["memory_before_backward"] = {
+                "allocated_bytes": torch.cuda.memory_allocated(device),
+                "reserved_bytes": torch.cuda.memory_reserved(device),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            }
             output.loss.backward()
             report["phase"] = "gradient_diagnostics"
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
@@ -207,7 +240,9 @@ def probe(checkpoint_path, scope="memory", seq_len=1024, chunk_size=128, steps=2
                                               for name, value in state.items() if name in ("exp_avg", "exp_avg_sq")),
             )
         report.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
-                      peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
+                      peak_reserved_bytes=torch.cuda.max_memory_reserved(device),
+                      gradient_parameters_present=sum(parameter.grad is not None for parameter in parameters)
+                      if optimizer is not None else 0)
     return report
 
 
@@ -218,9 +253,16 @@ def main():
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--meta-checkpoint-layers", type=int, default=0,
+                        help="Checkpoint depth segments inside each causal chunk (0: historical whole-chunk replay)")
+    parser.add_argument("--no-meta-time-checkpoint", action="store_true",
+                        help="Disable the outer time-chunk checkpoint and keep only depth checkpoints")
+    parser.add_argument("--meta-checkpoint-reentrant", action="store_true",
+                        help="Use fully flattened reentrant depth checkpoints (standard backward only)")
     args = parser.parse_args()
     try:
-        result = probe(args.checkpoint.resolve(), args.scope, args.seq_len, args.chunk_size, args.steps)
+        result = probe(args.checkpoint.resolve(), args.scope, args.seq_len, args.chunk_size, args.steps,
+                       args.meta_checkpoint_layers, not args.no_meta_time_checkpoint, args.meta_checkpoint_reentrant)
     except (GpuMemoryError, ValueError) as error:
         result = {"status": "refused", "error": str(error), "weights_saved": False}
     print("SELECTIVE_META_RESULT " + json.dumps(result), flush=True)

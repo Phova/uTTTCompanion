@@ -1,0 +1,491 @@
+{
+  "date": "2026-11-06",
+  "source_base": "a56847dfc55e35de89f1566ecc65d4b906a86102",
+  "completed_previous_run": {
+    "pretrain_steps": 100000,
+    "sft_steps": 6000,
+    "best_sft_step": 5750,
+    "best_sft_validation_ce": 2.0759948958292447,
+    "basic_instruction_matches": 0,
+    "basic_instruction_total": 4
+  },
+  "prompt_boundary_comparison": {
+    "fixed": {
+      "samples": 5,
+      "eos_rate": 0.8,
+      "token_limit_rate": 0.2,
+      "mean_generated_tokens": 18.0,
+      "mean_token_4gram_repetition": 0.04918032786885247,
+      "mean_text_4gram_repetition": 0.06511627906976744,
+      "accepted_exact_matches": 0,
+      "accepted_tasks": 4
+    },
+    "legacy_space": {
+      "samples": 5,
+      "eos_rate": 1.0,
+      "token_limit_rate": 0.0,
+      "mean_generated_tokens": 23.4,
+      "mean_token_4gram_repetition": 0.12105263157894737,
+      "mean_text_4gram_repetition": 0.13810741687979539,
+      "accepted_exact_matches": 0,
+      "accepted_tasks": 4
+    },
+    "same_checkpoint": true,
+    "decoding": "unpenalized_greedy"
+  },
+  "greeting_comparison": [
+    {
+      "decoding": "raw_greedy",
+      "prompt_boundary": "assistant_role",
+      "reply": "Hello! How can I help you today?"
+    },
+    {
+      "decoding": "legacy_space_raw_greedy",
+      "prompt_boundary": "legacy_assistant_space",
+      "reply": "{'开始位置': '15', '答案': '20'}"
+    }
+  ],
+  "instruction_audit": {
+    "sampled_rows": 10000,
+    "sampled": {
+      "long_rows": 4606,
+      "no_answered_user_turn": 0,
+      "no_supervised_targets": 0,
+      "answered_turns": 18941,
+      "short_question_and_answer_turns": 1285
+    },
+    "legacy_windows": {
+      "windows": 30000,
+      "missing_user_role": 3524,
+      "missing_assistant_role": 2968,
+      "first_target_without_its_question": 13670,
+      "windows_without_targets": 0,
+      "long_windows": 13818,
+      "long_first_target_without_its_question": 13670
+    },
+    "conditioned_windows": {
+      "windows": 10000,
+      "first_target_without_its_question": 0,
+      "windows_without_targets": 0,
+      "long_answer_truncated_without_eos": 1234
+    },
+    "document_tokens": {
+      "p0": 23,
+      "p50": 908,
+      "p90": 2026,
+      "p95": 2331,
+      "p99": 3752,
+      "p100": 11822,
+      "mean": 1033.2616
+    },
+    "rows": {
+      "rows": 96024,
+      "unique_rows": 96024,
+      "invalid_role_order_rows": 251
+    }
+  },
+  "recovery_corpus": {
+    "protocol": "uttt-recovery-curriculum-v1",
+    "seed": 20261105,
+    "train_records": 48000,
+    "synthetic_train_records": 12000,
+    "public_train_records": 36000,
+    "heldout_records": 1200,
+    "monitor_eval_records": 60,
+    "sources": {
+      "https://huggingface.co/datasets/HuggingFaceTB/smoltalk": 18000,
+      "https://huggingface.co/datasets/m-a-p/COIG-CQIA": 18000,
+      "uttt:programmatic-short-instructions-v1": 12000
+    },
+    "generated_split_checks": {
+      "operands_overlap": 0,
+      "payloads_overlap": 0,
+      "prompt_overlap": 0,
+      "semantic_key_overlap": 0,
+      "template_id_overlap": 0
+    },
+    "files": {
+      "eval_tasks.jsonl": {
+        "bytes": 19248,
+        "records": 60,
+        "sha256": "b6c2b208cfc274e8473ddae83e7e05bc516dae439e559902b1c28949967b699d"
+      },
+      "heldout.jsonl": {
+        "bytes": 799251,
+        "records": 1200,
+        "sha256": "d9a86976fa8a1d2db851fd746be9d981607c4fed6e0af8809a83a6db5f1a4e4b"
+      },
+      "train.jsonl": {
+        "bytes": 131094788,
+        "records": 48000,
+        "sha256": "4bbba768f5f050600bc7a382ef7e9fcb46e6a0ee1dcd50d9cb12cab8f1bddef9"
+      },
+      "upstream_sources.json": {
+        "bytes": 2568,
+        "sha256": "107955961fc9acbd37f7bd4e23a7a82e20d9f1ab01fba745e86b7a7f40f25ea8"
+      }
+    }
+  },
+  "memory_corpus": {
+    "protocol": "delayed_nonce_recall_correction_v1",
+    "seed": 20261106,
+    "seq_len": 768,
+    "sliding_window": 512,
+    "chunk_size": 128,
+    "identifier_intersections": {
+      "entities": 0,
+      "payloads": 0
+    },
+    "statistics": {
+      "heldout": {
+        "distinct_filler_sentences_per_row": {
+          "max": 42,
+          "mean": 37.3828125,
+          "min": 33
+        },
+        "entities": 256,
+        "entity_set_sha256": "29995f75852cce9f076bbfa93b809e2ce98380cb6f6555dedcc868e9997725f3",
+        "fact_to_answer_gap_tokens": {
+          "max": 723,
+          "mean": 668.72265625,
+          "min": 609
+        },
+        "languages": {
+          "en": 128,
+          "zh": 128
+        },
+        "payload_set_sha256": "8a0f2a19c847576fc664303d4c79f0fe84116b33579d9b4b279053fc17a32dad",
+        "payloads": 384,
+        "tasks": {
+          "correction": 128,
+          "recall": 128
+        },
+        "tokens_with_dataset_bos_eos": {
+          "max": 768,
+          "mean": 728.640625,
+          "min": 676
+        }
+      },
+      "train": {
+        "distinct_filler_sentences_per_row": {
+          "max": 42,
+          "mean": 37.17138671875,
+          "min": 32
+        },
+        "entities": 2048,
+        "entity_set_sha256": "4ac38727df10fffcc454b790784becd43ed084cfcc6391967713ccf33fd21c61",
+        "fact_to_answer_gap_tokens": {
+          "max": 725,
+          "mean": 665.546875,
+          "min": 599
+        },
+        "languages": {
+          "en": 1024,
+          "zh": 1024
+        },
+        "payload_set_sha256": "371981ad38c240398ddeccecd7ec1a67bb21b93b0d81b805552a4d09fcb80aa1",
+        "payloads": 3072,
+        "tasks": {
+          "correction": 1024,
+          "recall": 1024
+        },
+        "tokens_with_dataset_bos_eos": {
+          "max": 768,
+          "mean": 726.4375,
+          "min": 673
+        }
+      }
+    },
+    "files": {
+      "eval_tasks": {
+        "file": "eval_tasks.json",
+        "rows": 256,
+        "sha256": "8aee84899836b32aecbc01b4e12af2847724d532325ac4a1fc69abc6133621e0"
+      },
+      "heldout": {
+        "bytes": 977886,
+        "file": "heldout.jsonl",
+        "rows": 256,
+        "sha256": "72093f3feaddba9f1e057d71f4aa8ab2de9dc3b1b0e40a4c55cd7ad6df8733fd"
+      },
+      "train": {
+        "bytes": 7779996,
+        "file": "train.jsonl",
+        "rows": 2048,
+        "sha256": "27ad5eff8fce2b6d1dab31f1a62e053d98cbcee980451aa8dc8e33e8f7443c95"
+      }
+    }
+  },
+  "exact_meta_capacity": {
+    "status": "ok",
+    "phase": "complete",
+    "checkpoint_step": 5750,
+    "scope": "memory",
+    "parameters": 1583879748,
+    "trainable_parameters": 944727108,
+    "static_fp32_weights_grads_adam_bytes": 17672244288,
+    "allocator_limit_bytes": 30064771072,
+    "driver_reserve_bytes": 1610612736,
+    "maximum_allocator_bytes": 30064771072,
+    "seq_len": 768,
+    "chunk_size": 128,
+    "batch_size": 1,
+    "requested_steps": 3,
+    "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+    "gradient_checkpointing": true,
+    "gradient_checkpointing_every": 1,
+    "meta_checkpoint_layers": 4,
+    "meta_checkpoint_time_chunks": true,
+    "meta_checkpoint_reentrant": true,
+    "allocator_configuration": "expandable_segments:True",
+    "model_shape": {
+      "d_model": 2560,
+      "d_ff_fast": 6912,
+      "n_layers": 34,
+      "n_heads": 20,
+      "n_kv_heads": 5,
+      "vocab_size": 32000
+    },
+    "parameter_dtype": "float32",
+    "gradient_dtype": "float32",
+    "adam_moment_dtype": "float32",
+    "activation_dtype": "bfloat16",
+    "dynamic_state_precision": "float32",
+    "update_fast_weights": true,
+    "surprise_aux_weight": 0.0,
+    "return_fast_state": false,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "active_vocab_limit": 32000,
+    "synthetic_bpe_tokens": true,
+    "seed": 42,
+    "checkpoint_optimizer_restored": false,
+    "weights_saved": false,
+    "torch": "2.11.0+cu128",
+    "step_timing_includes_writer_diagnostics": true,
+    "finite": true,
+    "steps": [
+      {
+        "step": 1,
+        "seconds": 7.196772179999996,
+        "ce": 11.79127311706543,
+        "loss": 11.79127311706543,
+        "grad_norm": 10.13332748413086,
+        "finite": true,
+        "writer_parameter_count": 204,
+        "writer_grad_count": 204,
+        "writer_nonzero_grad_count": 204,
+        "writer_missing_grad_names": [],
+        "writer_zero_grad_names": [],
+        "writer_grad_norm_min": 1.3381641394971666e-07,
+        "writer_grad_norm_max": 0.0009052252862602472,
+        "writer_gradients_finite": true,
+        "all_writers_have_nonzero_ce_grad": true
+      },
+      {
+        "step": 2,
+        "seconds": 4.056621105000005,
+        "ce": 15.034509658813477,
+        "loss": 15.034509658813477,
+        "grad_norm": 50.1592903137207,
+        "finite": true,
+        "writer_parameter_count": 204,
+        "writer_grad_count": 204,
+        "writer_nonzero_grad_count": 204,
+        "writer_missing_grad_names": [],
+        "writer_zero_grad_names": [],
+        "writer_grad_norm_min": 2.537036039029772e-07,
+        "writer_grad_norm_max": 0.002762025687843561,
+        "writer_gradients_finite": true,
+        "all_writers_have_nonzero_ce_grad": true
+      },
+      {
+        "step": 3,
+        "seconds": 3.982396223000002,
+        "ce": 10.287717819213867,
+        "loss": 10.287717819213867,
+        "grad_norm": 10.878456115722656,
+        "finite": true,
+        "writer_parameter_count": 204,
+        "writer_grad_count": 204,
+        "writer_nonzero_grad_count": 204,
+        "writer_missing_grad_names": [],
+        "writer_zero_grad_names": [],
+        "writer_grad_norm_min": 4.17784804085386e-07,
+        "writer_grad_norm_max": 0.0023978869430720806,
+        "writer_gradients_finite": true,
+        "all_writers_have_nonzero_ce_grad": true
+      }
+    ],
+    "initial_dynamic_state_dtypes": {
+      "w_up": "torch.float32",
+      "w_gate": "torch.float32",
+      "w_down": "torch.float32",
+      "s_up": "torch.float32",
+      "s_gate": "torch.float32",
+      "s_down": "torch.float32",
+      "ln_weight": "torch.float32",
+      "ln_bias": "torch.float32"
+    },
+    "memory_before_backward": {
+      "allocated_bytes": 17136788480,
+      "reserved_bytes": 28896657408,
+      "peak_allocated_bytes": 28528534528
+    },
+    "all_writers_have_nonzero_ce_grad": true,
+    "optimizer_state_parameters": 345,
+    "optimizer_complete_state_parameters": 345,
+    "optimizer_state_elements": 944727108,
+    "optimizer_moment_elements": 1889454216,
+    "peak_allocated_bytes": 28528534528,
+    "peak_reserved_bytes": 28896657408,
+    "gradient_parameters_present": 345
+  },
+  "cpu_regression": {
+    "total": 341,
+    "passed": 320,
+    "skipped": 21,
+    "failures": 0,
+    "note": "Final CPU regression includes recovery resume, paired memory evaluation, scope and budget guards."
+  },
+  "cuda_regression": {
+    "total": 5,
+    "passed": 5,
+    "failures": 0,
+    "note": "CUDA FP32/BF16 checkpoint gradient and implicit FP32 state initialization tests."
+  },
+  "exact_meta_capacity_1024_isolated": {
+    "status": "ok",
+    "phase": "complete",
+    "checkpoint_step": 5750,
+    "scope": "memory",
+    "parameters": 1583879748,
+    "trainable_parameters": 944727108,
+    "static_fp32_weights_grads_adam_bytes": 17672244288,
+    "allocator_limit_bytes": 30064771072,
+    "driver_reserve_bytes": 1610612736,
+    "maximum_allocator_bytes": 30064771072,
+    "seq_len": 1024,
+    "chunk_size": 128,
+    "batch_size": 1,
+    "requested_steps": 2,
+    "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+    "gradient_checkpointing": true,
+    "gradient_checkpointing_every": 1,
+    "meta_checkpoint_layers": 4,
+    "meta_checkpoint_time_chunks": true,
+    "meta_checkpoint_reentrant": true,
+    "allocator_configuration": "expandable_segments:True",
+    "model_shape": {
+      "d_model": 2560,
+      "d_ff_fast": 6912,
+      "n_layers": 34,
+      "n_heads": 20,
+      "n_kv_heads": 5,
+      "vocab_size": 32000
+    },
+    "parameter_dtype": "float32",
+    "gradient_dtype": "float32",
+    "adam_moment_dtype": "float32",
+    "activation_dtype": "bfloat16",
+    "dynamic_state_precision": "float32",
+    "update_fast_weights": true,
+    "surprise_aux_weight": 0.0,
+    "return_fast_state": false,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "active_vocab_limit": 32000,
+    "synthetic_bpe_tokens": true,
+    "seed": 42,
+    "checkpoint_optimizer_restored": false,
+    "weights_saved": false,
+    "torch": "2.11.0+cu128",
+    "step_timing_includes_writer_diagnostics": true,
+    "finite": true,
+    "steps": [
+      {
+        "step": 1,
+        "seconds": 11.349718049999865,
+        "ce": 11.80538272857666,
+        "loss": 11.80538272857666,
+        "grad_norm": 9.963998794555664,
+        "finite": true,
+        "writer_parameter_count": 204,
+        "writer_grad_count": 204,
+        "writer_nonzero_grad_count": 204,
+        "writer_missing_grad_names": [],
+        "writer_zero_grad_names": [],
+        "writer_grad_norm_min": 9.295466725234292e-07,
+        "writer_grad_norm_max": 0.0013775386614724994,
+        "writer_gradients_finite": true,
+        "all_writers_have_nonzero_ce_grad": true
+      },
+      {
+        "step": 2,
+        "seconds": 5.327495470000031,
+        "ce": 15.881476402282715,
+        "loss": 15.881476402282715,
+        "grad_norm": 47.858917236328125,
+        "finite": true,
+        "writer_parameter_count": 204,
+        "writer_grad_count": 204,
+        "writer_nonzero_grad_count": 204,
+        "writer_missing_grad_names": [],
+        "writer_zero_grad_names": [],
+        "writer_grad_norm_min": 4.109899265358763e-08,
+        "writer_grad_norm_max": 0.0042256242595613,
+        "writer_gradients_finite": true,
+        "all_writers_have_nonzero_ce_grad": true
+      }
+    ],
+    "initial_dynamic_state_dtypes": {
+      "w_up": "torch.float32",
+      "w_gate": "torch.float32",
+      "w_down": "torch.float32",
+      "s_up": "torch.float32",
+      "s_gate": "torch.float32",
+      "s_down": "torch.float32",
+      "ln_weight": "torch.float32",
+      "ln_bias": "torch.float32"
+    },
+    "memory_before_backward": {
+      "allocated_bytes": 18165708800,
+      "reserved_bytes": 22292725760,
+      "peak_allocated_bytes": 21950236672
+    },
+    "all_writers_have_nonzero_ce_grad": true,
+    "optimizer_state_parameters": 345,
+    "optimizer_complete_state_parameters": 345,
+    "optimizer_state_elements": 944727108,
+    "optimizer_moment_elements": 1889454216,
+    "peak_allocated_bytes": 29508299776,
+    "peak_reserved_bytes": 29972496384,
+    "gradient_parameters_present": 345
+  },
+  "real_training_1024": {
+    "status": "oom_after_first_step_validation_and_save",
+    "phase": "second_step_backward",
+    "weights_saved": "separate preflight only"
+  },
+  "real_training_preflight": {
+    "status": "ok",
+    "real_training_steps": 3,
+    "resumed_from_step": 3,
+    "final_step": 4,
+    "optimizer_states": 345,
+    "optimizer_step_min": 4,
+    "optimizer_step_max": 4,
+    "adam_moments_fp32": true,
+    "training_state_keys": [
+      "data_cursor",
+      "rng",
+      "micro_batch_size",
+      "grad_accum_steps"
+    ],
+    "parameter_scope": "memory",
+    "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+    "validation_ce": 3.929605907864041,
+    "validation_frozen_ce": 3.8920461513378,
+    "peak_allocated_gib": 26.88892126083374,
+    "tokens_seen": 2831,
+    "note": "Short operational verification, not evidence of learned useful memory; on internal four-document validation dynamic CE remains worse than frozen."
+  }
+}

@@ -10,7 +10,8 @@ import subprocess
 import time
 
 
-TRAINING_SCRIPTS = {"train_5090.py", "run_training_pipeline.py"}
+PIPELINE_SCRIPTS = {"run_training_pipeline.py", "run_recovery_training.py"}
+TRAINING_SCRIPTS = {"train_5090.py", *PIPELINE_SCRIPTS}
 
 
 def process_table():
@@ -56,7 +57,7 @@ def select_training_processes(table, roots, workspace, scripts=TRAINING_SCRIPTS)
     # must stay alive until the trainer finishes its optimizer step and save.
     selected = [pid for pid in candidates if not below_trainer(pid)]
     # Notify the pipeline before its child so it cannot advance to the next stage.
-    return sorted(selected, key=lambda pid: ("run_training_pipeline.py" not in table[pid]["scripts"], pid))
+    return sorted(selected, key=lambda pid: (not bool(PIPELINE_SCRIPTS & table[pid]["scripts"]), pid))
 
 
 def _same_process(current, expected):

@@ -96,7 +96,10 @@ class SelectiveMetaProbeGuardsTests(unittest.TestCase):
             parameter.requires_grad_.assert_called_once_with(index >= 3)
 
     def test_one_chunk_or_one_adam_step_refuses_before_checkpoint_or_cuda(self):
-        for options in ({"seq_len": 129}, {"steps": 1}):
+        for options in ({"seq_len": 129}, {"steps": 1}, {"meta_checkpoint_layers": -1},
+                        {"meta_checkpoint_layers": True}, {"meta_checkpoint_layers": 1.5},
+                        {"meta_checkpoint_reentrant": True}, {"meta_checkpoint_time_chunks": 0},
+                        {"meta_checkpoint_reentrant": "true"}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.probe.probe(Path("never-read.pt"), **options)
         self.torch.load.assert_not_called()

@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from engine.checkpoint_manager import DualTrackCheckpointManager
+from engine.prompting import format_chat_prompt
 from model.tokenizer import build_tokenizer
 from deploy.training_diagnostics import generation_summary, repeated_ngram_continuations, repetition_metrics
 
@@ -81,10 +82,16 @@ def evaluation_profiles(sample_temperature, sample_top_p, controlled, controlled
 
 def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode="auto", seed=42,
              sample_temperature=.8, sample_top_p=.95, controlled=False, controlled_penalty=1.05,
-             controlled_ngram=4):
+             controlled_ngram=4, compare_prompt_boundaries=False, greedy_only=False):
     if max_new_tokens < 1 or mode not in {"auto", "chat", "continuation"}:
         raise ValueError("Positive generation length and a supported evaluation mode are required")
     profiles = evaluation_profiles(sample_temperature, sample_top_p, controlled, controlled_penalty, controlled_ngram)
+    if greedy_only:
+        if controlled:
+            raise ValueError("greedy_only cannot include a controlled sampling profile")
+        profiles = profiles[:1]
+    if compare_prompt_boundaries:
+        profiles.append({**profiles[0], "name": "legacy_space_raw_greedy"})
     with tempfile.TemporaryDirectory(prefix="uttt_quality_") as personas:
         manager = DualTrackCheckpointManager(checkpoint, personas, device=device, auto_create_base_if_missing=False)
         tokenizer = build_tokenizer(manager.config)
@@ -101,11 +108,17 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
             task_mode = task.get("mode", default_mode)
             if not isinstance(prompt, str) or task_mode not in {"chat", "continuation"}:
                 raise ValueError("Each task requires a text prompt and a supported mode")
-            encoded_prompt = f"<|user|> {prompt}\n<|assistant|> " if task_mode == "chat" else prompt
+            encoded_prompt = format_chat_prompt(prompt) if task_mode == "chat" else prompt
             ids = tokenizer.encode(encoded_prompt, add_bos=True)
             if len(ids) + max_new_tokens > manager.config.max_seq_len:
                 raise ValueError("Evaluation prompt exceeds model context budget")
             for profile in profiles:
+                legacy = profile["name"] == "legacy_space_raw_greedy"
+                if legacy and task_mode != "chat":
+                    continue
+                profile_ids = tokenizer.encode(encoded_prompt + " ", add_bos=True) if legacy else ids
+                if len(profile_ids) + max_new_tokens > manager.config.max_seq_len:
+                    raise ValueError("Evaluation prompt exceeds model context budget")
                 sample_seed = int(seed) + task_index
                 with torch.random.fork_rng(devices=devices), torch.no_grad():
                     torch.random.default_generator.manual_seed(sample_seed)
@@ -115,7 +128,7 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
                     with decoding_policy(manager.model, profile, tokenizer.EOS_ID) as trace:
                         with torch.autocast(manager.device.type, dtype=manager.dtype, enabled=manager.dtype != torch.float32):
                             tokens = list(manager.model.stream_generate(
-                                torch.tensor([ids], device=manager.device),
+                                torch.tensor([profile_ids], device=manager.device),
                                 manager.model.fast_weight_pool.readonly_state(device=manager.device, dtype=manager.dtype, detach=True),
                                 max_new_tokens=max_new_tokens, temperature=profile["temperature"], top_p=profile["top_p"],
                                 speculative_draft_k=0, use_cuda_graph=False,
@@ -128,7 +141,9 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
                 result = {"prompt": prompt, "mode": task_mode, "reply": reply, "generated_tokens": len(tokens),
                           "eos_generated": eos, "stop_reason": stop_reason,
                           "decoding": profile["name"], "decoding_parameters": dict(profile),
-                          "seed": None if profile["name"] == "raw_greedy" else sample_seed,
+                          "seed": None if profile["temperature"] == 0 else sample_seed,
+                          "prompt_boundary": ("legacy_assistant_space" if legacy else "assistant_role")
+                                             if task_mode == "chat" else "continuation",
                           **repetition_metrics(tokens, reply)}
                 if "accepted" in task:
                     result["exact_match"] = reply.casefold().strip("。.!！ \n") in [value.casefold() for value in task["accepted"]]
@@ -145,6 +160,13 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
                   "notes": ["Primary results and exact-match totals use unpenalized raw greedy decoding.",
                             "Controlled decoding is optional and cannot establish that training repetition is fixed.",
                             "Continuation samples may reach the token budget before a document's EOS; inspect repetition separately."]}
+        if compare_prompt_boundaries:
+            report["prompt_boundary_comparison"] = {
+                "fixed": generation_summary([row for row in results if row["mode"] == "chat"]),
+                "legacy_space": generation_summary(profile_results["legacy_space_raw_greedy"]),
+                "same_checkpoint": True,
+                "decoding": "unpenalized_greedy",
+            }
         Path(output).parent.mkdir(parents=True, exist_ok=True)
         Path(output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report
@@ -164,8 +186,12 @@ if __name__ == "__main__":
     parser.add_argument("--controlled", action="store_true", help="Also report a separately labeled repetition-controlled sample")
     parser.add_argument("--controlled-penalty", type=float, default=1.05)
     parser.add_argument("--controlled-ngram", type=int, default=4)
+    parser.add_argument("--compare-prompt-boundaries", action="store_true",
+                        help="Also test the legacy trailing-space chat prefix with the same weights and raw greedy decoding")
+    parser.add_argument("--greedy-only", action="store_true", help="Run only the unpenalized greedy profile for heldout monitoring")
     args = parser.parse_args()
     tasks = [json.loads(line) for line in Path(args.tasks).read_text(encoding="utf-8").splitlines() if line.strip()] if args.tasks else None
     evaluate(args.checkpoint, tasks, args.output, args.max_new_tokens, args.device, mode=args.mode, seed=args.seed,
              sample_temperature=args.sample_temperature, sample_top_p=args.sample_top_p,
-             controlled=args.controlled, controlled_penalty=args.controlled_penalty, controlled_ngram=args.controlled_ngram)
+             controlled=args.controlled, controlled_penalty=args.controlled_penalty, controlled_ngram=args.controlled_ngram,
+             compare_prompt_boundaries=args.compare_prompt_boundaries, greedy_only=args.greedy_only)

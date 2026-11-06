@@ -71,6 +71,9 @@ class uTTTConfig:
     # Training memory & schedule optimization
     gradient_checkpointing: bool = True
     gradient_checkpointing_every: int = 1
+    meta_checkpoint_layers: int = 0             # Nested depth checkpoints inside causal chunks (0=whole chunk)
+    meta_checkpoint_time_chunks: bool = True    # Disable to retain only depth checkpoint boundaries
+    meta_checkpoint_reentrant: bool = False    # Flattened depth checkpoints; standard loss.backward() only
     tie_word_embeddings: bool = True
     write_schedule: str = "sequential"          # Chunk-first causal reads, sequential boundary writes
     dspark_speculative_k: int = 0               # Legacy name: experimental self-draft length (0=off)
@@ -88,7 +91,8 @@ class uTTTConfig:
         if "model" in data or "uttt" in data:
             merged.update(data.get("model", {}))
             merged.update(data.get("uttt", {}))
-            for name in ("gradient_checkpointing", "gradient_checkpointing_every"):
+            for name in ("gradient_checkpointing", "gradient_checkpointing_every", "meta_checkpoint_layers",
+                         "meta_checkpoint_time_chunks", "meta_checkpoint_reentrant"):
                 if name in data.get("training", {}):
                     merged[name] = data["training"][name]
         else:
@@ -268,12 +272,20 @@ class uTTTModel(nn.Module):
           and flows sequentially through `layers[0] -> layers[1] -> ... -> layers[L-1]`.
     """
 
-    INNER_LOOP_PROTOCOL = "chunk_shared_fp32_exact_v1"
+    # v2 also keeps the automatically initialized W/S/LN master state in FP32
+    # under BF16 autocast. v1 rounded the initial state before its first write.
+    INNER_LOOP_PROTOCOL = "chunk_shared_fp32_exact_v2"
 
     def __init__(self, config: uTTTConfig) -> None:
         super().__init__()
         self.config = config
         self.gradient_checkpointing = config.gradient_checkpointing
+        if type(config.meta_checkpoint_layers) is not int or config.meta_checkpoint_layers < 0:
+            raise ValueError("meta_checkpoint_layers must be a nonnegative integer")
+        if type(config.meta_checkpoint_time_chunks) is not bool or type(config.meta_checkpoint_reentrant) is not bool:
+            raise ValueError("meta checkpoint time/reentrant switches must be boolean")
+        if config.meta_checkpoint_reentrant and not config.meta_checkpoint_layers:
+            raise ValueError("Reentrant meta checkpointing requires positive meta_checkpoint_layers")
         if config.tokenizer_json:
             tokenizer_data = json.loads(config.tokenizer_json)
             ids = list(tokenizer_data["model"]["vocab"].values())
@@ -423,22 +435,27 @@ class uTTTModel(nn.Module):
     # Forward Pass with Cross-Layer Fast-Weight State Passing
     # --------------------------------------------------------------------------
 
-    def _run_shared_chunk(self, hidden, tensors, kv_caches, attention_mask, start_pos, step_before):
-        """All layers read the chunk-start state; writes advance one shared cursor.
+    def _run_shared_layer_segment(
+        self, hidden, tensors, read_tensors, kv_caches, attention_mask,
+        start_pos, step_before, first_layer, last_layer,
+    ):
+        """Advance a depth segment while reading the ORIGINAL chunk-start state.
 
-        Advancing depth inside each chunk lets later chunks read writes from every
-        layer without exposing any write from the current chunk to its predictions.
-        Nested tensor arguments/outputs also support non-reentrant checkpointing.
+        Pass both the write cursor and read snapshot explicitly. In particular,
+        recomputation must not substitute a segment-start cursor for read_tensors:
+        that would expose current-chunk writes to its own token predictions.
+        Integer boundaries/steps are arguments too, avoiding mutable loop closures.
         """
         names = ("w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")
-        read_state = FastWeightState(**dict(zip(names, tensors)), step=step_before)
-        cursor = read_state
+        read_state = FastWeightState(**dict(zip(names, read_tensors)), step=step_before)
+        cursor = FastWeightState(**dict(zip(names, tensors)), step=step_before + first_layer)
         next_caches, surprises = [], []
-        for index, block in enumerate(self.layers):
+        for index in range(first_layer, last_layer):
+            block = self.layers[index]
             hidden, cursor, surprise, cache = block(
                 hidden, fast_pool=self.fast_weight_pool, fast_state=cursor,
                 read_state=read_state, attention_mask=attention_mask,
-                kv_cache=kv_caches[index], start_pos=start_pos, update_fast_weights=True,
+                kv_cache=kv_caches[index - first_layer], start_pos=start_pos, update_fast_weights=True,
             )
             # Keep differentiable history only within the local attention window.
             window = block.attn.window_size
@@ -446,7 +463,103 @@ class uTTTModel(nn.Module):
             surprises.append(surprise)
         return hidden, tuple(getattr(cursor, name) for name in names), next_caches, torch.stack(surprises)
 
-    def _forward_shared_chunks(self, hidden, state, attention_mask, kv_caches, start_pos):
+    def _run_shared_chunk(self, hidden, tensors, kv_caches, attention_mask, start_pos, step_before,
+                          use_reentrant=False):
+        """All layers read the chunk-start state; writes advance one shared cursor.
+
+        Advancing depth inside each chunk lets later chunks read writes from every
+        layer without exposing any write from the current chunk to its predictions.
+        Nested tensor arguments/outputs also support non-reentrant checkpointing.
+        """
+        # The outer time-chunk checkpoint avoids retaining every segment boundary
+        # during forward. Nested depth checkpoints bound the temporary autograd
+        # graph rebuilt during backward; no update is detached or approximated.
+        # A zero setting retains the historical whole-chunk implementation.
+        segment_layers = self.config.meta_checkpoint_layers
+        checkpoint_segments = bool(
+            segment_layers and self.training and self.gradient_checkpointing and torch.is_grad_enabled()
+        )
+        segment_layers = segment_layers if checkpoint_segments else len(self.layers)
+        read_tensors = tensors
+        next_caches, surprises = [], []
+        for first_layer in range(0, len(self.layers), segment_layers):
+            last_layer = min(first_layer + segment_layers, len(self.layers))
+            args = (
+                hidden, tensors, read_tensors, kv_caches[first_layer:last_layer], attention_mask,
+                start_pos, step_before, first_layer, last_layer,
+            )
+            if checkpoint_segments and use_reentrant:
+                # Reentrant checkpointing does not discover tensors nested inside
+                # tuple/list arguments. Flatten EVERY state/cache tensor so the
+                # backward path covers read snapshots, write cursors, and SWA
+                # history, including when embeddings/attention are frozen.
+                cache_flags = tuple(cache is not None for cache in args[3])
+                flat_caches = tuple(value for cache in args[3] if cache is not None for value in cache)
+                result = checkpoint(
+                    self._run_shared_layer_segment_flat,
+                    hidden, attention_mask, start_pos, step_before, first_layer, last_layer, cache_flags,
+                    *tensors, *read_tensors, *flat_caches,
+                    use_reentrant=True, preserve_rng_state=self.config.dropout > 0.0,
+                )
+                hidden, tensors, surprise = result[0], tuple(result[1:9]), result[-1]
+                caches = [tuple(result[index:index + 2]) for index in range(9, len(result) - 1, 2)]
+            elif checkpoint_segments:
+                hidden, tensors, caches, surprise = checkpoint(
+                    self._run_shared_layer_segment, *args, use_reentrant=False,
+                    preserve_rng_state=self.config.dropout > 0.0,
+                )
+            else:
+                hidden, tensors, caches, surprise = self._run_shared_layer_segment(*args)
+            next_caches.extend(caches)
+            surprises.append(surprise)
+        return hidden, tensors, next_caches, torch.cat(surprises)
+
+    def _run_shared_layer_segment_flat(
+        self, hidden, attention_mask, start_pos, step_before, first_layer, last_layer, cache_flags, *flat_tensors,
+    ):
+        """Tensor-only segment state/cache plumbing for reentrant recomputation.
+
+        PyTorch rebuilds this local graph in backward and propagates its exact
+        derivatives into all flattened inputs. It supports loss.backward(); users
+        needing autograd.grad or backward(inputs=...) must keep the default
+        non-reentrant policy instead.
+        """
+        tensors, read_tensors = tuple(flat_tensors[:8]), tuple(flat_tensors[8:16])
+        cursor, caches = 16, []
+        for has_cache in cache_flags:
+            caches.append(tuple(flat_tensors[cursor:cursor + 2]) if has_cache else None)
+            cursor += 2 if has_cache else 0
+        hidden, tensors, caches, surprise = self._run_shared_layer_segment(
+            hidden, tensors, read_tensors, caches, attention_mask, start_pos, step_before, first_layer, last_layer,
+        )
+        return (hidden, *tensors, *(value for cache in caches for value in cache), surprise)
+
+    def _meta_checkpoint_supervision(self, labels, attention_mask, seq_len):
+        """Allow reentrant depth replay only when later predictions train writers.
+
+        The target for prediction position C is labels[C + 1]. A physical second
+        chunk containing only padding, ignored targets, or the final input token
+        does not establish that dependency. Reentrant checkpointing materializes
+        zero gradients for unused outputs, so those cases use non-reentrant replay.
+        Batch predicates are transferred together, once per meta-training forward.
+        """
+        if not self.training or labels is None or seq_len <= self.config.chunk_size:
+            return False, False
+        chunk_size = self.config.chunk_size
+        future_targets = labels[:, chunk_size + 1:] != -100
+        valid_future_targets = future_targets
+        if attention_mask is not None:
+            valid_future_targets = (future_targets
+                                    & attention_mask[:, chunk_size:-1].bool()
+                                    & attention_mask[:, chunk_size + 1:].bool())
+        has_future, has_valid_future = torch.stack(
+            (future_targets.any(), valid_future_targets.any())
+        ).tolist()
+        use_reentrant = bool(self.config.meta_checkpoint_reentrant and has_valid_future)
+        return use_reentrant, not has_future
+
+    def _forward_shared_chunks(self, hidden, state, attention_mask, kv_caches, start_pos,
+                               use_reentrant=False):
         if self.config.write_schedule != "sequential":
             raise ValueError("Only the causal sequential write schedule is implemented; aggregated writes must not be silently treated as sequential")
         names = ("w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")
@@ -457,8 +570,8 @@ class uTTTModel(nn.Module):
         for offset in range(0, hidden.shape[1], self.config.chunk_size):
             end = min(offset + self.config.chunk_size, hidden.shape[1])
             mask = attention_mask[:, offset:end] if attention_mask is not None else None
-            args = (hidden[:, offset:end], tensors, caches, mask, start_pos + offset, step)
-            if self.training and self.gradient_checkpointing:
+            args = (hidden[:, offset:end], tensors, caches, mask, start_pos + offset, step, use_reentrant)
+            if self.training and self.gradient_checkpointing and self.config.meta_checkpoint_time_chunks:
                 piece, tensors, caches, surprise = checkpoint(
                     self._run_shared_chunk, *args, use_reentrant=False,
                     preserve_rng_state=self.config.dropout > 0.0,
@@ -477,7 +590,7 @@ class uTTTModel(nn.Module):
         )
         counts = torch.stack(token_counts)
         per_layer = (torch.stack(losses) * counts[:, None]).sum(dim=0) / counts.sum().clamp_min(1)
-        return torch.cat(pieces, dim=1), updated, per_layer, caches
+        return torch.cat(pieces, dim=1), updated, per_layer, caches, pieces[0]
 
     def _checkpointed_block_forward(
         self,
@@ -625,8 +738,13 @@ class uTTTModel(nn.Module):
                     batch_size=bsz, device=h.device, dtype=h.dtype, detach=not self.training
                 )
             else:
+                # Read matmuls cast these FP32 masters to activation precision;
+                # never round W_0/LN to BF16 before accumulating the first write.
+                # Explicit FP64 models retain their precision for math audits.
+                state_dtype = (torch.float64 if self.fast_weight_pool.w_up_init.dtype == torch.float64
+                               else torch.float32) if update_fast_weights else h.dtype
                 fast_state = self.init_fast_state(
-                    batch_size=bsz, device=h.device, dtype=h.dtype, detach=not self.training
+                    batch_size=bsz, device=h.device, dtype=state_dtype, detach=not self.training
                 )
         else:
             fast_state = fast_state.ensure_batch_size(bsz)
@@ -634,10 +752,15 @@ class uTTTModel(nn.Module):
         new_kv_caches: List[Tuple[torch.Tensor, torch.Tensor]] = []
         layer_surprise_tensors: List[torch.Tensor] = []
         layer_surprise_floats: List[float] = []
+        ce_first_chunk_only = False
+        ce_first_chunk_hidden = None
 
         if update_fast_weights:
-            h, cur_fast_state, per_layer_surprises, new_kv_caches = self._forward_shared_chunks(
-                h, fast_state, attention_mask, kv_caches, start_pos,
+            use_reentrant, ce_first_chunk_only = self._meta_checkpoint_supervision(
+                labels, attention_mask, seq_len,
+            )
+            h, cur_fast_state, per_layer_surprises, new_kv_caches, ce_first_chunk_hidden = self._forward_shared_chunks(
+                h, fast_state, attention_mask, kv_caches, start_pos, use_reentrant,
             )
             layer_surprise_tensors = list(per_layer_surprises.unbind())
         else:
@@ -673,11 +796,11 @@ class uTTTModel(nn.Module):
         total_loss: Optional[torch.Tensor] = None
 
         if labels is not None and self.training and bsz > 2:
-            h = self.norm(h)
+            h = self.norm(ce_first_chunk_hidden if ce_first_chunk_only else h)
             # Memory-efficient sliced LM-Head + Cross-Entropy (saves ~3.0 GiB Peak VRAM
             # and prevents CUDACachingAllocator page-unmap stalls at the 28GB boundary)
-            h_shift = h[:, :-1, :]
-            lbl_shift = labels[:, 1:]
+            h_shift = h if ce_first_chunk_only else h[:, :-1, :]
+            lbl_shift = labels[:, 1:1 + h_shift.shape[1]]
             ce_sums: List[torch.Tensor] = []
             ce_counts: List[torch.Tensor] = []
             for b_start in range(0, bsz, 2):
@@ -701,11 +824,22 @@ class uTTTModel(nn.Module):
         elif labels is not None:
             h = self.norm(h)
             logits = self.lm_head(h)
-            shift_labels = torch.full_like(labels, -100)
-            shift_labels[:, :-1] = labels[:, 1:]
+            if ce_first_chunk_only:
+                # Build the objective directly from the supervised chunk. A
+                # uniform CE over concatenated hidden chunks sends zero tensors
+                # through ignored tails, turning unused writer.grad=None into
+                # zero and making AdamW decay writers that had no CE supervision.
+                # Public full logits and the full differentiable surprise metric
+                # remain available; no meta-gradient is detached.
+                ce_logits = self.lm_head(self.norm(ce_first_chunk_hidden))
+                shift_labels = labels[:, 1:1 + ce_first_chunk_hidden.shape[1]]
+            else:
+                ce_logits = logits
+                shift_labels = torch.full_like(labels, -100)
+                shift_labels[:, :-1] = labels[:, 1:]
             ce_loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
+                ce_logits.reshape(-1, self.config.vocab_size),
+                shift_labels.reshape(-1),
                 ignore_index=-100,
                 reduction="sum",
             ) / (shift_labels != -100).sum().clamp_min(1)

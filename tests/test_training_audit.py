@@ -22,6 +22,19 @@ except ImportError:
 
 
 class DeploymentAuditTests(unittest.TestCase):
+    def test_recovery_runner_is_stopped_before_its_trainer_and_during_evaluation(self):
+        workspace = Path("/project").resolve()
+        table = {
+            50: {"parent": 1, "cwd": workspace, "scripts": {"bash"}},
+            70: {"parent": 50, "cwd": workspace / "runs/snapshot", "scripts": {"run_recovery_training.py"}},
+            60: {"parent": 70, "cwd": workspace / "runs/snapshot", "scripts": {"train_5090.py"}},
+            61: {"parent": 60, "cwd": workspace / "runs/snapshot", "scripts": {"train_5090.py"}},
+        }
+        self.assertEqual(select_training_processes(table, [50], workspace), [70, 60])
+        table[60]["scripts"] = {"evaluate_model.py"}
+        del table[61]
+        self.assertEqual(select_training_processes(table, [50], workspace), [70])
+
     def test_stop_selects_session_descendants_in_workspace_and_pipeline_before_child(self):
         workspace = Path("/project").resolve()
         table = {
@@ -214,6 +227,16 @@ class TrainingAuditTests(unittest.TestCase):
             # concern learned inner-loop adaptation, which is off in pretrain.
             for stage in ("pretrain", "sft"):
                 saved["metrics"]["training_stage"] = stage
+                # Inner-loop protocol compatibility is independent of SFT's
+                # explicitly versioned conditioning/window policy.
+                settings = yaml.safe_load(config.read_text())["training"]
+                stage_data = training.PersonaMetaDataset(
+                    None, seq_len=settings["seq_len"], data_path=str(data), mode=stage,
+                    split="train" if settings.get("validation_fraction", 0) else "all",
+                    validation_fraction=settings.get("validation_fraction", 0),
+                    split_seed=settings.get("seed", 42),
+                )
+                saved["metrics"]["dataset_fingerprint"] = stage_data.fingerprint
                 torch.save(saved, checkpoint)
                 training.train(str(config), str(data), str(checkpoint), stage=stage)
             saved["metrics"]["training_stage"] = "meta"

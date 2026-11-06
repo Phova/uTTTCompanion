@@ -24,10 +24,10 @@ class PromptBudgetTests(unittest.TestCase):
         ))
         return SimpleUTF8Tokenizer(32000), BPETokenizer(backend.to_str(), 512)
 
-    def test_short_prompt_keeps_original_tokenization(self):
+    def test_short_prompt_ends_at_assistant_token(self):
         for tokenizer in self.tokenizers():
             with self.subTest(tokenizer=type(tokenizer).__name__):
-                expected = tokenizer.encode("<|user|> hello 世界\n<|assistant|> ", add_bos=True)
+                expected = tokenizer.encode("<|user|> hello 世界\n<|assistant|>", add_bos=True)
                 self.assertEqual(encode_chat_prompt(tokenizer, "  hello 世界\n", 64), expected)
 
     def test_long_prompt_preserves_roles_and_recent_question_with_exact_budget(self):
@@ -40,15 +40,15 @@ class PromptBudgetTests(unittest.TestCase):
                 self.assertEqual(ids.count(tokenizer.ASSISTANT_ID), 1)
                 decoded = tokenizer.decode(ids, skip_special_tokens=False)
                 self.assertIn("FINAL QUESTION", decoded)
-                self.assertTrue(decoded.endswith("\n<|assistant|> "), decoded)
+                self.assertTrue(decoded.endswith("\n<|assistant|>"), decoded)
 
     def test_insufficient_template_space_is_rejected(self):
         tokenizer = SimpleUTF8Tokenizer(32000)
-        for budget in (0, 1, 2, 3, 4, 5, True):
+        for budget in (0, 1, 2, 3, 4, True):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 encode_chat_prompt(tokenizer, "hello", budget)
-        ids = encode_chat_prompt(tokenizer, "x" * 100, 6)
-        self.assertEqual(ids, [1, 4, 16 + ord("x"), 16 + ord("\n"), 5, 16 + ord(" ")])
+        ids = encode_chat_prompt(tokenizer, "x" * 100, 5)
+        self.assertEqual(ids, [1, 4, 16 + ord("x"), 16 + ord("\n"), 5])
 
     def engine(self):
         engine = uTTTPersonalizer.__new__(uTTTPersonalizer)
@@ -72,10 +72,10 @@ class PromptBudgetTests(unittest.TestCase):
         inputs = engine.model.stream_generate.call_args.kwargs["input_ids"]
         self.assertEqual(tuple(inputs.shape), (1, 32))
         text = engine.tokenizer.decode(inputs[0], skip_special_tokens=False)
-        self.assertTrue(text.endswith("FINAL QUESTION\n<|assistant|> "), text)
+        self.assertTrue(text.endswith("FINAL QUESTION\n<|assistant|>"), text)
 
     def test_invalid_budget_cannot_load_or_evict_a_persona(self):
-        for max_tokens in (59, 63, True):
+        for max_tokens in (60, 63, True):
             engine = self.engine()
             with self.subTest(max_tokens=max_tokens), self.assertRaises(ValueError):
                 list(engine.stream_interact_and_evolve("alice", "hello", max_new_tokens=max_tokens))

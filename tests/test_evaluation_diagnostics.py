@@ -111,6 +111,38 @@ class EvaluationDecodingTests(unittest.TestCase):
         self.assertEqual(report['basic_instruction_total'], 0)
         self.assertEqual(len(report['results']), len(evaluation.DEFAULT_CONTINUATIONS))
 
+    def test_boundary_comparison_keeps_fixed_prompt_as_primary_and_labels_legacy(self):
+        manager, tokenizer = self.fixture()
+        report = self.run_evaluation(manager, tokenizer, [{'prompt': 'answer', 'accepted': ['aa']}],
+                                     compare_prompt_boundaries=True)
+        self.assertIn('<|user|> answer\n<|assistant|>', tokenizer.prompts)
+        self.assertIn('<|user|> answer\n<|assistant|> ', tokenizer.prompts)
+        self.assertEqual(report['results'], report['profile_results']['raw_greedy'])
+        self.assertEqual(report['results'][0]['prompt_boundary'], 'assistant_role')
+        legacy = report['profile_results']['legacy_space_raw_greedy'][0]
+        self.assertEqual(legacy['prompt_boundary'], 'legacy_assistant_space')
+        self.assertEqual(legacy['decoding_parameters']['repetition_penalty'], 1.)
+        self.assertIsNone(legacy['seed'])
+        self.assertTrue(report['prompt_boundary_comparison']['same_checkpoint'])
+        self.assertEqual(report['prompt_boundary_comparison']['decoding'], 'unpenalized_greedy')
+
+    def test_greedy_monitor_omits_sampling_and_keeps_boundary_ablation(self):
+        manager, tokenizer = self.fixture()
+        report = self.run_evaluation(manager, tokenizer, [{'prompt': 'answer'}],
+                                     greedy_only=True, compare_prompt_boundaries=True)
+        self.assertEqual(set(report['profile_results']), {'raw_greedy', 'legacy_space_raw_greedy'})
+        self.assertTrue(all(row['seed'] is None for rows in report['profile_results'].values() for row in rows))
+        with self.assertRaisesRegex(ValueError, 'controlled'):
+            self.run_evaluation(manager, tokenizer, [{'prompt': 'answer'}], greedy_only=True, controlled=True)
+
+    def test_boundary_comparison_does_not_add_a_space_to_continuation_prompts(self):
+        manager, tokenizer = self.fixture('pretrain')
+        report = self.run_evaluation(manager, tokenizer, [{'prompt': 'continue here'}],
+                                     compare_prompt_boundaries=True)
+        self.assertEqual(tokenizer.prompts, ['continue here'])
+        self.assertEqual(report['profile_results']['legacy_space_raw_greedy'], [])
+        self.assertEqual(report['results'][0]['prompt_boundary'], 'continuation')
+
     def test_sampled_results_are_repeatable_and_training_rng_is_restored(self):
         manager, tokenizer = self.fixture()
         torch.manual_seed(193)

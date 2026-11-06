@@ -1,0 +1,410 @@
+"""Recovery runs keep checkpoints, stage completion and heldout quality separate."""
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+from deploy import run_recovery_training as runner
+
+
+class FakeProcess:
+    pid = 54321
+
+    def __init__(self, lines=(), code=0):
+        self.stdout = iter(lines)
+        self.code = code
+        self.sent_signals = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        return False
+
+    def poll(self):
+        return None
+
+    def send_signal(self, signum):
+        self.sent_signals.append(signum)
+
+    def wait(self):
+        return self.code
+
+
+class RecoveryLifecycleTests(unittest.TestCase):
+    def test_meta_improvement_over_old_model_cannot_hide_sft_regression(self):
+        sft = {"candidate": {"accuracy": .8, "eos_rate": 1.0}}
+        improved_over_old = {"quality_passed": True, "reasons": [],
+                             "candidate": {"accuracy": .5, "eos_rate": .95}}
+        result = runner.check_meta_language_retention(sft, improved_over_old, {})
+        self.assertFalse(result["quality_passed"])
+        self.assertIn("meta_accuracy_regressed_from_sft", result["reasons"])
+        self.assertEqual(improved_over_old["reasons"], [])
+        improved_over_old["candidate"]["accuracy"] = .78
+        self.assertTrue(runner.check_meta_language_retention(sft, improved_over_old, {})["quality_passed"])
+        with self.assertRaisesRegex(ValueError, "max_meta_accuracy_drop"):
+            runner.check_meta_language_retention(sft, improved_over_old, {"max_meta_accuracy_drop": float("nan")})
+
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        (self.root / "deploy").mkdir()
+        self.initial = self.root / "old_sft.best.pt"
+        self.initial.touch()
+        self.config = self.root / "recovery.yaml"
+        self.config.write_text("config", encoding="utf-8")
+        self.data = self.root / "new_data.jsonl"
+        self.data.write_text("data", encoding="utf-8")
+        self.tasks_path = self.root / "heldout.jsonl"
+        self.tasks = [{"prompt": f"question {i}", "accepted": [str(i)]} for i in range(4)]
+        self.tasks_path.write_text("\n".join(json.dumps(task) for task in self.tasks), encoding="utf-8")
+        self.output = self.root / "new_sft.pt"
+        self.meta_output = self.root / "meta.pt"
+        self.argv = ["--config", str(self.config), "--data-path", str(self.data), "--init-from", str(self.initial),
+                     "--output-ckpt", str(self.output), "--tasks", str(self.tasks_path), "--steps", "10", "--run-id", "test"]
+        self.settings = {"training": {"stage": "sft", "max_steps": 10}}
+        self.info = {"step": 10, "metrics": {"training_stage": "sft", "training_pipeline": 3,
+                    "dataset_fingerprint": "newdata", "run_id": "test", "code_revision": "revision",
+                    "total_loss": 1.2}, "has_optimizer": True, "has_training_state": True}
+        self.handlers = {}
+        self.stack.enter_context(patch.object(runner, "__file__", str(self.root / "deploy/run_recovery_training.py")))
+        self.stack.enter_context(patch.object(runner, "load_config", return_value=self.settings))
+        self.stack.enter_context(patch.object(runner, "dataset_identity", return_value={
+            "fingerprint": "newdata", "documents": 30, "window_protocol": "conditioned_turn_v1"}))
+        self.stack.enter_context(patch.object(runner, "checkpoint_info", side_effect=self.saved_info))
+        self.stack.enter_context(patch.dict(os.environ, {"UTTT_CODE_REVISION": "revision"}))
+        self.stack.enter_context(patch.dict(sys.modules, {"fcntl": SimpleNamespace(
+            LOCK_EX=2, LOCK_NB=4, flock=lambda *args: None)}))
+        self.stack.enter_context(patch.object(runner.signal, "signal", side_effect=self.register_handler))
+        self.console = self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.baseline_correct = 0
+        self.candidate_correct = 3
+        self.processes = []
+        self.popen = self.stack.enter_context(patch.object(runner.subprocess, "Popen", side_effect=self.spawn))
+
+    def register_handler(self, signum, handler):
+        previous = self.handlers.get(signum)
+        self.handlers[signum] = handler
+        return previous
+
+    def spawn(self, command, **kwargs):
+        if "deploy/evaluate_model.py" in command:
+            report_path = Path(command[command.index("--output") + 1])
+            checkpoint = Path(command[command.index("--checkpoint") + 1])
+            correct = self.baseline_correct if checkpoint == self.initial else self.candidate_correct
+            report_path.write_text(json.dumps(self.report(correct)), encoding="utf-8")
+        elif "deploy/evaluate_memory.py" in command:
+            report_path = Path(command[command.index("--output") + 1])
+            checkpoint = Path(command[command.index("--checkpoint") + 1])
+            data = Path(command[command.index("--data-path") + 1])
+            report_path.write_text(json.dumps({
+                "checkpoint_sha256": runner.digest(checkpoint), "data_sha256": runner.digest(data),
+                "meta_trained": "--allow-untrained-baseline" not in command,
+                "free_generation_accuracy_measured": False, "online_writes_allowed": False,
+                "summary": {"paired_ce_gain": .1}, "groups": {}}), encoding="utf-8")
+        elif "train_5090.py" in command:
+            output = Path(command[command.index("--output-ckpt") + 1])
+            output.touch()
+            output.with_suffix(".best.pt").touch()
+        process = FakeProcess()
+        self.processes.append((command, process))
+        return process
+
+    def saved_info(self, path):
+        if not Path(path).exists():
+            raise FileNotFoundError(path)
+        if str(path).startswith(str(self.meta_output.with_suffix(""))):
+            info = json.loads(json.dumps(self.info))
+            info["metrics"].update(training_stage="meta", parameter_scope="memory")
+            return info
+        return self.info
+
+    def meta_arguments(self):
+        directory = self.root / "memory"
+        directory.mkdir()
+        config, data, heldout, manifest, probe = (directory / name for name in
+                                                ("meta.yaml", "train.jsonl", "heldout.jsonl", "manifest.json", "probe.json"))
+        config.write_text("meta-config", encoding="utf-8")
+        data.write_text("memory-train", encoding="utf-8")
+        heldout.write_text("memory-heldout", encoding="utf-8")
+        manifest.write_text(json.dumps({"files": {
+            "train": {"file": data.name, "sha256": runner.digest(data)},
+            "heldout": {"file": heldout.name, "sha256": runner.digest(heldout)}}}), encoding="utf-8")
+        probe.write_text("probe", encoding="utf-8")
+        meta_settings = {"training": {"stage": "meta", "parameter_scope": "memory", "max_steps": 10}}
+        self.stack.enter_context(patch.object(runner, "load_config", side_effect=lambda path:
+                                             meta_settings if Path(path) == config else self.settings))
+        self.stack.enter_context(patch.object(runner, "validate_meta_probe", return_value={"status": "ok"}))
+        return ["--meta-config", str(config), "--meta-data", str(data), "--meta-output-ckpt", str(self.meta_output),
+                "--meta-capacity-probe", str(probe)]
+
+    def report(self, correct, eos=True):
+        return {"results": [{"prompt": task["prompt"], "exact_match": i < correct,
+                             "eos_generated": eos} for i, task in enumerate(self.tasks)]}
+
+    def state(self):
+        return json.loads((self.root / "logs/recovery_test/state.json").read_text(encoding="utf-8"))
+
+    def stop(self):
+        self.handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    def test_complete_sft_reports_quality_without_enabling_online_writes(self):
+        self.assertEqual(runner.main(self.argv), 0)
+        state = self.state()
+        self.assertEqual(state["status"], "complete")
+        self.assertTrue(state["training_complete"])
+        self.assertTrue(state["quality_passed"])
+        self.assertFalse(state["online_writes_allowed"])
+        self.assertEqual([stage["stage"] for stage in state["stages"]], ["baseline_evaluate", "sft", "sft_evaluate"])
+        self.assertTrue(all(stage["status"] == "complete" for stage in state["stages"]))
+        command = self.processes[1][0]
+        self.assertIn("--init-from", command)
+        self.assertIn("--no-resume", command)
+
+    def test_training_completion_is_distinct_from_failed_quality(self):
+        self.candidate_correct = 1
+        runner.main(self.argv)
+        self.assertTrue(self.state()["training_complete"])
+        self.assertFalse(self.state()["quality_passed"])
+        self.assertEqual(self.state()["status"], "quality_failed")
+        self.assertFalse(self.state()["online_writes_allowed"])
+
+    def test_requested_stop_forwards_term_and_launches_no_next_stage(self):
+        original = self.spawn
+
+        def spawn(command, **kwargs):
+            process = original(command, **kwargs)
+            if "train_5090.py" in command:
+                def lines():
+                    yield "saving checkpoint\n"
+                    self.stop()
+                process.stdout = lines()
+            return process
+
+        self.popen.side_effect = spawn
+        self.assertEqual(runner.main(self.argv), 0)
+        self.assertEqual(len(self.processes), 2)
+        self.assertEqual(self.processes[-1][1].sent_signals, [signal.SIGTERM])
+        self.assertEqual(self.state()["status"], "interrupted")
+        self.assertFalse(self.state()["training_complete"])
+
+    def test_baseline_stop_can_resume_before_any_training_checkpoint_exists(self):
+        original = self.spawn
+        def interrupted(command, **kwargs):
+            process = original(command, **kwargs)
+            if "deploy/evaluate_model.py" in command:
+                def lines():
+                    self.stop()
+                    yield "baseline interrupted\n"
+                process.stdout = lines()
+            return process
+        self.popen.side_effect = interrupted
+        runner.main(self.argv)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.state()["stage"], "baseline_evaluate")
+        old_reports = {path: path.read_bytes() for path in (self.root / "logs/recovery_test").glob("*.json")}
+        self.processes.clear()
+        self.popen.side_effect = original
+        runner.main(self.argv + ["--resume"])
+        self.assertTrue(self.state()["training_complete"])
+        self.assertEqual(self.state()["resume_action"], "initialization_retry_no_checkpoint")
+        self.assertIn("--init-from", self.processes[1][0])
+        for path, contents in old_reports.items():
+            if path.name != "state.json":
+                self.assertEqual(path.read_bytes(), contents)
+
+    def test_sft_stop_before_first_save_retries_initialization_and_reuses_baseline(self):
+        original = self.spawn
+        def interrupted(command, **kwargs):
+            if "train_5090.py" not in command:
+                return original(command, **kwargs)
+            def lines():
+                self.stop()
+                yield "stopped before first optimizer step\n"
+            process = FakeProcess(lines=lines())
+            self.processes.append((command, process))
+            return process
+        self.popen.side_effect = interrupted
+        runner.main(self.argv)
+        self.assertFalse(self.output.exists())
+        baseline_report = Path(self.state()["baseline_report"])
+        baseline_bytes = baseline_report.read_bytes()
+        self.processes.clear()
+        self.popen.side_effect = original
+        runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 2)
+        self.assertIn("train_5090.py", self.processes[0][0])
+        self.assertIn("--init-from", self.processes[0][0])
+        self.assertEqual(baseline_report.read_bytes(), baseline_bytes)
+
+    def test_read_error_can_use_valid_previous_full_but_conflicting_metadata_cannot(self):
+        self.output.touch()
+        previous = Path(str(self.output) + ".prev")
+        previous.touch()
+        expected = {"stage": "sft", "fingerprint": "newdata", "run_id": "test", "revision": "revision"}
+        def corrupt(path):
+            if Path(path) == self.output:
+                raise RuntimeError("unreadable torch archive")
+            return self.info
+        with patch.object(runner, "checkpoint_info", side_effect=corrupt):
+            self.assertEqual(runner.resume_checkpoint_source(self.output, **expected), previous)
+        conflict = json.loads(json.dumps(self.info))
+        conflict["metrics"]["dataset_fingerprint"] = "different-data"
+        with patch.object(runner, "checkpoint_info", side_effect=lambda path: conflict if Path(path) == self.output else self.info) as reader:
+            with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                runner.resume_checkpoint_source(self.output, **expected)
+            reader.assert_called_once_with(self.output)
+
+    def test_failed_training_never_evaluates_stale_best(self):
+        original = self.spawn
+
+        def spawn(command, **kwargs):
+            process = original(command, **kwargs)
+            if "train_5090.py" in command:
+                process.code = 1
+            return process
+
+        self.popen.side_effect = spawn
+        with self.assertRaisesRegex(RuntimeError, "sft exited"):
+            runner.main(self.argv)
+        self.assertEqual(len(self.processes), 2)
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertFalse(self.state()["online_writes_allowed"])
+
+    def test_checkpoint_requires_final_step_data_version_and_full_state(self):
+        for field in ("step", "fingerprint", "optimizer"):
+            with self.subTest(field=field):
+                info = json.loads(json.dumps(self.info))
+                if field == "step":
+                    info["step"] = 9
+                elif field == "fingerprint":
+                    info["metrics"]["dataset_fingerprint"] = "old-windowing-policy"
+                else:
+                    info["has_optimizer"] = False
+                with patch.object(runner, "checkpoint_info", return_value=info):
+                    with self.assertRaises(RuntimeError):
+                        runner.validate_checkpoint(self.output, stage="sft", fingerprint="newdata",
+                                                   run_id="test", revision="revision", target=10)
+
+    def test_new_run_refuses_an_old_output_without_launching_any_process(self):
+        self.output.touch()
+        with self.assertRaises(FileExistsError):
+            runner.main(self.argv)
+        self.popen.assert_not_called()
+
+    def test_resume_keeps_history_and_omits_weight_initialization(self):
+        runner.main(self.argv)
+        first_count = len(self.state()["stages"])
+        self.processes.clear()
+        runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 2)
+        command = self.processes[0][0]
+        self.assertIn("train_5090.py", command)
+        self.assertNotIn("--init-from", command)
+        self.assertNotIn("--no-resume", command)
+        self.assertEqual(len(self.state()["stages"]), first_count + 2)
+        self.assertEqual(len(list((self.root / "logs/recovery_test").glob("*_sft.log"))), 2)
+
+    def test_changed_resume_binding_preserves_the_original_manifest(self):
+        runner.main(self.argv)
+        path = self.root / "logs/recovery_test/state.json"
+        original = path.read_bytes()
+        self.data.write_text("changed data", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "differs from the original run"):
+            runner.main(self.argv + ["--resume"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_meta_records_separate_heldout_ablation_and_reuses_verified_reports_on_resume(self):
+        arguments = self.argv + self.meta_arguments()
+        runner.main(arguments)
+        stages = [entry["stage"] for entry in self.state()["stages"]]
+        self.assertEqual(stages, ["baseline_evaluate", "sft", "sft_evaluate", "memory_baseline_evaluate",
+                                  "meta", "meta_evaluate", "meta_memory_evaluate"])
+        self.assertEqual(set(self.state()["memory_evaluations"]), {"baseline", "meta"})
+        self.assertFalse(self.state()["online_writes_allowed"])
+        self.assertFalse(self.state()["online_memory_quality_verified"])
+        baseline_command = self.processes[3][0]
+        self.assertIn("--allow-untrained-baseline", baseline_command)
+        self.assertEqual(baseline_command[baseline_command.index("--max-samples") + 1], "64")
+        report_files = {Path(command[command.index("--output") + 1]) for command, _ in self.processes if "--output" in command}
+        self.assertEqual(len(report_files), 5)
+        previous_contents = {path: path.read_bytes() for path in report_files}
+        self.processes.clear()
+        runner.main(arguments + ["--resume"])
+        self.assertFalse(any("deploy/evaluate_memory.py" in command for command, _ in self.processes))
+        self.assertTrue(all("--init-from" not in command for command, _ in self.processes if "train_5090.py" in command))
+        for path, contents in previous_contents.items():
+            self.assertEqual(path.read_bytes(), contents)
+        self.assertFalse(self.state()["online_writes_allowed"])
+
+    def test_failed_sft_quality_does_not_start_meta_or_memory_evaluation(self):
+        arguments = self.argv + self.meta_arguments()
+        self.candidate_correct = 1
+        runner.main(arguments)
+        self.assertEqual(len(self.processes), 3)
+        self.assertEqual(self.state()["meta_skipped_reason"], "SFT heldout quality gate failed")
+
+    def test_memory_manifest_is_required_and_bound_into_resume_identity(self):
+        arguments = self.argv + self.meta_arguments()
+        runner.main(arguments)
+        manifest = self.root / "memory/manifest.json"
+        contents = json.loads(manifest.read_text(encoding="utf-8"))
+        contents["changed_note"] = True
+        manifest.write_text(json.dumps(contents), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "differs from the original run"):
+            runner.main(arguments + ["--resume"])
+
+    def test_improvement_and_eos_gate_cannot_be_hidden_by_completion(self):
+        baseline = self.report(2)
+        same = runner.quality_comparison(baseline, self.report(2), self.tasks, {})
+        self.assertFalse(same["quality_passed"])
+        self.assertIn("heldout_accuracy_did_not_improve", same["reasons"])
+        regressed = runner.quality_comparison(baseline, self.report(4, eos=False), self.tasks, {})
+        self.assertFalse(regressed["quality_passed"])
+        self.assertIn("eos_rate_regressed", regressed["reasons"])
+
+    def test_wrong_heldout_report_is_rejected(self):
+        report = self.report(4)
+        report["results"][0]["prompt"] = "a different task"
+        with self.assertRaisesRegex(ValueError, "fixed heldout tasks"):
+            runner.quality_comparison(self.report(0), report, self.tasks, {})
+
+    def test_memory_only_probe_cannot_authorize_full_parameter_meta(self):
+        path = self.root / "probe.json"
+        path.write_text(json.dumps({"status": "ok", "finite": True, "scope": "memory",
+                                   "steps": [{}, {}], "all_writers_have_nonzero_ce_grad": True}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "same parameter scope"):
+            runner.validate_meta_probe(path, self.settings)
+
+    def test_probe_geometry_must_match_meta_training(self):
+        config = {"training": {"stage": "meta", "parameter_scope": "memory", "seq_len": 1024,
+                               "micro_batch_size": 1, "meta_checkpoint_layers": 4,
+                               "meta_checkpoint_reentrant": True}, "uttt": {"chunk_size": 128}}
+        report = {"status": "ok", "finite": True, "scope": "memory",
+                  "steps": [{"finite": True, "all_writers_have_nonzero_ce_grad": True}] * 2,
+                  "all_writers_have_nonzero_ce_grad": True, "seq_len": 1024, "batch_size": 1,
+                  "chunk_size": 128, "gradient_checkpointing": True, "gradient_checkpointing_every": 1,
+                  "meta_checkpoint_layers": 4, "meta_checkpoint_time_chunks": True,
+                  "meta_checkpoint_reentrant": True, "surprise_loss_measured": True,
+                  "peak_allocated_bytes": 27 * 1024 ** 3, "peak_reserved_bytes": 27 * 1024 ** 3}
+        path = self.root / "probe.json"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        self.assertEqual(runner.validate_meta_probe(path, config)["scope"], "memory")
+        for key, value in (("seq_len", 256), ("meta_checkpoint_reentrant", False),
+                           ("surprise_loss_measured", False), ("peak_reserved_bytes", 29 * 1024 ** 3)):
+            with self.subTest(key=key):
+                path.write_text(json.dumps({**report, key: value}), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    runner.validate_meta_probe(path, config)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -131,6 +131,7 @@ class PersonaMetaDataset(Dataset):
     GPUS = ["NVIDIA RTX 5090", "Blackwell sm_120 Node", "RTX 5090 32GB GDDR7"]
     LANGS = ["Python 3.12", "Rust", "C++20", "Go"]
     FRAMEWORKS = ["FastAPI + WebSockets", "PyTorch 2.6", "Triton", "Tokio"]
+    SFT_WINDOW_PROTOCOL = "conditioned_turn_v1"
 
     def __init__(
         self,
@@ -155,10 +156,16 @@ class PersonaMetaDataset(Dataset):
         self.mode, self.split = mode, split
         if mode not in {"pretrain", "sft", "meta"}:
             raise ValueError("mode must be pretrain, sft, or meta")
+        if mode == "sft" and seq_len < 5:
+            raise ValueError("SFT seq_len must fit BOS, user/assistant roles, a question token and an answer token (at least 5)")
         if not 0 <= validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0, 1)")
         seen = set()
         fingerprint = hashlib.sha256()
+        # A changed windowing policy is a data transition, even when the raw
+        # JSONL has not changed. Never silently resume an old SFT data cursor.
+        if mode == "sft":
+            fingerprint.update(f"{self.SFT_WINDOW_PROTOCOL}:seq_len={seq_len}\0".encode())
 
         if data_path:
             with open(data_path, "r", encoding="utf-8") as f:
@@ -236,13 +243,70 @@ class PersonaMetaDataset(Dataset):
                 assistant = False
         return ids, labels
 
+    def _sft_turns(self, ids, labels):
+        """Locate answered user turns; end at the answer's real first EOS."""
+        turns, user = [], None
+        for index, token in enumerate(ids):
+            if token == self.tokenizer.USER_ID:
+                user = index
+            elif token == self.tokenizer.ASSISTANT_ID:
+                if user is not None and index > user + 1:
+                    end = index + 1
+                    while end < len(ids) and ids[end] not in (
+                            self.tokenizer.USER_ID, self.tokenizer.ASSISTANT_ID):
+                        end += 1
+                        if ids[end - 1] == self.tokenizer.EOS_ID:
+                            break
+                    if any(value != -100 for value in labels[index + 1:end]):
+                        turns.append((user, index, end))
+                user = None
+        return turns
+
+    def _sft_window(self, ids, labels, text):
+        """Keep the question that conditions every supervised long-row answer.
+
+        Random answer-interior crops train continuation without the instruction.
+        Choose a whole answered turn instead. A long single turn keeps the
+        beginning/end of its question and the beginning of its answer. An answer
+        cut at the budget keeps its original labels; it is never given a fake EOS.
+        """
+        turns = self._sft_turns(ids, labels)
+        if not turns:
+            return ids[:self.seq_len], [-100] * min(len(ids), self.seq_len)
+        seed = int(hashlib.sha256(text.encode()).hexdigest()[:16], 16)
+        choice = (seed % len(turns) if self.split == "validation"
+                  else int(torch.randint(len(turns), ()).item()))
+        user, assistant, end = turns[choice]
+        budget = self.seq_len - 1  # Retain BOS in every reconstructed window.
+        if end - user <= budget:
+            # Include recent complete earlier turns when they fit. Only the
+            # selected answer is supervised, so every target retains its user.
+            starts = [index for index, token in enumerate(ids[:user + 1])
+                      if token == self.tokenizer.USER_ID and end - index <= budget]
+            start = starts[0]
+            return ([self.tokenizer.BOS_ID] + ids[start:end],
+                    [-100] * (assistant - start + 2) + labels[assistant + 1:end])
+        question, answer = ids[user + 1:assistant], ids[assistant + 1:end]
+        content_budget = self.seq_len - 3  # BOS + USER + ASSISTANT.
+        answer_budget = min(len(answer), max(1, content_budget // 2))
+        question_budget = min(len(question), content_budget - answer_budget)
+        answer_budget = min(len(answer), content_budget - question_budget)
+        if len(question) > question_budget:
+            head = (question_budget + 1) // 2
+            tail = question_budget - head
+            question = question[:head] + (question[-tail:] if tail else [])
+        prefix = [self.tokenizer.BOS_ID, self.tokenizer.USER_ID] + question + [self.tokenizer.ASSISTANT_ID]
+        return prefix + answer[:answer_budget], [-100] * len(prefix) + labels[assistant + 1:assistant + 1 + answer_budget]
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         text = self.external_texts[idx % len(self.external_texts)] if self.external_texts else self._synthesize_dialogue(idx)
         ids, labels = self._document(text)
         # Select targets from the whole conversation, not always its first 1024
         # characters. Compute role masks BEFORE cropping so mid-answer windows
         # retain their supervision and never fall back to training user prompts.
-        if len(ids) > self.seq_len:
+        if len(ids) > self.seq_len and self.mode == "sft":
+            ids, labels = self._sft_window(ids, labels, text)
+        elif len(ids) > self.seq_len:
             targets = [i for i, value in enumerate(labels) if value != -100 and i > 0]
             if targets:
                 seed = int(hashlib.sha256(text.encode()).hexdigest()[:16], 16)
@@ -279,6 +343,11 @@ def configure_rtx5090_environment(hw_cfg: Dict[str, Any]) -> Tuple[torch.device,
     Configure CUDA 12.8+ / Blackwell sm_120 flags, TF32 matmul precision,
     and strict 28GB VRAM limit on NVIDIA RTX 5090.
     """
+    allocator_conf = hw_cfg.get("cuda_allocator_conf")
+    if allocator_conf is not None:
+        actual = os.environ.get("PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+        if not isinstance(allocator_conf, str) or not allocator_conf or actual != allocator_conf:
+            raise ValueError("Set PYTORCH_ALLOC_CONF to hardware.cuda_allocator_conf before launching training")
     requested_device = hw_cfg.get("device", "cuda")
     if requested_device == "cuda" and torch.cuda.is_available():
         device = torch.device("cuda")
@@ -295,10 +364,24 @@ def configure_rtx5090_environment(hw_cfg: Dict[str, Any]) -> Tuple[torch.device,
         # Keep VRAM limit metadata for diagnostics; avoid set_per_process_memory_fraction
         # which triggers synchronous CUDACachingAllocator cuMemUnmap thrashing on WSL2/WDDM.
         vram_limit_gb = float(hw_cfg.get("vram_limit_gb", 29.5))
+        if hw_cfg.get("enforce_vram_limit", False):
+            from deploy.gpu_memory import GpuMemoryError, query_available_gpu_memory
+            properties = torch.cuda.get_device_properties(0)
+            runtime_free, _ = torch.cuda.mem_get_info(0)
+            memory = query_available_gpu_memory(
+                runtime_free, device_uuid=getattr(properties, "uuid", None), device_index=0,
+                visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+            )
+            budget = int(vram_limit_gb * 1024 ** 3)
+            if (not 0 < budget < properties.total_memory
+                    or memory["free_bytes"] < budget + int(1.5 * 1024 ** 3)):
+                raise GpuMemoryError("Enforced training budget requires its full allocation plus 1.5 GiB driver headroom")
+            torch.cuda.set_per_process_memory_fraction(budget / properties.total_memory, device=0)
 
         print(
             f"[Hardware] GPU: {gpu_name} (sm_{cap_major}{cap_minor}) | "
-            f"Total VRAM: {total_vram_gb:.1f} GB | Target Budget: {vram_limit_gb:.1f} GB"
+            f"Total VRAM: {total_vram_gb:.1f} GB | Target Budget: {vram_limit_gb:.1f} GB | "
+            f"Enforced={bool(hw_cfg.get('enforce_vram_limit', False))}"
         )
     else:
         device = torch.device("cpu")
@@ -652,6 +735,45 @@ def restore_training_rng(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+def validate_parameter_scope(stage, scope):
+    """A frozen language backbone is an explicit meta-training configuration."""
+    if scope not in ("all", "memory"):
+        raise ValueError("training.parameter_scope must be all or memory")
+    if scope == "memory" and stage != "meta":
+        raise ValueError("training.parameter_scope=memory is supported only for stage=meta")
+    return scope
+
+
+def apply_training_parameter_scope(model, stage, scope):
+    """Freeze parameter storage without severing gradients through the backbone.
+
+    Attention and embeddings still run in the differentiable forward. Their
+    Jacobians propagate the CE objective to memory reads/writes and W_0; only
+    their own parameter gradients and Adam moments are omitted in memory scope.
+    """
+    validate_parameter_scope(stage, scope)
+    total, trainable = 0, 0
+    for name, parameter in model.named_parameters():
+        enabled = scope == "all" or name.startswith("fast_weight_pool.") or ".uttt." in name
+        parameter.requires_grad_(enabled)
+        total += parameter.numel()
+        trainable += parameter.numel() if enabled else 0
+    if not trainable:
+        raise ValueError("Training parameter scope is empty")
+    return {"total": total, "trainable": trainable, "frozen": total - trainable}
+
+
+def validate_resume_parameter_scope(metadata, scope):
+    # Old checkpoints trained the complete model. Treat the missing field as
+    # all, never infer memory scope from sparse/inactive Adam state tensors.
+    saved_scope = metadata.get("parameter_scope", "all")
+    if saved_scope != scope:
+        raise ValueError(
+            f"Resume checkpoint uses a different parameter_scope ({saved_scope!r} versus {scope!r}). "
+            "Use a new output path and --init-from for an intentional parameter-scope transition."
+        )
+
+
 def validate_resume_optimizer_state(optimizer, saved_state, saved_step):
     """Reject weight-only or malformed Adam resumes before any model mutation.
 
@@ -740,6 +862,7 @@ def train(
     training_stage = stage or train_cfg.get("stage", "meta")
     if training_stage not in {"pretrain", "sft", "meta"}:
         raise ValueError("stage must be pretrain, sft, or meta")
+    parameter_scope = validate_parameter_scope(training_stage, train_cfg.get("parameter_scope", "all"))
     update_fast_weights = training_stage == "meta"
     corpus_manifest = read_manifest(data_path)
     if corpus_manifest and training_stage != "pretrain":
@@ -795,12 +918,15 @@ def train(
         model.load_dual_base_state(initialized["slow_weights"], initialized["init_fast_weights"])
         del initialized
         print(f"[Init] Loaded model weights from {init_from}; optimizer starts fresh for {training_stage}.")
+    scope_stats = apply_training_parameter_scope(model, training_stage, parameter_scope)
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     param_stats = model.num_parameters()
     print(
         f"[Model] {model_cfg.name} initialized | "
         f"Total Params: {param_stats['total'] / 1e6:.2f}M "
         f"(Slow: {param_stats['slow_weights'] / 1e6:.2f}M, "
-        f"Shared Fast Pool W_0: {param_stats['fast_weight_pool'] / 1e6:.2f}M)"
+        f"Shared Fast Pool W_0: {param_stats['fast_weight_pool'] / 1e6:.2f}M) | "
+        f"ParameterScope={parameter_scope}, Trainable={scope_stats['trainable']:,}, Frozen={scope_stats['frozen']:,}"
     )
 
     # Separate parameter groups for Slow Weights (Theta_slow) and Meta-Init Fast Weights (W_0)
@@ -812,13 +938,13 @@ def train(
         [
             {
                 "name": "slow_weights",
-                "params": model.get_slow_parameters(),
+                "params": [parameter for parameter in model.get_slow_parameters() if parameter.requires_grad],
                 "lr": outer_lr,
                 "weight_decay": weight_decay,
             },
             {
                 "name": "init_fast_weights",
-                "params": model.get_meta_fast_parameters(),
+                "params": [parameter for parameter in model.get_meta_fast_parameters() if parameter.requires_grad],
                 "lr": meta_fast_lr,
                 "weight_decay": 0.0,
             },
@@ -903,6 +1029,7 @@ def train(
                 print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
         if saved is not None:
             metadata = saved.get("metrics", {})
+            validate_resume_parameter_scope(metadata, parameter_scope)
             if training_stage == "meta" and metadata.get("inner_loop_protocol") != model.INNER_LOOP_PROTOCOL:
                 raise ValueError("Resume checkpoint uses a different meta inner-loop protocol. Use a new output path and --init-from for an intentional protocol transition.")
             if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
@@ -987,7 +1114,8 @@ def train(
         f"MicroBatch={micro_batch_size}, GradAccum={grad_accum_steps}, SeqLen={seq_len}, "
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
-        f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}",
+        f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}, "
+        f"ParameterScope={parameter_scope}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -1130,7 +1258,7 @@ def train(
                 data_iter = iter(loader)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
+            trainable_parameters,
             max_outer_grad_norm,
             error_if_nonfinite=True,
             foreach=(device.type == "cuda"),
@@ -1231,6 +1359,8 @@ def train(
                     "surprise_loss_measured": update_fast_weights,
                     "causal_ttt_v2": True,
                     "training_pipeline": 3, "training_stage": training_stage,
+                    "parameter_scope": parameter_scope,
+                    "trainable_parameters": scope_stats["trainable"], "frozen_parameters": scope_stats["frozen"],
                     "inner_loop_protocol": model.INNER_LOOP_PROTOCOL,
                     "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),
                     "run_id": os.environ.get("UTTT_RUN_ID"),
