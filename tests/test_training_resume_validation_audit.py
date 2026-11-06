@@ -208,7 +208,8 @@ class ResumeValidationAuditTests(unittest.TestCase):
                             mock.patch.object(model.fast_weight_pool, "readonly_state", wraps=model.fast_weight_pool.readonly_state) as readonly, \
                             mock.patch.object(model, "forward", wraps=model.forward) as forward:
                         actual = training.evaluate_language_model(model, dataset, torch.device("cpu"), dtype, updates)
-                    self.assertEqual(actual, expected)
+                    self.assertEqual({key: actual[key] for key in expected}, expected)
+                    self.assertEqual(actual["validation_examples"], len(dataset))
                     self.assertTrue(model.training)
                     self.assertEqual(amp.call_count, 1)
                     self.assertTrue(all(call.kwargs["return_fast_state"] is False for call in forward.call_args_list))

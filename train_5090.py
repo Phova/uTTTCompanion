@@ -545,6 +545,30 @@ def validate_resume_sft_padding(metadata, enabled):
         raise ValueError("Resume checkpoint uses different trim_sft_padding; use a new run and --init-from")
 
 
+def validate_validation_selection_metric(stage, metric="validation_ce"):
+    if metric not in ("validation_ce", "validation_example_ce"):
+        raise ValueError("training.validation_selection_metric must be validation_ce or validation_example_ce")
+    if metric == "validation_example_ce" and stage != "sft":
+        raise ValueError("validation_example_ce selection requires stage=sft")
+    return metric
+
+
+def validate_resume_validation_selection(metadata, metric):
+    previous = metadata.get("validation_selection_metric", "validation_ce")
+    if previous != metric:
+        raise ValueError("Resume checkpoint uses different validation_selection_metric; use a new run and --init-from")
+    if metric == "validation_example_ce" and "best_validation_score" not in metadata:
+        raise ValueError("Resume checkpoint is missing historical best_validation_score for validation_example_ce")
+    value = metadata.get("best_validation_score", metadata.get("best_validation_ce", float("inf")))
+    try:
+        score = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Resume checkpoint has invalid best_validation_score") from error
+    if math.isnan(score) or score == -float("inf"):
+        raise ValueError("Resume checkpoint has invalid best_validation_score")
+    return score
+
+
 # ==============================================================================
 # 3. Base Checkpoint Export (`checkpoints/base_uttt.pt`)
 # ==============================================================================
@@ -788,6 +812,7 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
     was_training = model.training
     model.eval()
     nll, frozen_nll, targets = 0.0, 0.0, 0
+    example_nll, examples = 0.0, 0
     try:
         count_batches = min(len(dataset), max_batches)
         indices = [index * (len(dataset) - 1) // max(1, count_batches - 1) for index in range(count_batches)]
@@ -809,18 +834,22 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
                 inputs = {name: value.unsqueeze(0).to(device) for name, value in batch.items()}
                 result = model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0,
                                return_fast_state=False, fast_state=None if update_fast_weights else frozen_state)
-                nll += float(result.ce_loss) * count
+                example_ce = float(result.ce_loss)
+                nll += example_ce * count
+                example_nll += example_ce
+                examples += 1
                 if update_fast_weights:
                     frozen = model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0,
                                    return_fast_state=False, fast_state=frozen_state)
                     frozen_nll += float(frozen.ce_loss) * count
                 else:
-                    frozen_nll += float(result.ce_loss) * count
+                    frozen_nll += example_ce * count
                 targets += count
         if not targets:
             raise ValueError("Validation split has no supervised next-token targets")
         return {"validation_ce": nll / targets, "validation_frozen_ce": frozen_nll / targets,
-                "validation_targets": targets}
+                "validation_targets": targets, "validation_example_ce": example_nll / examples,
+                "validation_examples": examples}
     finally:
         model.train(was_training)
 
@@ -1045,6 +1074,9 @@ def train(
     training_stage = stage or train_cfg.get("stage", "meta")
     if training_stage not in {"pretrain", "sft", "meta"}:
         raise ValueError("stage must be pretrain, sft, or meta")
+    validation_selection_metric = validate_validation_selection_metric(
+        training_stage, train_cfg.get("validation_selection_metric", "validation_ce"),
+    )
     validation_group_key = validate_sft_validation_group_key(training_stage, train_cfg.get("validation_group_key"))
     parameter_scope = validate_parameter_scope(training_stage, train_cfg.get("parameter_scope", "all"))
     update_fast_weights = training_stage == "meta"
@@ -1211,6 +1243,7 @@ def train(
     start_step = 1
     tokens_seen = 0
     best_validation_ce = float("inf")
+    best_validation_score = float("inf")
     validation_metrics = {}
     evaluation_interval = max(1, int(train_cfg.get("eval_interval", 250)))
     cur_data_tag = str(Path(data_path).expanduser().resolve()) if data_path else "synthetic"
@@ -1232,6 +1265,7 @@ def train(
             metadata = saved.get("metrics", {})
             validate_resume_parameter_scope(metadata, parameter_scope)
             validate_resume_sft_padding(metadata, trim_sft_padding)
+            best_validation_score = validate_resume_validation_selection(metadata, validation_selection_metric)
             if training_stage == "meta" and metadata.get("inner_loop_protocol") != model.INNER_LOOP_PROTOCOL:
                 raise ValueError("Resume checkpoint uses a different meta inner-loop protocol. Use a new output path and --init-from for an intentional protocol transition.")
             if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
@@ -1512,9 +1546,15 @@ def train(
                 model, validation_dataset, device, amp_dtype, update_fast_weights,
                 max_batches=int(train_cfg.get("eval_samples", 32)),
             )
-            improved = validation_metrics["validation_ce"] < best_validation_ce
+            validation_score = float(validation_metrics[validation_selection_metric])
+            improved = validation_score < best_validation_score
+            best_validation_score = min(best_validation_score, validation_score)
             best_validation_ce = min(best_validation_ce, validation_metrics["validation_ce"])
             print(f"[Validation {step}] CE={validation_metrics['validation_ce']:.4f} | Frozen CE={validation_metrics['validation_frozen_ce']:.4f} | Tokens seen={tokens_seen:,} | Stage: {training_stage} | TTT: {'enabled' if update_fast_weights else 'disabled'}", flush=True)
+            if "validation_example_ce" in validation_metrics:
+                print(f"[Validation selection {step}] Example CE={validation_metrics['validation_example_ce']:.4f} | "
+                      f"Examples={validation_metrics['validation_examples']} | Metric={validation_selection_metric} | "
+                      f"Best Score={best_validation_score:.4f}", flush=True)
             if train_cfg.get("eval_prompts"):
                 validation_metrics["validation_samples"] = generate_validation_samples(
                     model, tokenizer, train_cfg["eval_prompts"], training_stage, device, amp_dtype,
@@ -1600,7 +1640,9 @@ def train(
                     "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),
                     "run_id": os.environ.get("UTTT_RUN_ID"),
                     "dataset_fingerprint": dataset.fingerprint, "tokens_seen": tokens_seen,
-                    "best_validation_ce": best_validation_ce, **validation_metrics,
+                    "best_validation_ce": best_validation_ce,
+                    "best_validation_score": best_validation_score,
+                    "validation_selection_metric": validation_selection_metric, **validation_metrics,
                     "data_source": cur_data_tag,
                     "peak_vram_gb": (
                         torch.cuda.max_memory_allocated(device) / (1024 ** 3)
