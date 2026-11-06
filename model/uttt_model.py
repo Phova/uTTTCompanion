@@ -708,6 +708,7 @@ class uTTTModel(nn.Module):
         surprise_aux_weight: float = 0.10,
         logits_to_keep: int = 0,
         return_fast_state: bool = True,
+        ce_reduction: str = "token_mean",
     ) -> uTTTModelOutput:
         """
         Forward pass through all uTTTBlocks with sequential cross-layer FastWeightState passing.
@@ -724,7 +725,15 @@ class uTTTModel(nn.Module):
             start_pos:           Starting token position for RoPE during decoding.
             update_fast_weights: Whether to update W_fast in each block's inner loop.
             surprise_aux_weight: Weight of inner-loop surprise loss in total meta-training loss.
+            ce_reduction:       "token_mean" keeps the default target-token average.
+                                Frozen-write labeled calls may use "sequence_mean"
+                                to give each sequence equal weight, matching the
+                                average of separate one-sequence forward losses.
         """
+        if ce_reduction not in ("token_mean", "sequence_mean"):
+            raise ValueError("ce_reduction must be token_mean or sequence_mean")
+        if ce_reduction == "sequence_mean" and (labels is None or update_fast_weights):
+            raise ValueError("sequence_mean requires labels and update_fast_weights=False")
         bsz, seq_len = input_ids.shape
         if seq_len == 0 or self.config.chunk_size < 1:
             raise ValueError("input sequence and chunk_size must be non-empty/positive")
@@ -808,14 +817,24 @@ class uTTTModel(nn.Module):
                 h_sub = h_shift[b_start:b_end].reshape(-1, self.config.d_model)
                 l_sub = lbl_shift[b_start:b_end].reshape(-1)
                 logits_sub = self.lm_head(h_sub)
-                ce_sums.append(
-                    F.cross_entropy(
-                        logits_sub, l_sub, ignore_index=-100, reduction="sum"
+                if ce_reduction == "sequence_mean":
+                    token_losses = F.cross_entropy(
+                        logits_sub, l_sub, ignore_index=-100, reduction="none"
+                    ).reshape(b_end - b_start, -1)
+                    ce_sums.append(token_losses.sum(dim=1))
+                    ce_counts.append((lbl_shift[b_start:b_end] != -100).sum(dim=1))
+                else:
+                    ce_sums.append(
+                        F.cross_entropy(
+                            logits_sub, l_sub, ignore_index=-100, reduction="sum"
+                        )
                     )
-                )
-                ce_counts.append((l_sub != -100).sum())
-            total_valid = torch.stack(ce_counts).sum().clamp_min(1)
-            ce_loss = torch.stack(ce_sums).sum() / total_valid
+                    ce_counts.append((l_sub != -100).sum())
+            if ce_reduction == "sequence_mean":
+                ce_loss = (torch.cat(ce_sums) / torch.cat(ce_counts).clamp_min(1)).mean()
+            else:
+                total_valid = torch.stack(ce_counts).sum().clamp_min(1)
+                ce_loss = torch.stack(ce_sums).sum() / total_valid
             # Multiplying a connected auxiliary graph by zero still traverses
             # its complete higher-order backward. Keep the metric available,
             # but omit that graph from the objective when it is disabled.
@@ -837,12 +856,21 @@ class uTTTModel(nn.Module):
                 ce_logits = logits
                 shift_labels = torch.full_like(labels, -100)
                 shift_labels[:, :-1] = labels[:, 1:]
-            ce_loss = F.cross_entropy(
-                ce_logits.reshape(-1, self.config.vocab_size),
-                shift_labels.reshape(-1),
-                ignore_index=-100,
-                reduction="sum",
-            ) / (shift_labels != -100).sum().clamp_min(1)
+            if ce_reduction == "sequence_mean":
+                token_losses = F.cross_entropy(
+                    ce_logits.reshape(-1, self.config.vocab_size),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).reshape_as(shift_labels)
+                ce_loss = (token_losses.sum(dim=1) / (shift_labels != -100).sum(dim=1).clamp_min(1)).mean()
+            else:
+                ce_loss = F.cross_entropy(
+                    ce_logits.reshape(-1, self.config.vocab_size),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                ) / (shift_labels != -100).sum().clamp_min(1)
             total_loss = ce_loss if surprise_aux_weight == 0.0 else ce_loss + surprise_aux_weight * mean_surprise_loss
         elif logits_to_keep < 0:
             # Skip final norm and lm_head when logits are not needed (e.g. test_time_update)

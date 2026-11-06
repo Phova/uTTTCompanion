@@ -46,6 +46,7 @@ from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
 from engine.corpus import ResumableBatchSampler, TokenizedCorpusDataset, read_manifest
 from engine.prompting import encode_chat_prompt
+from engine.sft_execution import validate_sft_execution, materialize_sft_execution_step
 from deploy.training_diagnostics import repetition_metrics
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
@@ -1087,6 +1088,15 @@ def train(
         train_cfg.get("trim_sft_padding", False), training_stage, model_cfg.dropout,
         bool(hw_cfg.get("torch_compile", True)),
     )
+    sft_execution = validate_sft_execution(
+        train_cfg.get("sft_execution_batch_size"), train_cfg.get("sft_padding_multiple", 128),
+        train_cfg.get("sft_sort_by_length", False), stage=training_stage, dropout=model_cfg.dropout,
+        torch_compile=hw_cfg.get("torch_compile", True),
+        micro_batch_size=(override_batch_size if override_batch_size is not None else
+                          1 if large_preset else train_cfg.get("micro_batch_size", 4)),
+        trim_sft_padding=trim_sft_padding,
+        max_tokens_per_group=train_cfg.get("sft_max_group_tokens", 1536),
+    )
 
     seed = int(train_cfg.get("seed", 42))
     torch.manual_seed(seed)
@@ -1312,7 +1322,7 @@ def train(
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
         f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}, "
-        f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}",
+        f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}, SFTExecution={sft_execution}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -1354,20 +1364,35 @@ def train(
                 step_surprise_gpu = torch.zeros((), device=device, dtype=torch.float32)
                 inv_accum = 1.0 / float(grad_accum_steps)
                 step_tokens = 0
+                # Consume the same semantic B1 samples, in the same order, before
+                # regrouping only this optimizer step. The cursor/RNG transaction
+                # below also covers materialization and partial-group backward.
+                if sft_execution is not None:
+                    execution_plan, data_iter = materialize_sft_execution_step(
+                        loader, data_iter, batch_sampler, grad_accum_steps, sft_execution,
+                        pad_token_id=tokenizer.PAD_ID,
+                    )
+                    step_tokens = execution_plan.actual_tokens
+                    execution_batches = ((group.batch, group.loss_weight) for group in execution_plan.groups)
+                else:
+                    execution_batches = ((None, inv_accum) for _ in range(grad_accum_steps))
 
                 # This context exits before clipping and optimizer.step, so
                 # cached BF16 casts can never survive a parameter update.
                 with accumulation_autocast(autocast_device_type, amp_dtype, cache_across_accumulation):
-                    for _ in range(grad_accum_steps):
-                        try:
-                            batch = next(data_iter)
-                        except StopIteration:
-                            data_iter = iter(loader)
-                            batch = next(data_iter)
+                    for batch, loss_weight in execution_batches:
+                        if batch is None:
+                            try:
+                                batch = next(data_iter)
+                            except StopIteration:
+                                data_iter = iter(loader)
+                                batch = next(data_iter)
+                            step_tokens += int(batch["attention_mask"].sum())
+                        elif device.type == "cuda":
+                            batch = {name: tensor.pin_memory() for name, tensor in batch.items()}
 
                         if not bool((batch["labels"][:, 1:] != -100).any()):
                             raise ValueError("Batch has no supervised next-token targets; check dialogue roles and training stage")
-                        step_tokens += int(batch["attention_mask"].sum())
                         input_ids = batch["input_ids"].to(device, non_blocking=True)
                         labels = batch["labels"].to(device, non_blocking=True)
                         # Packing can still leave padding (e.g. a one-row dataset).
@@ -1383,8 +1408,9 @@ def train(
                                 update_fast_weights=update_fast_weights,
                                 surprise_aux_weight=surprise_aux_weight,
                                 return_fast_state=False,
+                                **({"ce_reduction": "sequence_mean"} if sft_execution is not None else {}),
                             )
-                            scaled_loss = out.loss * inv_accum
+                            scaled_loss = out.loss * loss_weight
 
                         # The outer cache stays alive, but ordinary backward kernels
                         # must run outside enabled autocast. Checkpoint recomputation
@@ -1392,11 +1418,12 @@ def train(
                         with (torch.amp.autocast(autocast_device_type, enabled=False)
                               if cache_across_accumulation else nullcontext()):
                             scaled_loss.backward()
-                        batch_sampler.advance(input_ids.shape[0])
+                        if sft_execution is None:
+                            batch_sampler.advance(input_ids.shape[0])
 
-                        step_loss_gpu += out.loss.detach().float() * inv_accum
-                        step_ce_gpu += out.ce_loss.detach().float() * inv_accum
-                        step_surprise_gpu += out.surprise_loss.detach().float() * inv_accum
+                        step_loss_gpu += out.loss.detach().float() * loss_weight
+                        step_ce_gpu += out.ce_loss.detach().float() * loss_weight
+                        step_surprise_gpu += out.surprise_loss.detach().float() * loss_weight
                         del out, scaled_loss
                 break
             except torch.OutOfMemoryError:
@@ -1406,7 +1433,12 @@ def train(
                 out = scaled_loss = input_ids = labels = attention_mask = None
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                if not model.gradient_checkpointing:
+                if sft_execution is not None and sft_execution.execution_batch_size > 1:
+                    from dataclasses import replace
+                    sft_execution = replace(sft_execution, execution_batch_size=max(1, sft_execution.execution_batch_size // 2))
+                    print(f"[VRAM-Guard][Step {step:04d}] Reduced SFT execution group to "
+                          f"{sft_execution.execution_batch_size}; semantic B1 samples and loss weights preserved. Retrying step...", flush=True)
+                elif not model.gradient_checkpointing:
                     # Enable the checkpointing path implemented by this stage.
                     model.gradient_checkpointing = True
                     model_cfg.gradient_checkpointing = True
@@ -1558,6 +1590,11 @@ def train(
                     "training_pipeline": 3, "training_stage": training_stage,
                     "parameter_scope": parameter_scope,
                     "trim_sft_padding": trim_sft_padding,
+                    "sft_execution": (dict(execution_batch_size=sft_execution.execution_batch_size,
+                                           padding_multiple=sft_execution.padding_multiple,
+                                           sort_by_length=sft_execution.sort_by_length,
+                                           max_tokens_per_group=sft_execution.max_tokens_per_group,
+                                           ce_reduction="sequence_mean") if sft_execution is not None else None),
                     "trainable_parameters": scope_stats["trainable"], "frozen_parameters": scope_stats["frozen"],
                     "inner_loop_protocol": model.INNER_LOOP_PROTOCOL,
                     "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),

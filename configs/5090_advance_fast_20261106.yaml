@@ -1,0 +1,89 @@
+# Measured SFT execution configuration for a new, separately named run.
+# Group-isolated paraphrases, short complete public turns, bounded padding.
+hardware:
+  device: cuda
+  precision: bfloat16
+  tf32_matmul: true
+  torch_compile: false
+  vram_limit_gb: 28.0
+  cuda_allocator_conf: expandable_segments:True
+  enforce_vram_limit: true
+
+model:
+  name: uTTT-1.584B-Instruction-Advance
+  vocab_size: 32000
+  d_model: 2560
+  n_layers: 34
+  n_heads: 20
+  n_kv_heads: 5
+  d_ff_fast: 6912
+  sliding_window_size: 512
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-5
+  dropout: 0.0
+  repetition_penalty: 1.0
+
+uttt:
+  chunk_size: 128
+  base_inner_lr: 0.015
+  base_weight_decay: 0.005
+  momentum_beta: 0.9
+  max_inner_grad_norm: 1.0
+  normalize_loss_by_dim: true
+  surprise_threshold: 0.015
+  elastic_anchor_lambda: 0.02
+  max_weight_drift_ratio: 0.35
+
+training:
+  stage: sft
+  tokenizer_path: data/pretrain_20261029/tokenized/tokenizer.json
+  seed: 20261106
+  micro_batch_size: 1
+  grad_accum_steps: 16
+  seq_len: 512
+  max_steps: 6000
+  warmup_steps: 200
+  outer_lr: 5.0e-5
+  meta_fast_lr: 2.5e-5
+  weight_decay: 0.01
+  max_outer_grad_norm: 1.0
+  surprise_aux_loss_weight: 0.0
+  gradient_checkpointing: false
+  autocast_cache_across_accumulation: true
+  pack_sequences: false
+  trim_sft_padding: true
+  sft_execution_batch_size: 4
+  sft_padding_multiple: 32
+  sft_sort_by_length: true
+  sft_max_group_tokens: 1536
+  validation_group_key: validation_group_id
+  validation_fraction: 0.02
+  eval_interval: 500
+  eval_samples: 128
+  eval_new_tokens: 48
+  eval_prompts:
+    - "Hello"
+    - "翻译成中文，只输出译文：hello"
+    - "1+1等于多少？只输出数字。"
+    - "请只回答：你好"
+  log_interval: 10
+  save_interval: 500
+  base_checkpoint_path: checkpoints/uttt_1.584b_20261106_advance_fast.pt
+
+recovery:
+  evaluate_final_checkpoint: true
+  min_accuracy: 0.5
+  min_accuracy_improvement: 0.0
+  max_eos_rate_drop: 0.1
+  max_meta_accuracy_drop: 0.05
+  eval_max_new_tokens: 64
+
+personalization:
+  personas_dir: personas
+  max_gpu_users: 2
+  max_cpu_users: 8
+  auto_save_every_turn: true
+  default_max_new_tokens: 128
+  temperature: 0.3
+  top_p: 0.9

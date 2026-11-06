@@ -1,0 +1,294 @@
+{
+  "date": "2026-11-07",
+  "cpu_regression": {
+    "total": 413,
+    "passed": 391,
+    "skipped": 22,
+    "failures": 0
+  },
+  "same_batch_initial": {
+    "checkpoint_step": 6000,
+    "parameters": 1583879748,
+    "precision": "FP32 parameters/full fused AdamW state; BF16 AMP; lr=0",
+    "samples": {
+      "synthetic": 12,
+      "public": 4
+    },
+    "results": {
+      "b1_pad128": {
+        "seconds_per_step": 1.025326493999995,
+        "actual_tokens": 1306,
+        "physical_tokens": 2560,
+        "actual_tok_per_second": 1273.7406159330224,
+        "examples_per_second": 15.604785493819568,
+        "loss": 0.3355739414691925,
+        "raw_grad_norm": 1.329978585243225,
+        "gradients": {
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 23.472044467926025
+      },
+      "b1_pad32": {
+        "seconds_per_step": 0.9624304714000005,
+        "actual_tokens": 1306,
+        "physical_tokens": 1568,
+        "actual_tok_per_second": 1356.9811418171598,
+        "examples_per_second": 16.624577541404715,
+        "loss": 0.3358268141746521,
+        "raw_grad_norm": 1.3309787511825562,
+        "gradients": {
+          "relative_l2": 0.03362138545512941,
+          "cosine": 0.9994346791232924,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 23.458539485931396
+      },
+      "b2_pad32_sorted": {
+        "seconds_per_step": 0.7531860260000031,
+        "actual_tokens": 1306,
+        "physical_tokens": 1792,
+        "actual_tok_per_second": 1733.967379793096,
+        "examples_per_second": 21.24309194233502,
+        "loss": 0.3358057737350464,
+        "raw_grad_norm": 1.332228660583496,
+        "gradients": {
+          "relative_l2": 0.03314870848430644,
+          "cosine": 0.9994501763807805,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 23.499056339263916
+      },
+      "b4_pad32_sorted": {
+        "seconds_per_step": 0.6088562545999991,
+        "actual_tokens": 1306,
+        "physical_tokens": 1920,
+        "actual_tok_per_second": 2145.0054756487702,
+        "examples_per_second": 26.278780712389224,
+        "loss": 0.33565834164619446,
+        "raw_grad_norm": 1.330902338027954,
+        "gradients": {
+          "relative_l2": 0.034210641314046275,
+          "cosine": 0.9994146221207717,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 25.70255947113037
+      }
+    },
+    "worst_length_results": {
+      "b1_pad32": {
+        "seconds": 1.5152049810000108,
+        "physical_tokens": 8192,
+        "peak_allocated_gib": 23.490052223205566,
+        "valid_lengths": [
+          492,
+          508,
+          510,
+          509,
+          485,
+          499,
+          489,
+          508,
+          501,
+          489,
+          510,
+          502,
+          505,
+          507,
+          493,
+          488
+        ]
+      },
+      "b2_pad32_sorted": {
+        "seconds": 1.4507567899999856,
+        "physical_tokens": 8192,
+        "peak_allocated_gib": 25.051941871643066,
+        "valid_lengths": [
+          492,
+          508,
+          510,
+          509,
+          485,
+          499,
+          489,
+          508,
+          501,
+          489,
+          510,
+          502,
+          505,
+          507,
+          493,
+          488
+        ]
+      },
+      "b4_pad32_sorted": {
+        "oom": true
+      }
+    }
+  },
+  "same_batch_adaptive": {
+    "checkpoint_step": 6000,
+    "parameters": 1583879748,
+    "precision": "FP32 parameters/full fused AdamW state; BF16 AMP; lr=0",
+    "samples": {
+      "synthetic": 12,
+      "public": 4
+    },
+    "results": {
+      "b1_pad128": {
+        "seconds_per_step": 1.1090954228,
+        "actual_tokens": 1306,
+        "physical_tokens": 2560,
+        "actual_tok_per_second": 1177.5361913431204,
+        "examples_per_second": 14.426170797465488,
+        "loss": 0.3355739414691925,
+        "raw_grad_norm": 1.329858660697937,
+        "gradients": {
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 23.472044467926025
+      },
+      "b4_pad128_adaptive": {
+        "seconds_per_step": 0.7037592118000007,
+        "actual_tokens": 1306,
+        "physical_tokens": 3072,
+        "actual_tok_per_second": 1855.7483555485571,
+        "examples_per_second": 22.735048766291666,
+        "loss": 0.33561211824417114,
+        "raw_grad_norm": 1.3307114839553833,
+        "gradients": {
+          "relative_l2": 0.03480070730536315,
+          "cosine": 0.9993943564463618,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 27.058587074279785
+      },
+      "b4_pad32_adaptive": {
+        "seconds_per_step": 0.6095596877999995,
+        "actual_tokens": 1306,
+        "physical_tokens": 1920,
+        "actual_tok_per_second": 2142.5301346838855,
+        "examples_per_second": 26.248454942528458,
+        "loss": 0.33565834164619446,
+        "raw_grad_norm": 1.3309037685394287,
+        "gradients": {
+          "relative_l2": 0.03420590991951915,
+          "cosine": 0.9994153074529425,
+          "none_mismatch": []
+        },
+        "peak_allocated_gib": 25.70255947113037
+      }
+    },
+    "worst_length_results": {
+      "b4_pad128_adaptive": {
+        "seconds": 1.444196519000002,
+        "physical_tokens": 8192,
+        "peak_allocated_gib": 25.051941871643066,
+        "valid_lengths": [
+          492,
+          508,
+          510,
+          509,
+          485,
+          499,
+          489,
+          508,
+          501,
+          489,
+          510,
+          502,
+          505,
+          507,
+          493,
+          488
+        ]
+      },
+      "b4_pad32_adaptive": {
+        "seconds": 1.4244622199999952,
+        "physical_tokens": 8192,
+        "peak_allocated_gib": 25.051941871643066,
+        "valid_lengths": [
+          492,
+          508,
+          510,
+          509,
+          485,
+          499,
+          489,
+          508,
+          501,
+          489,
+          510,
+          502,
+          505,
+          507,
+          493,
+          488
+        ]
+      }
+    }
+  },
+  "actual_trainer": {
+    "steps_per_variant": 30,
+    "initial_full_checkpoint_step": 6000,
+    "note": "Actual trainer, same cursor and RNG, no checkpoint export; validation mocked for throughput only.",
+    "results": {
+      "legacy_b1_pad128": {
+        "step_lines": [
+          "[Step 6001/6030] Stage: sft | Total Loss: 0.1875 | CE Loss: 0.1875 | Surprise Loss: disabled | GradNorm: 1.077 | LR: 5.00e-06 | Speed: 503 tok/s | Peak VRAM: 23.49 GB",
+          "[Step 6010/6030] Stage: sft | Total Loss: 0.2492 | CE Loss: 0.2492 | Surprise Loss: disabled | GradNorm: 2.336 | LR: 5.00e-06 | Speed: 1,383 tok/s | Peak VRAM: 23.49 GB",
+          "[Step 6020/6030] Stage: sft | Total Loss: 0.2600 | CE Loss: 0.2600 | Surprise Loss: disabled | GradNorm: 2.342 | LR: 5.00e-06 | Speed: 1,384 tok/s | Peak VRAM: 23.49 GB",
+          "[Step 6030/6030] Stage: sft | Total Loss: 0.2626 | CE Loss: 0.2626 | Surprise Loss: disabled | GradNorm: 1.655 | LR: 5.00e-06 | Speed: 1,094 tok/s | Peak VRAM: 23.49 GB"
+        ],
+        "saved_metrics_in_ram": [
+          {
+            "tokens_seen": 8711384,
+            "sft_execution": null,
+            "total_loss": 0.03847487270832062,
+            "peak_vram_gb": 23.4900541305542
+          }
+        ],
+        "steady_interval_tok_per_second": [
+          1384,
+          1094
+        ]
+      },
+      "adaptive_b4_pad32": {
+        "step_lines": [
+          "[Step 6001/6030] Stage: sft | Total Loss: 0.1873 | CE Loss: 0.1873 | Surprise Loss: disabled | GradNorm: 1.075 | LR: 5.00e-06 | Speed: 1,020 tok/s | Peak VRAM: 24.82 GB",
+          "[Step 6010/6030] Stage: sft | Total Loss: 0.2494 | CE Loss: 0.2494 | Surprise Loss: disabled | GradNorm: 2.306 | LR: 5.00e-06 | Speed: 2,271 tok/s | Peak VRAM: 27.06 GB",
+          "[Step 6020/6030] Stage: sft | Total Loss: 0.2599 | CE Loss: 0.2599 | Surprise Loss: disabled | GradNorm: 2.397 | LR: 5.00e-06 | Speed: 2,206 tok/s | Peak VRAM: 27.06 GB",
+          "[Step 6030/6030] Stage: sft | Total Loss: 0.2627 | CE Loss: 0.2627 | Surprise Loss: disabled | GradNorm: 1.628 | LR: 5.00e-06 | Speed: 2,116 tok/s | Peak VRAM: 27.06 GB"
+        ],
+        "saved_metrics_in_ram": [
+          {
+            "tokens_seen": 8711384,
+            "sft_execution": {
+              "execution_batch_size": 4,
+              "padding_multiple": 32,
+              "sort_by_length": true,
+              "max_tokens_per_group": 1536,
+              "ce_reduction": "sequence_mean"
+            },
+            "total_loss": 0.038150038570165634,
+            "peak_vram_gb": 27.058588981628418
+          }
+        ],
+        "steady_interval_tok_per_second": [
+          2206,
+          2116
+        ]
+      }
+    },
+    "formal_checkpoint_unchanged": true
+  },
+  "candidate_files": {
+    "model/uttt_model.py": "da4fef5b1bbe2bb778e9607a6f090f86bcaaa3d08f14a638a0b109f6a83b6b40",
+    "train_5090.py": "4225bdb618fcb9c2c8c169d7c4d83d62c367e329154ff166ed26cc2337b9101b",
+    "engine/sft_execution.py": "9cafd74a8e647e1ecdd7866de3fc737fce5b9c6a54bfb8a266565082bc687a83"
+  }
+}
