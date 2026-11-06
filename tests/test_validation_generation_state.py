@@ -1,5 +1,7 @@
 """Raw generation diagnostics must leave training weights, mode and RNG intact."""
 import unittest
+import io
+from contextlib import redirect_stdout
 from unittest import mock
 
 try:
@@ -82,6 +84,30 @@ class ValidationGenerationStateTests(unittest.TestCase):
             self.assertEqual(model.training, originally_training)
             self.assertEqual(model.config.repetition_penalty, 1.7)
             torch.testing.assert_close(torch.get_rng_state(), rng)
+
+    def test_phase_logs_localize_failure_without_repeating_prompt_content(self):
+        model = self.model()
+        output = io.StringIO()
+        calls = 0
+
+        def generate(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("sample failed")
+            yield 2
+
+        with redirect_stdout(output), mock.patch.object(model, "stream_generate", generate):
+            with self.assertRaisesRegex(RuntimeError, "sample failed"):
+                generate_validation_samples(model, Tokenizer(), ["private prompt value"], "pretrain",
+                                            torch.device("cpu"), torch.float32, max_new_tokens=4)
+        lines = output.getvalue().splitlines()
+        self.assertNotIn("private prompt value", output.getvalue())
+        self.assertIn("prompt_start index=1/1 decoding=greedy", lines[1])
+        self.assertIn("prompt_complete index=1/1 decoding=greedy", lines[2])
+        self.assertIn("prompt_start index=1/1 decoding=sampled", lines[3])
+        self.assertIn("failed replies=1", lines[4])
+        self.assertFalse(any("prompt_complete" in line and "sampled" in line for line in lines))
 
     def test_real_dropout_model_samples_are_repeatable_without_modifying_weights(self):
         model = self.model()

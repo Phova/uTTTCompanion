@@ -112,7 +112,22 @@ class CheckpointPerformanceTests(unittest.TestCase):
         self.directory.cleanup()
 
     def load(self, path):
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+
+    def assert_nested_equal(self, left, right):
+        if isinstance(left, torch.Tensor):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+        elif isinstance(left, dict):
+            self.assertEqual(left.keys(), right.keys())
+            for key in left:
+                self.assert_nested_equal(left[key], right[key])
+        elif isinstance(left, (list, tuple)):
+            self.assertEqual(type(left), type(right))
+            self.assertEqual(len(left), len(right))
+            for actual, expected in zip(left, right):
+                self.assert_nested_equal(actual, expected)
+        else:
+            self.assertEqual(left, right)
 
     def assert_same_weights(self, left, right):
         for partition in ("slow_weights", "init_fast_weights"):
@@ -165,6 +180,108 @@ class CheckpointPerformanceTests(unittest.TestCase):
         training.export_base_checkpoint(model, None, self.config, self.full, 1, {})
         slow = self.load(self.full)["slow_weights"]
         self.assertNotEqual(slow["tok_embeddings.weight"].data_ptr(), slow["lm_head.weight"].data_ptr())
+
+    def test_storage_estimate_counts_backing_views_once_but_not_equal_independent_tensors(self):
+        source = torch.arange(16, dtype=torch.float32)
+        independent = source.clone()
+        estimate, has_cuda = training._checkpoint_storage_bytes(
+            {"source": source, "views": [source[1:], source[::2], source.view(4, 4)],
+             "independent": independent, "again": (independent,), "empty": torch.empty(0)}
+        )
+        self.assertEqual(estimate, source.untyped_storage().nbytes() * 2)
+        self.assertFalse(has_cuda)
+
+    def test_low_memory_gpu_fallback_matches_frozen_export_and_preserves_full_resume_state(self):
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=.001)
+        ids = torch.tensor([[6, 7, 8, 9]])
+        self.model(ids, labels=ids, update_fast_weights=False).loss.backward()
+        optimizer.step()
+        metrics = {"ce_loss": 1.2, "samples": [{"reply": "unchanged"}]}
+        state = {"data_cursor": {"size": 17, "seed": 19, "epoch": 2, "offset": 4},
+                 "rng": training.capture_training_rng(), "micro_batch_size": 1, "grad_accum_steps": 4}
+        frozen = self.root / "frozen.pt"
+        training.export_base_checkpoint(self.model, optimizer, self.config, frozen, 7,
+                                        metrics, async_save=True, training_state=state)
+        training._wait_for_active_save()
+        reference = self.load(frozen)
+        estimate, _ = training._checkpoint_storage_bytes((self.model.state_dict(), optimizer.state_dict(), metrics, state))
+        save = torch.save
+        calling_thread = threading.get_ident()
+        destinations = []
+
+        def check_stream(payload, destination):
+            self.assertEqual(threading.get_ident(), calling_thread)
+            self.assertEqual(payload["slow_weights"]["tok_embeddings.weight"].data_ptr(),
+                             self.model.tok_embeddings.weight.data_ptr())
+            destinations.append(destination.name)
+            return save(payload, destination)
+
+        # Simulate the GPU/low-RAM decision with real CPU storages so the full
+        # export/resume equivalence also runs in CPU-only CI. CUDA device tags
+        # and real GPU staging are covered separately below.
+        with mock.patch.object(training, "_checkpoint_storage_bytes", return_value=(estimate, True)), \
+                mock.patch.object(training, "_host_memory_status", return_value={"available": estimate * 2 - 1}), \
+                mock.patch.object(training, "_cpu_copy_nested", side_effect=AssertionError("full CPU clone")), \
+                mock.patch.object(training.threading, "Thread", side_effect=AssertionError("background writer")), \
+                mock.patch.object(torch, "save", check_stream):
+            training.export_base_checkpoint(self.model, optimizer, self.config, self.full, 7,
+                                            metrics, async_save=True, training_state=state, best_save_path=self.best)
+        self.assertEqual(len(destinations), 2)
+        actual, best = self.load(self.full), self.load(self.best)
+        for key in ("step", "config", "slow_weights", "init_fast_weights", "optimizer_state", "training_state", "metrics"):
+            self.assert_nested_equal(actual[key], reference[key])
+        self.assert_same_weights(actual, best)
+        self.assertEqual(actual["slow_weights"]["tok_embeddings.weight"].data_ptr(),
+                         actual["slow_weights"]["lm_head.weight"].data_ptr())
+        self.assertNotIn("optimizer_state", best)
+        self.assertNotIn("training_state", best)
+        with torch.no_grad():
+            self.model.tok_embeddings.weight.add_(3)
+            for values in optimizer.state.values():
+                values["exp_avg"].add_(2)
+        state["rng"]["cpu"].zero_()
+        metrics["samples"][0]["reply"] = "changed later"
+        self.assert_nested_equal(self.load(self.full)["optimizer_state"], reference["optimizer_state"])
+        self.assert_nested_equal(self.load(self.full)["training_state"], reference["training_state"])
+        self.assert_same_weights(self.load(self.best), reference)
+        restored = uTTTModel(self.config)
+        restored.load_dual_base_state(actual["slow_weights"], actual["init_fast_weights"])
+        restored_optimizer = torch.optim.AdamW(restored.parameters())
+        restored_optimizer.load_state_dict(actual["optimizer_state"])
+        self.assert_nested_equal(restored_optimizer.state_dict(), reference["optimizer_state"])
+
+    def test_streaming_primary_failure_keeps_durable_full_and_best(self):
+        training.export_base_checkpoint(self.model, None, self.config, self.full, 1, {}, best_save_path=self.best)
+        before = (self.full.read_bytes(), self.best.read_bytes())
+        with mock.patch.object(training, "_checkpoint_storage_bytes", return_value=(100, True)), \
+                mock.patch.object(training, "_host_memory_status", return_value={"available": 1}), \
+                mock.patch.object(training, "_cpu_copy_nested", side_effect=AssertionError("full CPU clone")), \
+                mock.patch.object(torch, "save", side_effect=OSError("stream interrupted")):
+            with self.assertRaisesRegex(OSError, "stream interrupted"):
+                training.export_base_checkpoint(self.model, None, self.config, self.full, 2, {},
+                                                async_save=True, best_save_path=self.best)
+        self.assertEqual((self.full.read_bytes(), self.best.read_bytes()), before)
+        self.assertFalse(Path(str(self.full) + ".tmp").exists())
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA staging integration")
+    def test_real_cuda_streaming_checkpoint_loads_with_cpu_mmap(self):
+        model = self.model.to("cuda")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.001, fused=True)
+        ids = torch.tensor([[6, 7, 8, 9]], device="cuda")
+        model(ids, labels=ids, update_fast_weights=False).loss.backward()
+        optimizer.step()
+        with mock.patch.object(training, "_cpu_copy_nested", side_effect=AssertionError("full CPU clone")):
+            training.export_base_checkpoint(model, optimizer, self.config, self.full, 1, {},
+                                            training_state={"rng": training.capture_training_rng()}, best_save_path=self.best)
+        actual, best = self.load(self.full), self.load(self.best)
+        self.assert_same_weights(actual, best)
+        self.assertTrue(all(value.device.type == "cpu" for value in actual["slow_weights"].values()))
+        for name, value in model.state_dict().items():
+            partition = actual["init_fast_weights"] if name.startswith("fast_weight_pool.") else actual["slow_weights"]
+            key = name.removeprefix("fast_weight_pool.") if name.startswith("fast_weight_pool.") else name
+            torch.testing.assert_close(partition[key], value.cpu(), atol=0, rtol=0)
+        for values in actual["optimizer_state"]["state"].values():
+            self.assertEqual(values["exp_avg"].device.type, "cpu")
 
     def test_async_pair_is_immutable_after_the_training_thread_continues(self):
         entered, release = threading.Event(), threading.Event()

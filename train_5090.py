@@ -465,6 +465,70 @@ def accumulation_autocast(device_type: str, dtype: torch.dtype, cache_across_acc
 # 3. Base Checkpoint Export (`checkpoints/base_uttt.pt`)
 # ==============================================================================
 
+def _host_memory_status() -> Dict[str, int]:
+    """Best-effort Linux counters in bytes; unavailable counters stay absent."""
+    status = {}
+    if not sys.platform.startswith("linux"):
+        return status
+    for path, fields in (
+        ("/proc/meminfo", {"MemAvailable": "available", "SwapFree": "swap_free"}),
+        ("/proc/self/status", {"RssAnon": "anon", "VmSwap": "process_swap"}),
+    ):
+        try:
+            for line in Path(path).read_text().splitlines():
+                name, _, value = line.partition(":")
+                if name in fields:
+                    parts = value.split()
+                    if len(parts) == 2 and parts[1] == "kB":
+                        status[fields[name]] = int(parts[0]) * 1024
+        except (OSError, ValueError):
+            pass
+    return status
+
+
+def _host_memory_summary(status: Optional[Dict[str, int]] = None) -> str:
+    status = _host_memory_status() if status is None else status
+    return " ".join(f"{name}={value / 1024**2:.0f}MiB" for name, value in status.items()) or "host_memory=unavailable"
+
+
+def _checkpoint_storage_bytes(obj: Any) -> Tuple[int, bool]:
+    """Count unique backing storages, including aliased CPU and GPU views."""
+    storages = set()
+    total = 0
+    has_cuda = False
+
+    def visit(value):
+        nonlocal total, has_cuda
+        if isinstance(value, torch.Tensor):
+            has_cuda = has_cuda or value.device.type == "cuda"
+            if value.layout == torch.sparse_coo:
+                visit(value._indices())
+                visit(value._values())
+            elif value.layout in (torch.sparse_csr, torch.sparse_bsr):
+                visit(value.crow_indices())
+                visit(value.col_indices())
+                visit(value.values())
+            elif value.layout in (torch.sparse_csc, torch.sparse_bsc):
+                visit(value.ccol_indices())
+                visit(value.row_indices())
+                visit(value.values())
+            else:
+                storage = value.untyped_storage()
+                key = (storage.device, storage.data_ptr(), storage.nbytes())
+                if key not in storages:
+                    storages.add(key)
+                    total += storage.nbytes()
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    visit(obj)
+    return total, has_cuda
+
+
 def _cpu_copy_nested(obj: Any, tensor_memo=None) -> Any:
     """Snapshot tensors without duplicating tied parameters or identical views."""
     if tensor_memo is None:
@@ -520,10 +584,34 @@ def export_base_checkpoint(
             raise ValueError("The best checkpoint must differ from the full checkpoint")
         best_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Copy a consistent model snapshot once. state_dict has two keys for tied
-    # embeddings; retaining that alias saves both copy traffic and file space.
+    model_state = model.state_dict()
+    optimizer_state = optimizer.state_dict() if optimizer is not None else None
+    estimated_bytes, has_cuda = _checkpoint_storage_bytes(
+        (model_state, optimizer_state, metrics, training_state)
+    )
+    host_memory = _host_memory_status()
+    available = host_memory.get("available")
+    if async_save and has_cuda and available is not None and estimated_bytes > available * 0.5:
+        # A full FP32 model + Adam snapshot can occupy most of a small WSL VM.
+        # Pause training and let torch.save stage GPU storages individually.
+        # Direct references must never be serialized by a background writer.
+        async_save = False
+        print(
+            f"[Checkpoint] Async snapshot estimate={estimated_bytes / 1024**2:.0f}MiB "
+            f"exceeds 50% of MemAvailable={available / 1024**2:.0f}MiB; "
+            "using synchronous streaming save.", flush=True,
+        )
+    streaming = has_cuda and not async_save
+    mode = "synchronous_stream" if streaming else "cpu_snapshot"
+    print(f"[Checkpoint] snapshot_start step={step} mode={mode} "
+          f"estimate={estimated_bytes / 1024**2:.0f}MiB {_host_memory_summary(host_memory)}", flush=True)
+    # Async saves require immutable CPU copies. Synchronous GPU saves instead
+    # retain the original storages until both files are durable; torch.save
+    # transfers one storage at a time rather than cloning the full checkpoint.
+    # Both routes preserve tied embeddings and optimizer/storage aliases.
     tensor_memo = {}
-    model_snapshot = _cpu_copy_nested(model.state_dict(), tensor_memo)
+    snapshot = (lambda value: value) if streaming else lambda value: _cpu_copy_nested(value, tensor_memo)
+    model_snapshot = snapshot(model_state)
     fast_prefix = "fast_weight_pool."
 
     payload = {
@@ -534,16 +622,17 @@ def export_base_checkpoint(
         "config": config.to_dict(),
         "slow_weights": {key: value for key, value in model_snapshot.items() if not key.startswith(fast_prefix)},
         "init_fast_weights": {key[len(fast_prefix):]: value for key, value in model_snapshot.items() if key.startswith(fast_prefix)},
-        "metrics": _cpu_copy_nested(metrics, tensor_memo),
+        "metrics": snapshot(metrics),
     }
     if optimizer is not None:
-        payload["optimizer_state"] = _cpu_copy_nested(optimizer.state_dict(), tensor_memo)
+        payload["optimizer_state"] = snapshot(optimizer_state)
     if training_state is not None:
-        payload["training_state"] = _cpu_copy_nested(training_state, tensor_memo)
-    # The weight-only best file references the same immutable CPU tensors. Disk
-    # serialization does not mutate them, and no second GPU snapshot is needed.
+        payload["training_state"] = snapshot(training_state)
+    # Best shares the same stable weights: immutable CPU copies for async
+    # writers, or live storages while the synchronous caller remains paused.
     best_payload = ({key: value for key, value in payload.items()
                      if key not in ("optimizer_state", "training_state")} if best_path is not None else None)
+    print(f"[Checkpoint] snapshot_complete step={step} mode={mode} {_host_memory_summary()}", flush=True)
 
     def _write_one(path, contents) -> None:
         tmp_path = Path(str(path) + ".tmp")
@@ -572,13 +661,14 @@ def export_base_checkpoint(
         print(f"[Checkpoint] Saved Base Checkpoint -> {path} ({size_mb:.2f} MB)", flush=True)
 
     def _write_to_disk() -> None:
+        print(f"[Checkpoint] write_start step={step} mode={mode} {_host_memory_summary()}", flush=True)
         _write_one(out_path, payload)
         if best_payload is not None:
-            # The large optimizer snapshot is no longer needed once the full
-            # file is durable. Release it before serializing weight-only best.
+            # The full file is durable; best needs only weights and metadata.
             payload.pop("optimizer_state", None)
             payload.pop("training_state", None)
             _write_one(best_path, best_payload)
+        print(f"[Checkpoint] write_complete step={step} mode={mode} {_host_memory_summary()}", flush=True)
 
     if async_save:
         def _background_write() -> None:
@@ -663,6 +753,8 @@ def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype,
     results = []
     was_training = model.training
     previous_penalty = model.config.repetition_penalty
+    completed = False
+    print(f"[Validation generation] start prompts={len(prompts)} {_host_memory_summary()}", flush=True)
     try:
         model.eval()
         # A penalty can hide the exact loops this diagnostic is meant to show.
@@ -682,6 +774,8 @@ def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype,
                 ids = (tokenizer.encode(prompt, add_bos=True, max_length=prompt_budget)
                        if stage == "pretrain" else encode_chat_prompt(tokenizer, prompt, prompt_budget))
                 for decoding, temperature in (("greedy", 0.0), ("sampled", sample_temperature)):
+                    print(f"[Validation generation] prompt_start index={index + 1}/{len(prompts)} "
+                          f"decoding={decoding} {_host_memory_summary()}", flush=True)
                     seed = int(sample_seed) + index
                     if decoding == "sampled":
                         torch.random.default_generator.manual_seed(seed)
@@ -703,9 +797,14 @@ def generate_validation_samples(model, tokenizer, prompts, stage, device, dtype,
                         "generated_tokens": len(generated), "eos_generated": tokenizer.EOS_ID in generated,
                         **repetition_metrics(generated, reply),
                     })
+                    print(f"[Validation generation] prompt_complete index={index + 1}/{len(prompts)} "
+                          f"decoding={decoding} tokens={len(generated)} {_host_memory_summary()}", flush=True)
+        completed = True
     finally:
         model.config.repetition_penalty = previous_penalty
         model.train(was_training)
+        print(f"[Validation generation] {'complete' if completed else 'failed'} "
+              f"replies={len(results)} {_host_memory_summary()}", flush=True)
     return results
 
 
