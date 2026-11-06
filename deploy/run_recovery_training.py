@@ -475,7 +475,7 @@ def main(argv=None):
             state = {"protocol": "uttt-recovery-run-v1", "binding": binding, "created_at": utc_now(),
                      "stages": [], "training_complete": False, "quality_passed": False,
                      "online_writes_allowed": False}
-        update(pid=os.getpid(), status="starting", online_writes_allowed=False,
+        update(pid=os.getpid(), status="starting", error=None, online_writes_allowed=False,
                resume_action=(("full_checkpoint" if resume_source == output else "previous_full_checkpoint") if resume_source else
                               "initialization_retry_no_checkpoint" if args.resume else "new_initialization"),
                resume_checkpoint=str(resume_source) if resume_source else None)

@@ -1,10 +1,13 @@
 """Full Adam resumes, immutable validation and truthful padded-token timing."""
 from contextlib import redirect_stdout
+import gc
 import io
 from pathlib import Path
 import re
+import sys
 import tempfile
 import unittest
+import weakref
 from unittest import mock
 
 try:
@@ -95,6 +98,60 @@ class ResumeValidationAuditTests(unittest.TestCase):
             self.assertIn("--init-from", str(raised.exception.__cause__))
             load.assert_not_called()
             self.assertEqual(checkpoint.read_bytes(), before)
+
+    def test_resume_releases_mapped_rng_tensor_before_the_next_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config, data = self.fixture(root)
+            checkpoint = training.train(str(config), str(data), str(root / "full.pt"))
+            restore = training.restore_training_rng
+            forward = training.uTTTModel.forward
+            rng_refs, resumed_forwards = [], []
+
+            def observe_restore(state):
+                rng_refs.append(weakref.ref(state["cpu"]))
+                restore(state)
+
+            def verify_released(model, *args, **kwargs):
+                gc.collect()
+                self.assertEqual(len(rng_refs), 1)
+                self.assertIsNone(rng_refs[0](), "resume frame still owns the checkpoint's mapped RNG tensor")
+                resumed_forwards.append(True)
+                return forward(model, *args, **kwargs)
+
+            # Plain replacement functions deliberately avoid Mock call records:
+            # recording the restore arguments would itself retain the mmap.
+            with mock.patch.object(training, "restore_training_rng", new=observe_restore), \
+                    mock.patch.object(training.uTTTModel, "forward", new=verify_released):
+                training.train(str(config), str(data), str(checkpoint), override_steps=2)
+            self.assertTrue(resumed_forwards)
+            saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            self.assertEqual(saved["step"], 2)
+            self.assertTrue(all(int(value["step"]) == 2 for value in saved["optimizer_state"]["state"].values()))
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and Path("/proc/self/maps").exists(), "Linux mmap lifetime")
+    def test_tiny_rng_reference_keeps_a_rotated_checkpoint_mapping_until_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rotated.pt"
+            torch.save({"weights": torch.zeros(16384), "rng": torch.get_rng_state()}, path)
+
+            def mapped_lines():
+                return [line for line in Path("/proc/self/maps").read_text().splitlines() if str(path) in line]
+
+            saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+            rng = saved["rng"]
+            rng_ref = weakref.ref(rng)
+            self.assertTrue(mapped_lines())
+            training.restore_training_rng({"cpu": rng})
+            del saved
+            path.unlink()  # Simulate the inode losing its final checkpoint name.
+            gc.collect()
+            self.assertIsNotNone(rng_ref())
+            self.assertTrue(any("(deleted)" in line for line in mapped_lines()))
+            del rng
+            gc.collect()
+            self.assertIsNone(rng_ref())
+            self.assertFalse(mapped_lines())
 
     def test_speed_counts_actual_unpadded_tokens_and_actual_small_batch(self):
         with tempfile.TemporaryDirectory() as tmp:

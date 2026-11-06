@@ -302,7 +302,19 @@ class RecoveryLifecycleTests(unittest.TestCase):
 
     def test_resume_keeps_history_and_omits_weight_initialization(self):
         runner.main(self.argv)
-        first_count = len(self.state()["stages"])
+        interrupted = self.state()
+        interrupted.update(status="interrupted", error="prior interruption")
+        (self.root / "logs/recovery_test/state.json").write_text(json.dumps(interrupted), encoding="utf-8")
+        first_count = len(interrupted["stages"])
+        old_logs = {Path(stage["log"]): Path(stage["log"]).read_bytes() for stage in interrupted["stages"]}
+        spawn = self.spawn
+
+        def check_healthy_resume(command, **kwargs):
+            self.assertIsNone(self.state()["error"])
+            self.assertEqual(self.state()["status"], "running")
+            return spawn(command, **kwargs)
+
+        self.popen.side_effect = check_healthy_resume
         self.processes.clear()
         runner.main(self.argv + ["--resume"])
         self.assertEqual(len(self.processes), 2)
@@ -310,8 +322,12 @@ class RecoveryLifecycleTests(unittest.TestCase):
         self.assertIn("train_5090.py", command)
         self.assertNotIn("--init-from", command)
         self.assertNotIn("--no-resume", command)
+        self.assertIsNone(self.state()["error"])
+        self.assertEqual(self.state()["stages"][:first_count], interrupted["stages"])
         self.assertEqual(len(self.state()["stages"]), first_count + 2)
         self.assertEqual(len(list((self.root / "logs/recovery_test").glob("*_sft.log"))), 2)
+        for path, contents in old_logs.items():
+            self.assertEqual(path.read_bytes(), contents)
 
     def test_changed_resume_binding_preserves_the_original_manifest(self):
         runner.main(self.argv)

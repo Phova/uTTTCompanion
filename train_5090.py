@@ -1175,6 +1175,11 @@ def train(
                             print("[Resume] Batch settings changed; data cursor restored, but numerical trajectory may differ.", flush=True)
                     else:
                         print("[Resume] Legacy checkpoint has no data cursor/RNG state; exact sample-order continuation is unavailable.", flush=True)
+                    # RNG tensors are views into torch.load's whole-file mmap.
+                    # The RNG setters copy their bytes; keeping this local after
+                    # restoration would pin the previous checkpoint's mapping
+                    # and inode throughout training, even after file rotation.
+                    del training_state
                     print(
                         f"[Resume] Resumed from {loaded_from} at step {saved_step}/{max_steps} "
                         f"(Last Loss: {saved_loss:.4f})",
