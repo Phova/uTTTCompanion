@@ -39,6 +39,63 @@ class EvaluationMetricTests(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, 'PyTorch evaluation dependencies unavailable')
+class AnswerMatchingTests(unittest.TestCase):
+    def test_case_conversion_and_copy_contracts_are_case_sensitive(self):
+        for task, expected, wrong in [('uppercase', 'ABC', 'abc'), ('lowercase', 'abc', 'ABC'),
+                                      ('copy', 'aBc', 'ABC'), ('reverse', 'cBa', 'cba'),
+                                      ('extract', 'CaseValue', 'casevalue')]:
+            item = {'task': task, 'accepted': [expected]}
+            with self.subTest(task=task):
+                self.assertEqual(evaluation.answer_match_mode(item), 'strict_text')
+                self.assertTrue(evaluation.answer_matches(' \n' + expected + '\t', item))
+                self.assertFalse(evaluation.answer_matches(wrong, item))
+                self.assertFalse(evaluation.answer_matches(expected + '.', item))
+
+    def test_arithmetic_and_lengths_do_not_accept_extra_punctuation_or_explanation(self):
+        for task in ('add', 'subtract', 'multiply', 'length'):
+            item = {'task': task, 'accepted': ['12']}
+            with self.subTest(task=task):
+                self.assertTrue(evaluation.answer_matches(' 12\n', item))
+                self.assertFalse(evaluation.answer_matches('12.', item))
+                self.assertFalse(evaluation.answer_matches('The answer is 12', item))
+
+    def test_sort_accepts_json_layout_but_retains_order_types_and_case(self):
+        item = {'task': 'sort', 'accepted': ['[1,2,3]']}
+        self.assertEqual(evaluation.answer_match_mode(item), 'json')
+        self.assertTrue(evaluation.answer_matches(' \n[1, 2,\n3] ', item))
+        for wrong in ('[true,2,3]', '[1.0,2,3]', '["1",2,3]', '[3,2,1]', '[1,2]', '[1,2,3].'):
+            with self.subTest(reply=wrong):
+                self.assertFalse(evaluation.answer_matches(wrong, item))
+        nested = {'match_mode': 'json', 'accepted': ['{"a":[true,null],"b":"Case"}']}
+        self.assertTrue(evaluation.answer_matches('{"b":"Case", "a":[true, null]}', nested))
+        self.assertFalse(evaluation.answer_matches('{"a":[1,null],"b":"Case"}', nested))
+        self.assertFalse(evaluation.answer_matches('{"a":[true,null],"b":"case"}', nested))
+
+    def test_nonstandard_or_ambiguous_json_cannot_match(self):
+        for reply in ('NaN', 'Infinity', '1e999', '{"a":1,"a":2}', '[] trailing'):
+            with self.subTest(reply=reply):
+                self.assertFalse(evaluation.answer_matches(reply, {'match_mode': 'json', 'accepted': ['[]']}))
+        with self.assertRaisesRegex(ValueError, 'Accepted answer'):
+            evaluation.answer_matches('[]', {'match_mode': 'json', 'accepted': ['not JSON']})
+
+    def test_explicit_modes_override_task_defaults_and_unknown_modes_fail(self):
+        item = {'task': 'uppercase', 'match_mode': 'legacy_casefold', 'accepted': ['ABC']}
+        self.assertTrue(evaluation.answer_matches('abc!', item))
+        self.assertEqual(evaluation.answer_match_mode(item), 'legacy_casefold')
+        strict = {'match_mode': 'strict_text', 'accepted': ['Hello']}
+        self.assertFalse(evaluation.answer_matches('hello', strict))
+        for mode in ('unknown', '', None, True, 7):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'Unknown answer match_mode'):
+                evaluation.answer_matches('ABC', {'task': 'uppercase', 'match_mode': mode, 'accepted': ['ABC']})
+
+    def test_legacy_basic_probe_scoring_is_preserved(self):
+        for reply in ('hello', 'HELLO!', ' Hello。\n'):
+            self.assertTrue(evaluation.answer_matches(reply, {'accepted': ['Hello', 'Hi']}))
+        self.assertTrue(evaluation.answer_matches('你好！', {'accepted': ['你好']}))
+        self.assertFalse(evaluation.answer_matches('Well, Hello', {'accepted': ['Hello']}))
+
+
+@unittest.skipIf(torch is None, 'PyTorch evaluation dependencies unavailable')
 class EvaluationDecodingTests(unittest.TestCase):
     def fixture(self, stage='sft'):
         config = uTTTConfig(vocab_size=128, d_model=8, n_layers=1, n_heads=1,
@@ -125,6 +182,25 @@ class EvaluationDecodingTests(unittest.TestCase):
         self.assertIsNone(legacy['seed'])
         self.assertTrue(report['prompt_boundary_comparison']['same_checkpoint'])
         self.assertEqual(report['prompt_boundary_comparison']['decoding'], 'unpenalized_greedy')
+
+    def test_results_record_task_specific_matching_policy(self):
+        manager, tokenizer = self.fixture()
+        tokenizer.decode = lambda tokens: 'abc'
+        report = self.run_evaluation(manager, tokenizer, [
+            {'prompt': 'uppercase probe', 'task': 'uppercase', 'accepted': ['ABC']},
+            {'prompt': 'legacy probe', 'accepted': ['ABC']},
+        ], greedy_only=True)
+        self.assertEqual(report['results'][0]['answer_match_mode'], 'strict_text')
+        self.assertFalse(report['results'][0]['exact_match'])
+        self.assertEqual(report['results'][1]['answer_match_mode'], 'legacy_casefold')
+        self.assertTrue(report['results'][1]['exact_match'])
+
+    def test_unknown_answer_policy_rejects_before_generation(self):
+        manager, tokenizer = self.fixture()
+        with mock.patch.object(manager.model, 'stream_generate') as generate:
+            with self.assertRaisesRegex(ValueError, 'Unknown answer match_mode'):
+                self.run_evaluation(manager, tokenizer, [{'prompt': 'answer', 'match_mode': 'unsupported'}])
+            generate.assert_not_called()
 
     def test_greedy_monitor_omits_sampling_and_keeps_boundary_ablation(self):
         manager, tokenizer = self.fixture()

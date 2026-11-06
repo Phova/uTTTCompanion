@@ -31,6 +31,81 @@ DEFAULT_CONTINUATIONS = [
 ]
 
 
+STRICT_ANSWER_TASKS = frozenset({
+    "add", "subtract", "multiply", "copy", "uppercase", "lowercase", "reverse", "length", "extract",
+})
+ANSWER_MATCH_MODES = frozenset({"strict_text", "json", "legacy_casefold"})
+
+
+def answer_match_mode(task):
+    """Resolve an explicit policy first, then the known task's actual contract."""
+    if "match_mode" in task:
+        mode = task["match_mode"]
+    elif task.get("task") in STRICT_ANSWER_TASKS:
+        mode = "strict_text"
+    elif task.get("task") == "sort":
+        mode = "json"
+    else:
+        mode = "legacy_casefold"
+    if not isinstance(mode, str) or mode not in ANSWER_MATCH_MODES:
+        raise ValueError(f"Unknown answer match_mode: {mode!r}; supported modes: {sorted(ANSWER_MATCH_MODES)}")
+    return mode
+
+
+def _parse_answer_json(text):
+    """Parse unambiguous standard JSON, excluding nonfinite numbers."""
+    def reject_constant(value):
+        raise ValueError(f"Nonstandard JSON constant: {value}")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON object key")
+            result[key] = value
+        return result
+
+    value = json.loads(text, parse_constant=reject_constant, object_pairs_hook=unique_object)
+    # JSON's float parser can also produce infinity from an overflowing exponent.
+    json.dumps(value, allow_nan=False)
+    return value
+
+
+def _json_value_equal(left, right):
+    """Ignore JSON layout/key order, retaining scalar types and array order."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_json_value_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_json_value_equal(left[key], right[key]) for key in left)
+    return left == right
+
+
+def answer_matches(reply, task):
+    """Score task-specific outputs without forgiving meaningful case changes."""
+    mode = answer_match_mode(task)
+    accepted = task.get("accepted")
+    if not isinstance(reply, str) or not isinstance(accepted, list) or not accepted or not all(isinstance(value, str) for value in accepted):
+        raise ValueError("Answer matching requires a text reply and a nonempty list of accepted strings")
+    if mode == "strict_text":
+        return reply.strip() in [value.strip() for value in accepted]
+    if mode == "legacy_casefold":
+        # Preserve the original four basic probes' historical scoring exactly.
+        return reply.casefold().strip("。.!！ \n") in [value.casefold() for value in accepted]
+    expected = []
+    for value in accepted:
+        try:
+            expected.append(_parse_answer_json(value))
+        except (ValueError, TypeError, RecursionError) as error:
+            raise ValueError("Accepted answer is not valid unambiguous JSON") from error
+    try:
+        actual = _parse_answer_json(reply.strip())
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return any(_json_value_equal(actual, value) for value in expected)
+
+
 @contextmanager
 def decoding_policy(model, profile, eos_id):
     """Apply a labeled evaluation policy and restore the original sampler."""
@@ -105,6 +180,7 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
         devices = [manager.device.index if manager.device.index is not None else torch.cuda.current_device()] if manager.device.type == "cuda" else []
         for task_index, task in enumerate(tasks):
             prompt = task["prompt"]
+            match_mode = answer_match_mode(task)
             task_mode = task.get("mode", default_mode)
             if not isinstance(prompt, str) or task_mode not in {"chat", "continuation"}:
                 raise ValueError("Each task requires a text prompt and a supported mode")
@@ -144,9 +220,10 @@ def evaluate(checkpoint, tasks, output, max_new_tokens=64, device=None, *, mode=
                           "seed": None if profile["temperature"] == 0 else sample_seed,
                           "prompt_boundary": ("legacy_assistant_space" if legacy else "assistant_role")
                                              if task_mode == "chat" else "continuation",
+                          "answer_match_mode": match_mode,
                           **repetition_metrics(tokens, reply)}
                 if "accepted" in task:
-                    result["exact_match"] = reply.casefold().strip("。.!！ \n") in [value.casefold() for value in task["accepted"]]
+                    result["exact_match"] = answer_matches(reply, task)
                 profile_results[profile["name"]].append(result)
                 print(json.dumps(result, ensure_ascii=False), flush=True)
         results = profile_results["raw_greedy"]

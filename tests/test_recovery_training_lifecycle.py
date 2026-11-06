@@ -322,6 +322,126 @@ class RecoveryLifecycleTests(unittest.TestCase):
             runner.main(self.argv + ["--resume"])
         self.assertEqual(path.read_bytes(), original)
 
+    def interrupted_sft_for_migration(self, step=4):
+        self.info["step"] = step
+        original = self.spawn
+        def interrupted(command, **kwargs):
+            process = original(command, **kwargs)
+            if "train_5090.py" in command:
+                def lines():
+                    self.stop()
+                    yield "full Adam/cursor checkpoint saved before stop\n"
+                process.stdout = lines()
+            return process
+        self.popen.side_effect = interrupted
+        runner.main(self.argv)
+        self.assertEqual(self.state()["stage"], "sft")
+        self.assertFalse(self.state()["training_complete"])
+        self.processes.clear()
+        self.popen.side_effect = original
+        return self.root / "logs/recovery_test/state.json"
+
+    def test_code_only_migration_reruns_baseline_and_continues_full_checkpoint_without_initialization(self):
+        path = self.interrupted_sft_for_migration()
+        old_state = self.state()
+        old_baseline = Path(old_state["baseline_report"])
+        old_baseline_bytes = old_baseline.read_bytes()
+        old_checkpoint = json.loads(json.dumps(self.info))
+        trained = False
+        original = self.spawn
+        def spawn(command, **kwargs):
+            nonlocal trained
+            process = original(command, **kwargs)
+            if "train_5090.py" in command:
+                self.assertNotIn("--init-from", command)
+                self.assertNotIn("--no-resume", command)
+                self.assertEqual(kwargs["env"]["UTTT_CODE_REVISION"], "new-revision")
+                trained = True
+            return process
+        def saved(path):
+            if Path(path) == self.output and trained:
+                value = json.loads(json.dumps(old_checkpoint))
+                value["step"] = 10
+                value["metrics"]["code_revision"] = "new-revision"
+                return value
+            return old_checkpoint
+        self.popen.side_effect = spawn
+        with patch.dict(os.environ, {"UTTT_CODE_REVISION": "new-revision"}), patch.object(runner, "checkpoint_info", side_effect=saved):
+            runner.main(self.argv + ["--resume", "--resume-from-revision", "revision"])
+        state = self.state()
+        self.assertEqual(state["binding"]["code_revision"], "new-revision")
+        self.assertEqual([entry["stage"] for entry in state["stages"]][-3:], ["baseline_evaluate", "sft", "sft_evaluate"])
+        self.assertEqual(state["code_migrations"][0]["from"], "revision")
+        self.assertEqual(state["code_migrations"][0]["to"], "new-revision")
+        self.assertEqual(state["code_migrations"][0]["saved_step"], 4)
+        self.assertEqual(state["code_migrations"][0]["discarded_baseline_report"], str(old_baseline))
+        self.assertEqual(set(state["accepted_code_revisions"]), {"revision", "new-revision"})
+        self.assertNotEqual(state["baseline_report"], str(old_baseline))
+        self.assertEqual(old_baseline.read_bytes(), old_baseline_bytes)
+        self.assertTrue(state["training_complete"])
+        # The old best remains truthfully labeled with its original source.
+        self.assertEqual(old_checkpoint["metrics"]["code_revision"], "revision")
+        self.assertFalse(state["online_writes_allowed"])
+
+    def test_code_migration_rejects_config_or_wrong_old_revision_without_manifest_changes(self):
+        path = self.interrupted_sft_for_migration()
+        original = path.read_bytes()
+        with patch.dict(os.environ, {"UTTT_CODE_REVISION": "new-revision"}):
+            with self.assertRaisesRegex(ValueError, "old source revision"):
+                runner.main(self.argv + ["--resume", "--resume-from-revision", "unrelated-revision"])
+            self.assertEqual(path.read_bytes(), original)
+            self.config.write_text("changed config", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Code-only migration cannot change"):
+                runner.main(self.argv + ["--resume", "--resume-from-revision", "revision"])
+            self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(self.processes)
+
+    def test_code_migration_rejects_completed_or_meta_runs_and_weight_only_checkpoint(self):
+        path = self.interrupted_sft_for_migration()
+        original = path.read_bytes()
+        with patch.dict(os.environ, {"UTTT_CODE_REVISION": "new-revision"}):
+            self.info["step"] = 10
+            with self.assertRaisesRegex(ValueError, "strictly below"):
+                runner.main(self.argv + ["--resume", "--resume-from-revision", "revision"])
+            self.assertEqual(path.read_bytes(), original)
+            self.info["step"] = 4
+            self.info["has_optimizer"] = False
+            with self.assertRaisesRegex(RuntimeError, "Full optimizer"):
+                runner.main(self.argv + ["--resume", "--resume-from-revision", "revision"])
+            self.assertEqual(path.read_bytes(), original)
+            self.info["has_optimizer"] = True
+            state = json.loads(original)
+            state["stage"] = "meta"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            meta_state = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "unfinished SFT"):
+                runner.main(self.argv + ["--resume", "--resume-from-revision", "revision"])
+            self.assertEqual(path.read_bytes(), meta_state)
+        self.assertFalse(self.processes)
+
+    def test_revision_migration_flag_requires_resume_and_default_resume_remains_strict(self):
+        path = self.interrupted_sft_for_migration()
+        original = path.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            runner.main(self.argv + ["--resume-from-revision", "revision"])
+        self.assertEqual(path.read_bytes(), original)
+        with patch.dict(os.environ, {"UTTT_CODE_REVISION": "new-revision"}), self.assertRaisesRegex(ValueError, "differs from the original run"):
+            runner.main(self.argv + ["--resume"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_checkpoint_revision_sets_follow_only_continuous_explicit_migrations(self):
+        state = {"binding": {"code_revision": "third"}, "code_migrations": [
+            {"from": "first", "to": "second"}, {"from": "second", "to": "third"}]}
+        self.assertEqual(runner.accepted_checkpoint_revisions(state), {"first", "second", "third"})
+        runner.validate_checkpoint(self.output, stage="sft", fingerprint="newdata", run_id="test",
+                                   revision={"revision", "new-revision"}, saved=self.info)
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            runner.validate_checkpoint(self.output, stage="sft", fingerprint="newdata", run_id="test",
+                                       revision="new-revision", saved=self.info)
+        state["code_migrations"][0]["to"] = "unrelated"
+        with self.assertRaisesRegex(ValueError, "continuous revision chain"):
+            runner.accepted_checkpoint_revisions(state)
+
     def test_meta_records_separate_heldout_ablation_and_reuses_verified_reports_on_resume(self):
         arguments = self.argv + self.meta_arguments()
         runner.main(arguments)

@@ -81,8 +81,9 @@ def validate_checkpoint(path, *, stage, fingerprint, run_id, revision, target=No
     saved = checkpoint_info(path) if saved is None else saved
     metrics = saved["metrics"]
     expected = {"training_stage": stage, "training_pipeline": 3,
-                "dataset_fingerprint": fingerprint, "run_id": run_id, "code_revision": revision}
-    if any(metrics.get(key) != value for key, value in expected.items()):
+                "dataset_fingerprint": fingerprint, "run_id": run_id}
+    revisions = {revision} if isinstance(revision, str) else set(revision)
+    if any(metrics.get(key) != value for key, value in expected.items()) or metrics.get("code_revision") not in revisions:
         raise RuntimeError(f"Checkpoint has incompatible stage, data protocol or run provenance: {path}")
     if metrics.get("parameter_scope", "all") != parameter_scope:
         raise RuntimeError(f"Checkpoint uses a different parameter scope: {path}")
@@ -113,6 +114,18 @@ def resume_checkpoint_source(path, **expected):
     if failures:
         raise RuntimeError("No readable full recovery checkpoint; initialization was not attempted") from failures[-1][1]
     return None
+
+
+def accepted_checkpoint_revisions(state):
+    """Accept only the current revision and its explicitly recorded ancestry."""
+    current = state["binding"]["code_revision"]
+    accepted = {current}
+    for migration in reversed(state.get("code_migrations", [])):
+        if migration.get("to") != current or not isinstance(migration.get("from"), str) or not migration["from"]:
+            raise ValueError("Recovery code migration history is not a continuous revision chain")
+        current = migration["from"]
+        accepted.add(current)
+    return accepted
 
 
 def quality_comparison(baseline, candidate, tasks, settings):
@@ -214,11 +227,15 @@ def main(argv=None):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--resume", action="store_true", help="Require the existing full checkpoint; do not initialize weights again")
+    parser.add_argument("--resume-from-revision", metavar="OLD_SHA",
+                        help="With --resume only, migrate an unfinished SFT run from this exact source revision; all other bindings remain fixed")
     parser.add_argument("--meta-config")
     parser.add_argument("--meta-data")
     parser.add_argument("--meta-output-ckpt")
     parser.add_argument("--meta-capacity-probe")
     args = parser.parse_args(argv)
+    if args.resume_from_revision and not args.resume:
+        parser.error("--resume-from-revision requires --resume")
     if not args.run_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in args.run_id):
         parser.error("run-id may contain only letters, numbers, underscores and hyphens")
     root = Path(__file__).resolve().parents[1]
@@ -398,15 +415,52 @@ def main(argv=None):
 
     try:
         resume_source = None
+        accepted_revisions = {revision}
         if args.resume:
             if not state_path.is_file():
                 raise ValueError("--resume requires this run's existing state manifest")
             previous_state = json.loads(state_path.read_text(encoding="utf-8"))
-            if previous_state.get("binding") != binding:
+            if args.resume_from_revision:
+                old_revision = previous_state.get("binding", {}).get("code_revision")
+                previous_binding = {**previous_state.get("binding", {}), "code_revision": revision}
+                if old_revision != args.resume_from_revision or old_revision == revision:
+                    raise ValueError("Requested old source revision does not match the run, or does not change its revision")
+                if previous_binding != binding:
+                    raise ValueError("Code-only migration cannot change config, data, tasks, initialization, outputs, steps or meta bindings")
+                if (previous_state.get("stage") != "sft" or previous_state.get("training_complete")
+                        or previous_state.get("meta_training_complete")
+                        or any(entry.get("stage", "").startswith("meta") for entry in previous_state.get("stages", []))):
+                    raise ValueError("Code migration is allowed only for unfinished SFT before any meta stage")
+                accepted_revisions = accepted_checkpoint_revisions(previous_state)
+            elif previous_state.get("binding") != binding:
                 raise ValueError("Resume config, data, tasks, code or output differs from the original run")
-            state = previous_state
+            else:
+                accepted_revisions = accepted_checkpoint_revisions(previous_state)
             resume_source = resume_checkpoint_source(output, stage="sft", fingerprint=identity["fingerprint"],
-                                                     run_id=args.run_id, revision=revision)
+                                                     run_id=args.run_id, revision=accepted_revisions)
+            if args.resume_from_revision:
+                if resume_source is None:
+                    raise RuntimeError("Code migration requires a verified full SFT checkpoint with Adam, data cursor and RNG state")
+                saved = checkpoint_info(resume_source)
+                if saved["step"] >= steps:
+                    raise ValueError("Code migration requires a saved SFT step strictly below its training target")
+                migration = {"from": args.resume_from_revision, "to": revision, "at": utc_now(),
+                             "saved_step": saved["step"], "checkpoint": str(resume_source),
+                             "discarded_baseline_report": previous_state.get("baseline_report"),
+                             "discarded_baseline_sha256": previous_state.get("baseline_sha256")}
+                accepted_revisions.add(revision)
+                migration["accepted_revisions"] = sorted(accepted_revisions)
+                # Do not assign state until every migration constraint and
+                # checkpoint has passed. Rejections leave the manifest intact.
+                state = previous_state
+                state["code_migrations"] = [*state.get("code_migrations", []), migration]
+                state["binding"] = binding
+                state.pop("baseline_report", None)
+                state.pop("baseline_sha256", None)
+                update(accepted_code_revisions=sorted(accepted_revisions), quality_passed=False,
+                       online_writes_allowed=False)
+            else:
+                state = previous_state
             if resume_source is None and (state.get("training_complete") or state.get("saved_step")
                     or output.with_suffix(".best.pt").exists()
                     or any(stage.get("stage") == "sft" and stage.get("status") == "complete"
@@ -446,7 +500,7 @@ def main(argv=None):
         check_stop()
         best = output.with_suffix(".best.pt")
         validate_checkpoint(best, stage="sft", fingerprint=identity["fingerprint"],
-                            run_id=args.run_id, revision=revision, full=False)
+                            run_id=args.run_id, revision=accepted_revisions, full=False)
         update(training_complete=True, saved_step=saved["step"])
         candidate, candidate_path = evaluate("sft_evaluate", best)
         comparison = quality_comparison(baseline, candidate, tasks, settings)

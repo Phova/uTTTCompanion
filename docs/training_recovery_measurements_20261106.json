@@ -341,11 +341,11 @@
     "gradient_parameters_present": 345
   },
   "cpu_regression": {
-    "total": 341,
-    "passed": 320,
+    "total": 354,
+    "passed": 333,
     "skipped": 21,
     "failures": 0,
-    "note": "Final CPU regression includes recovery resume, paired memory evaluation, scope and budget guards."
+    "note": "Includes strict case/typed JSON scoring and checkpoint-preserving code migration."
   },
   "cuda_regression": {
     "total": 5,
@@ -487,5 +487,24 @@
     "peak_allocated_gib": 26.88892126083374,
     "tokens_seen": 2831,
     "note": "Short operational verification, not evidence of learned useful memory; on internal four-document validation dynamic CE remains worse than frozen."
+  },
+  "monitor_baseline_scoring_correction": {
+    "same_generated_replies": true,
+    "tasks": 60,
+    "legacy_matches": 7,
+    "task_specific_matches": 2,
+    "strict_text_tasks": [
+      "add",
+      "subtract",
+      "multiply",
+      "copy",
+      "uppercase",
+      "lowercase",
+      "reverse",
+      "length",
+      "extract"
+    ],
+    "json_task": "sort",
+    "note": "Scoring correction is not a change in model capability."
   }
 }
