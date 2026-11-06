@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
@@ -89,6 +89,12 @@ if hasattr(signal, "SIGHUP"):
 # ==============================================================================
 # 1. Synthetic & JSONL Persona-Memory Meta-Training Dataset
 # ==============================================================================
+
+def validate_sft_validation_group_key(mode, key):
+    if key is not None and (mode != "sft" or not isinstance(key, str) or not key.strip()):
+        raise ValueError("validation_group_key requires stage=sft and a nonempty string field name")
+    return key
+
 
 class PersonaMetaDataset(Dataset):
     """
@@ -144,6 +150,7 @@ class PersonaMetaDataset(Dataset):
         split: str = "all",
         validation_fraction: float = 0.0,
         split_seed: int = 42,
+        validation_group_key: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -160,12 +167,18 @@ class PersonaMetaDataset(Dataset):
             raise ValueError("SFT seq_len must fit BOS, user/assistant roles, a question token and an answer token (at least 5)")
         if not 0 <= validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0, 1)")
+        self.validation_group_key = validate_sft_validation_group_key(mode, validation_group_key)
+        if validation_group_key is not None and not data_path:
+            raise ValueError("validation_group_key requires an external JSONL dataset")
         seen = set()
+        seen_groups = {}
         fingerprint = hashlib.sha256()
         # A changed windowing policy is a data transition, even when the raw
         # JSONL has not changed. Never silently resume an old SFT data cursor.
         if mode == "sft":
             fingerprint.update(f"{self.SFT_WINDOW_PROTOCOL}:seq_len={seq_len}\0".encode())
+        if validation_group_key is not None:
+            fingerprint.update(("group-validation-v1:" + json.dumps(validation_group_key, ensure_ascii=False) + "\0").encode())
 
         if data_path:
             with open(data_path, "r", encoding="utf-8") as f:
@@ -176,19 +189,34 @@ class PersonaMetaDataset(Dataset):
                     if line.startswith("{"):
                         obj = json.loads(line)
                         text = obj.get("text") or obj.get("content")
+                        group_id = obj.get(validation_group_key) if validation_group_key is not None else None
                     else:
+                        if validation_group_key is not None:
+                            raise ValueError("validation_group_key requires JSON rows containing the group field")
                         text = line
+                        group_id = None
+                    if validation_group_key is not None and (not isinstance(group_id, str) or not group_id.strip()):
+                        raise ValueError(f"Every dataset row requires a nonempty string {validation_group_key}")
                     if not isinstance(text, str):
                         raise ValueError("Dataset rows must contain string text/content")
                     text = re.sub(r"^<\|user\|> \[Context Category:[^\n]*\n", "", text).strip()
                     identity = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    if validation_group_key is not None:
+                        if identity in seen_groups and seen_groups[identity] != group_id:
+                            raise ValueError("Identical dataset text has contradictory validation group IDs")
+                        seen_groups[identity] = group_id
                     if not text or identity in seen:
                         continue
                     seen.add(identity)
-                    is_validation = int(hashlib.sha256(f"{split_seed}:{identity}".encode()).hexdigest()[:16], 16) / 2**64 < validation_fraction
+                    split_identity = (f"group-validation-v1:{split_seed}:{group_id}" if validation_group_key is not None
+                                      else f"{split_seed}:{identity}")
+                    is_validation = int(hashlib.sha256(split_identity.encode()).hexdigest()[:16], 16) / 2**64 < validation_fraction
                     if split != "all" and (split == "validation") != is_validation:
                         continue
-                    fingerprint.update(identity.encode())
+                    if validation_group_key is not None:
+                        fingerprint.update((json.dumps([group_id, identity], ensure_ascii=False) + "\n").encode())
+                    else:
+                        fingerprint.update(identity.encode())
                     self.external_texts.append(text)
             if not self.external_texts:
                 raise ValueError(f"Dataset split {split} is empty: {data_path}")
@@ -459,6 +487,61 @@ def accumulation_autocast(device_type: str, dtype: torch.dtype, cache_across_acc
     if cache_across_accumulation and dtype != torch.float32:
         return torch.amp.autocast(device_type, dtype=dtype)
     return nullcontext()
+
+
+def validate_sft_padding_trim(enabled, stage, dropout, torch_compile) -> bool:
+    """Limit the optional execution change to frozen, deterministic SFT reads."""
+    if not isinstance(enabled, bool):
+        raise ValueError("training.trim_sft_padding must be a boolean")
+    if enabled and (stage != "sft" or dropout != 0.0 or torch_compile):
+        raise ValueError("trim_sft_padding requires stage=sft, dropout=0 and torch_compile=false")
+    return enabled
+
+
+def trim_sft_batch_padding(batch):
+    """Drop a common right-PAD suffix on CPU (eight buckets at a 1024-token cap).
+
+    The original batch, all valid tokens and the shifted next-token targets stay
+    intact. 128-token rounding bounds attention kernel/cache shape variants.
+    This helper is deliberately not used for pretraining or dynamic meta writes.
+    """
+    names = ("input_ids", "labels", "attention_mask")
+    if any(name not in batch or not isinstance(batch[name], torch.Tensor) for name in names):
+        raise ValueError("SFT padding trim requires input_ids, labels and attention_mask tensors")
+    ids, labels, mask = (batch[name] for name in names)
+    if (ids.ndim != 2 or labels.shape != ids.shape or mask.shape != ids.shape
+            or ids.shape[0] == 0 or ids.shape[1] < 2):
+        raise ValueError("SFT padding trim requires matching, nonempty (B,T) tensors with T >= 2")
+    if any(batch[name].device.type != "cpu" for name in names):
+        raise ValueError("SFT padding trim must run on CPU before device transfer")
+    if not bool(((mask == 0) | (mask == 1)).all()):
+        raise ValueError("SFT padding trim requires a binary attention_mask")
+    valid = mask.bool()
+    if bool((~valid[:, :-1] & valid[:, 1:]).any()):
+        raise ValueError("SFT padding trim requires contiguous right padding")
+    lengths = valid.sum(dim=1)
+    if bool((lengths < 2).any()):
+        raise ValueError("SFT padding trim requires at least two valid tokens in each row")
+    if bool((labels[~valid] != -100).any()):
+        raise ValueError("SFT padding trim cannot remove supervised padding targets")
+    length = min(ids.shape[1], max(2, ((int(lengths.max()) + 127) // 128) * 128))
+    if length == ids.shape[1]:
+        return batch
+    trimmed = dict(batch)
+    for name in names:
+        trimmed[name] = batch[name][:, :length].contiguous()
+    return trimmed
+
+
+def collate_trimmed_sft(examples):
+    """Collate/crop before DataLoader's pinning and the training H2D transfer."""
+    return trim_sft_batch_padding(default_collate(examples))
+
+
+def validate_resume_sft_padding(metadata, enabled):
+    previous = metadata.get("trim_sft_padding", False)
+    if not isinstance(previous, bool) or previous != enabled:
+        raise ValueError("Resume checkpoint uses different trim_sft_padding; use a new run and --init-from")
 
 
 # ==============================================================================
@@ -961,6 +1044,7 @@ def train(
     training_stage = stage or train_cfg.get("stage", "meta")
     if training_stage not in {"pretrain", "sft", "meta"}:
         raise ValueError("stage must be pretrain, sft, or meta")
+    validation_group_key = validate_sft_validation_group_key(training_stage, train_cfg.get("validation_group_key"))
     parameter_scope = validate_parameter_scope(training_stage, train_cfg.get("parameter_scope", "all"))
     update_fast_weights = training_stage == "meta"
     corpus_manifest = read_manifest(data_path)
@@ -998,6 +1082,11 @@ def train(
         model_cfg.sliding_window_size = 512
         model_cfg.gradient_checkpointing = True
         hw_cfg["torch_compile"] = False
+
+    trim_sft_padding = validate_sft_padding_trim(
+        train_cfg.get("trim_sft_padding", False), training_stage, model_cfg.dropout,
+        bool(hw_cfg.get("torch_compile", True)),
+    )
 
     seed = int(train_cfg.get("seed", 42))
     torch.manual_seed(seed)
@@ -1081,12 +1170,14 @@ def train(
             pack_sequences=pack_sequences, mode=training_stage,
             split="train" if train_cfg.get("validation_fraction", 0) else "all",
             validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
+            validation_group_key=validation_group_key,
         )
         if data_path and train_cfg.get("validation_fraction", 0):
             validation_dataset = PersonaMetaDataset(
                 tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
                 pack_sequences=pack_sequences, mode=training_stage, split="validation",
                 validation_fraction=float(train_cfg["validation_fraction"]), split_seed=seed,
+                validation_group_key=validation_group_key,
             )
             print(f"[Data] Deduplicated train={len(dataset):,}, validation={len(validation_dataset):,} conversations; split before windowing.")
     # Persona windows use torch.randint for random cropping. Keep them in the
@@ -1104,6 +1195,7 @@ def train(
             num_workers=2 if use_workers else 0,
             persistent_workers=use_workers,
             prefetch_factor=4 if use_workers else None,
+            collate_fn=collate_trimmed_sft if trim_sft_padding else None,
         )
 
     start_step = 1
@@ -1129,6 +1221,7 @@ def train(
         if saved is not None:
             metadata = saved.get("metrics", {})
             validate_resume_parameter_scope(metadata, parameter_scope)
+            validate_resume_sft_padding(metadata, trim_sft_padding)
             if training_stage == "meta" and metadata.get("inner_loop_protocol") != model.INNER_LOOP_PROTOCOL:
                 raise ValueError("Resume checkpoint uses a different meta inner-loop protocol. Use a new output path and --init-from for an intentional protocol transition.")
             if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
@@ -1219,7 +1312,7 @@ def train(
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
         f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}, "
-        f"ParameterScope={parameter_scope}",
+        f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -1464,6 +1557,7 @@ def train(
                     "causal_ttt_v2": True,
                     "training_pipeline": 3, "training_stage": training_stage,
                     "parameter_scope": parameter_scope,
+                    "trim_sft_padding": trim_sft_padding,
                     "trainable_parameters": scope_stats["trainable"], "frozen_parameters": scope_stats["frozen"],
                     "inner_loop_protocol": model.INNER_LOOP_PROTOCOL,
                     "code_revision": os.environ.get("UTTT_CODE_REVISION", "unknown"),

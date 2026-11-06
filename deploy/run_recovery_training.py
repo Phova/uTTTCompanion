@@ -61,6 +61,7 @@ def dataset_identity(config, path, stage):
         mode=stage, split="train" if settings.get("validation_fraction", 0) else "all",
         validation_fraction=float(settings.get("validation_fraction", 0)),
         split_seed=int(settings.get("seed", 42)), pack_sequences=False,
+        validation_group_key=settings.get("validation_group_key"),
     )
     return {"fingerprint": dataset.fingerprint, "documents": len(dataset),
             "window_protocol": dataset.SFT_WINDOW_PROTOCOL if stage == "sft" else None}
@@ -160,6 +161,30 @@ def quality_comparison(baseline, candidate, tasks, settings):
             "scope": "This heldout curriculum only; not a general assistant or online-memory benchmark."}
 
 
+def select_sft_candidate(candidates):
+    """Select the fixed endpoints without confusing progress with a passed gate."""
+    if list(candidates) != ["best_ce", "final"]:
+        raise ValueError("SFT selection requires exactly best_ce and final, in that order")
+    eligible = [name for name, value in candidates.items() if value["quality"]["quality_passed"]]
+    allowed_intermediate_failures = {"heldout_accuracy_below_minimum", "heldout_accuracy_did_not_improve"}
+    safe_intermediate = [name for name, value in candidates.items()
+                         if set(value["quality"]["reasons"]) <= allowed_intermediate_failures
+                         and value["quality"]["candidate"]["accuracy"] >= value["quality"]["baseline"]["accuracy"]]
+    # Iteration order is the explicit tie break. A below-threshold improvement
+    # can be retained for further SFT, but its failed gate still forbids meta.
+    pool = eligible or safe_intermediate
+    selected = (max(pool, key=lambda name: candidates[name]["quality"]["candidate"]["accuracy"])
+                if pool else "best_ce")
+    return selected, {
+        "protocol": "best_ce_and_final_v1", "evaluated_candidates": list(candidates),
+        "eligible_candidates": eligible, "safe_intermediate_candidates": safe_intermediate,
+        "selected_candidate": selected, "may_start_meta": bool(eligible),
+        "selection_status": "gate_passed" if eligible else "intermediate_only" if pool else "fallback_only",
+        "rule": "gate_passes_first; otherwise_nonregressing_intermediate; accuracy_tie_prefers_best_ce; no_safe_candidate_keeps_best_ce",
+        "scope": "Fixed monitoring-set candidate selection and gating; not an independent test or general-quality estimate.",
+    }
+
+
 def validate_meta_probe(path, config):
     report = json.loads(Path(path).read_text(encoding="utf-8"))
     training = config["training"]
@@ -257,6 +282,9 @@ def main(argv=None):
     if not tasks or any(not isinstance(task.get("prompt"), str) or not task["prompt"].strip() for task in tasks):
         raise ValueError("Heldout tasks must contain nonempty prompts")
     settings = config.get("recovery", {})
+    evaluate_final_checkpoint = settings.get("evaluate_final_checkpoint", False)
+    if type(evaluate_final_checkpoint) is not bool:
+        raise ValueError("recovery.evaluate_final_checkpoint must be a boolean")
     # Validate quality settings before any GPU work.
     dummy = {"results": [{"prompt": task["prompt"], "exact_match": False, "eos_generated": False} for task in tasks]}
     dummy_quality = quality_comparison(dummy, dummy, tasks, settings)
@@ -381,6 +409,33 @@ def main(argv=None):
                     "--max-new-tokens", str(int(settings.get("eval_max_new_tokens", 64)))])
         return json.loads(report.read_text(encoding="utf-8")), report
 
+    def evaluate_sft_candidate(name, stage, checkpoint, saved):
+        """Freeze report/weight identity so resume cannot repeatedly reselect."""
+        checkpoint_sha256 = digest(checkpoint)
+        previous = state.get("sft_candidates", {}).get(name)
+        if args.resume and previous:
+            if (previous.get("checkpoint") != str(checkpoint)
+                    or previous.get("checkpoint_sha256") != checkpoint_sha256
+                    or previous.get("step") != saved["step"]
+                    or previous.get("code_revision") != saved["metrics"].get("code_revision")):
+                raise ValueError("A recorded SFT candidate checkpoint changed")
+            path = Path(previous["report"])
+            if digest(path) != previous["report_sha256"]:
+                raise ValueError("A recorded SFT candidate evaluation report changed")
+            report = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            report, path = evaluate(stage, checkpoint)
+            if digest(checkpoint) != checkpoint_sha256:
+                raise ValueError("An SFT candidate checkpoint changed during evaluation")
+        comparison = quality_comparison(baseline, report, tasks, settings)
+        record = {"checkpoint": str(checkpoint), "checkpoint_sha256": checkpoint_sha256,
+                  "step": saved["step"], "code_revision": saved["metrics"].get("code_revision"),
+                  "report": str(path), "report_sha256": digest(path), "quality": comparison}
+        records = dict(state.get("sft_candidates", {}))
+        records[name] = record
+        update(sft_candidates=records)
+        return report, path, comparison
+
     def evaluate_memory(key, checkpoint, *, allow_untrained=False):
         previous = state.get("memory_evaluations", {}).get(key)
         if args.resume and previous:
@@ -499,15 +554,28 @@ def main(argv=None):
                                     run_id=args.run_id, revision=revision, target=steps)
         check_stop()
         best = output.with_suffix(".best.pt")
-        validate_checkpoint(best, stage="sft", fingerprint=identity["fingerprint"],
-                            run_id=args.run_id, revision=accepted_revisions, full=False)
+        best_saved = validate_checkpoint(best, stage="sft", fingerprint=identity["fingerprint"],
+                                         run_id=args.run_id, revision=accepted_revisions, full=False)
         update(training_complete=True, saved_step=saved["step"])
-        candidate, candidate_path = evaluate("sft_evaluate", best)
-        comparison = quality_comparison(baseline, candidate, tasks, settings)
-        update(quality=comparison, quality_passed=comparison["quality_passed"], selected_checkpoint=str(best),
+        selected_sft = best
+        if evaluate_final_checkpoint:
+            reports = {}
+            for name, stage, checkpoint, info in (("best_ce", "sft_evaluate", best, best_saved),
+                                                   ("final", "sft_final_evaluate", output, saved)):
+                reports[name] = evaluate_sft_candidate(name, stage, checkpoint, info)
+            selected, selection = select_sft_candidate(state["sft_candidates"])
+            selected_record = state["sft_candidates"][selected]
+            selected_sft = Path(selected_record["checkpoint"])
+            candidate, candidate_path, comparison = reports[selected]
+            update(sft_selection=selection, sft_selected_checkpoint=str(selected_sft),
+                   sft_selected_checkpoint_sha256=selected_record["checkpoint_sha256"])
+        else:
+            candidate, candidate_path = evaluate("sft_evaluate", best)
+            comparison = quality_comparison(baseline, candidate, tasks, settings)
+        update(quality=comparison, quality_passed=comparison["quality_passed"], selected_checkpoint=str(selected_sft),
                sft_quality_report=str(candidate_path), sft_quality_sha256=digest(candidate_path))
         if meta and comparison["quality_passed"]:
-            evaluate_memory("baseline", best, allow_untrained=True)
+            evaluate_memory("baseline", selected_sft, allow_untrained=True)
             meta_command = [sys.executable, "-u", "train_5090.py", "--config", str(meta["config"]),
                             "--data-path", str(meta["data"]), "--steps", str(meta["steps"]),
                             "--output-ckpt", str(meta["output"])]
@@ -520,7 +588,7 @@ def main(argv=None):
                         or any(stage.get("stage") == "meta" and stage.get("status") == "complete"
                                for stage in state.get("stages", []))):
                     raise RuntimeError("The full meta checkpoint is missing after training/save evidence; refusing weight-only reinitialization")
-                meta_command.extend(["--init-from", str(best), "--no-resume"])
+                meta_command.extend(["--init-from", str(selected_sft), "--no-resume"])
             update(meta_resume_checkpoint=str(meta_resume_source) if meta_resume_source else None)
             run("meta", meta_command)
             validate_checkpoint(meta["output"], stage="meta", fingerprint=meta["identity"]["fingerprint"],
@@ -535,7 +603,7 @@ def main(argv=None):
             meta_quality = check_meta_language_retention(comparison, meta_quality, settings)
             update(meta_quality=meta_quality, quality_passed=meta_quality["quality_passed"],
                    meta_quality_report=str(meta_report_path), meta_quality_sha256=digest(meta_report_path),
-                   selected_checkpoint=str(meta_best if meta_quality["quality_passed"] else best), online_writes_allowed=False,
+                   selected_checkpoint=str(meta_best if meta_quality["quality_passed"] else selected_sft), online_writes_allowed=False,
                    meta_training_complete=True, online_memory_quality_verified=False,
                    online_writes_blocked_reason="Separate memory heldout evaluation of dynamic versus frozen state is required")
             evaluate_memory("meta", meta_best)

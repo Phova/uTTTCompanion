@@ -38,6 +38,31 @@ class FakeProcess:
         return self.code
 
 
+class RecoveryDatasetIdentityTests(unittest.TestCase):
+    def test_grouped_identity_matches_the_trainer_and_changes_legacy_fingerprint(self):
+        try:
+            from train_5090 import PersonaMetaDataset
+        except ImportError:
+            self.skipTest("Trainer's PyTorch dependencies unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grouped.jsonl"
+            rows = [{"text": f"<|user|> Question {group}, form {form}?<|assistant|> Answer {group}.<|eos|>",
+                     "validation_group_id": f"semantic-{group}"}
+                    for group in range(40) for form in range(3)]
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            training = {"seq_len": 64, "validation_fraction": .25, "seed": 271828,
+                        "validation_group_key": "validation_group_id"}
+            expected = PersonaMetaDataset(None, seq_len=64, data_path=str(path), mode="sft", split="train",
+                                          validation_fraction=.25, split_seed=271828, pack_sequences=False,
+                                          validation_group_key="validation_group_id")
+            actual = runner.dataset_identity({"training": training}, path, "sft")
+            self.assertEqual(actual, {"fingerprint": expected.fingerprint, "documents": len(expected),
+                                      "window_protocol": expected.SFT_WINDOW_PROTOCOL})
+            legacy = PersonaMetaDataset(None, seq_len=64, data_path=str(path), mode="sft", split="train",
+                                        validation_fraction=.25, split_seed=271828, pack_sequences=False)
+            self.assertNotEqual(actual["fingerprint"], legacy.fingerprint)
+
+
 class RecoveryLifecycleTests(unittest.TestCase):
     def test_meta_improvement_over_old_model_cannot_hide_sft_regression(self):
         sft = {"candidate": {"accuracy": .8, "eos_rate": 1.0}}
@@ -87,6 +112,8 @@ class RecoveryLifecycleTests(unittest.TestCase):
         self.console = self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.baseline_correct = 0
         self.candidate_correct = 3
+        self.final_correct = None
+        self.final_eos = True
         self.processes = []
         self.popen = self.stack.enter_context(patch.object(runner.subprocess, "Popen", side_effect=self.spawn))
 
@@ -100,7 +127,10 @@ class RecoveryLifecycleTests(unittest.TestCase):
             report_path = Path(command[command.index("--output") + 1])
             checkpoint = Path(command[command.index("--checkpoint") + 1])
             correct = self.baseline_correct if checkpoint == self.initial else self.candidate_correct
-            report_path.write_text(json.dumps(self.report(correct)), encoding="utf-8")
+            if checkpoint == self.output and self.final_correct is not None:
+                correct = self.final_correct
+            report_path.write_text(json.dumps(self.report(correct, eos=self.final_eos if checkpoint == self.output else True)),
+                                   encoding="utf-8")
         elif "deploy/evaluate_memory.py" in command:
             report_path = Path(command[command.index("--output") + 1])
             checkpoint = Path(command[command.index("--checkpoint") + 1])
@@ -176,6 +206,171 @@ class RecoveryLifecycleTests(unittest.TestCase):
         self.assertFalse(self.state()["quality_passed"])
         self.assertEqual(self.state()["status"], "quality_failed")
         self.assertFalse(self.state()["online_writes_allowed"])
+
+    def final_candidate_monitor(self, *, baseline=2, best=2, final=14):
+        self.settings["recovery"] = {"evaluate_final_checkpoint": True}
+        self.tasks = [{"prompt": f"question {i}", "accepted": [str(i)]} for i in range(60)]
+        self.tasks_path.write_text("\n".join(json.dumps(task) for task in self.tasks), encoding="utf-8")
+        self.baseline_correct, self.candidate_correct, self.final_correct = baseline, best, final
+
+    def test_final_improvement_is_retained_without_bypassing_meta_gate(self):
+        self.final_candidate_monitor()
+        runner.main(self.argv + self.meta_arguments())
+        state = self.state()
+        self.assertEqual(state["selected_checkpoint"], str(self.output))
+        self.assertEqual(state["sft_selection"]["selection_status"], "intermediate_only")
+        self.assertFalse(state["sft_selection"]["may_start_meta"])
+        self.assertFalse(state["quality_passed"])
+        self.assertEqual(state["quality"]["candidate"]["accuracy"], 14 / 60)
+        self.assertEqual(state["status"], "quality_failed")
+        self.assertEqual([entry["stage"] for entry in state["stages"]],
+                         ["baseline_evaluate", "sft", "sft_evaluate", "sft_final_evaluate"])
+        self.assertFalse(any("deploy/evaluate_memory.py" in command for command, _ in self.processes))
+        self.assertEqual(set(state["sft_candidates"]), {"best_ce", "final"})
+        for candidate in state["sft_candidates"].values():
+            self.assertEqual(candidate["checkpoint_sha256"], runner.digest(candidate["checkpoint"]))
+            self.assertEqual(candidate["report_sha256"], runner.digest(candidate["report"]))
+            self.assertEqual(candidate["code_revision"], "revision")
+            self.assertEqual(candidate["step"], 10)
+
+    def test_passing_final_candidate_supplies_meta_initialization_and_retention_reference(self):
+        self.final_candidate_monitor(final=31)
+        runner.main(self.argv + self.meta_arguments())
+        state = self.state()
+        self.assertEqual(state["sft_selection"]["selection_status"], "gate_passed")
+        self.assertTrue(state["sft_selection"]["may_start_meta"])
+        self.assertEqual(state["sft_selected_checkpoint"], str(self.output))
+        memory = next(command for command, _ in self.processes if "--allow-untrained-baseline" in command)
+        self.assertEqual(memory[memory.index("--checkpoint") + 1], str(self.output))
+        meta = next(command for command, _ in self.processes
+                    if "train_5090.py" in command and command[command.index("--output-ckpt") + 1] == str(self.meta_output))
+        self.assertEqual(meta[meta.index("--init-from") + 1], str(self.output))
+        self.assertIn("--no-resume", meta)
+        self.assertEqual(state["meta_quality"]["sft_retention"]["reference"]["accuracy"], 31 / 60)
+        # Fake meta stays at the old best's score and fails; retain the selected
+        # final SFT candidate, rather than accidentally falling back to best CE.
+        self.assertFalse(state["meta_quality"]["quality_passed"])
+        self.assertEqual(state["selected_checkpoint"], str(self.output))
+
+    def test_higher_final_accuracy_cannot_hide_eos_regression(self):
+        self.final_candidate_monitor(final=31)
+        self.final_eos = False
+        runner.main(self.argv + self.meta_arguments())
+        state = self.state()
+        self.assertEqual(state["sft_selection"]["selected_candidate"], "best_ce")
+        self.assertEqual(state["selected_checkpoint"], str(self.output.with_suffix(".best.pt")))
+        self.assertIn("eos_rate_regressed", state["sft_candidates"]["final"]["quality"]["reasons"])
+        self.assertFalse(state["sft_selection"]["may_start_meta"])
+        self.assertEqual(len(self.processes), 4)
+
+    def test_candidate_accuracy_ties_prefer_best_ce(self):
+        self.settings["recovery"] = {"evaluate_final_checkpoint": True}
+        self.final_correct = self.candidate_correct
+        runner.main(self.argv)
+        state = self.state()
+        self.assertEqual(state["sft_selection"]["eligible_candidates"], ["best_ce", "final"])
+        self.assertEqual(state["sft_selection"]["selected_candidate"], "best_ce")
+        self.assertTrue(state["quality_passed"])
+
+    def test_no_nonregressing_candidate_keeps_best_ce_as_unapproved_fallback(self):
+        self.final_candidate_monitor(baseline=20, best=2, final=14)
+        runner.main(self.argv)
+        self.assertEqual(self.state()["sft_selection"]["selection_status"], "fallback_only")
+        self.assertEqual(self.state()["sft_selection"]["safe_intermediate_candidates"], [])
+        self.assertEqual(self.state()["sft_selection"]["selected_candidate"], "best_ce")
+        self.assertFalse(self.state()["quality_passed"])
+
+    def test_resume_reuses_both_pinned_candidate_evaluations(self):
+        self.final_candidate_monitor()
+        runner.main(self.argv)
+        records = self.state()["sft_candidates"]
+        contents = {Path(value["report"]): Path(value["report"]).read_bytes() for value in records.values()}
+        self.processes.clear()
+        runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 1)
+        self.assertIn("train_5090.py", self.processes[0][0])
+        self.assertEqual(self.state()["sft_candidates"], records)
+        self.assertEqual(self.state()["selected_checkpoint"], str(self.output))
+        for path, value in contents.items():
+            self.assertEqual(path.read_bytes(), value)
+
+    def test_changed_cached_candidate_report_is_not_silently_reevaluated(self):
+        self.final_candidate_monitor()
+        runner.main(self.argv)
+        report = Path(self.state()["sft_candidates"]["best_ce"]["report"])
+        report.write_text(report.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self.processes.clear()
+        with self.assertRaisesRegex(ValueError, "candidate evaluation report changed"):
+            runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 1)
+        self.assertEqual(self.state()["status"], "failed")
+
+    def test_interrupted_final_evaluation_reuses_best_and_preserves_partial_report(self):
+        self.final_candidate_monitor(final=31)
+        spawn = self.spawn
+
+        def interrupted_final(command, **kwargs):
+            process = spawn(command, **kwargs)
+            if ("deploy/evaluate_model.py" in command
+                    and command[command.index("--checkpoint") + 1] == str(self.output)):
+                def lines():
+                    self.stop()
+                    yield "final candidate evaluation interrupted\n"
+                process.stdout = lines()
+            return process
+
+        self.popen.side_effect = interrupted_final
+        runner.main(self.argv)
+        interrupted = self.state()
+        self.assertEqual(interrupted["status"], "interrupted")
+        self.assertEqual(set(interrupted["sft_candidates"]), {"best_ce"})
+        old_report = Path(interrupted["stages"][-1]["log"]).with_suffix(".json")
+        old_contents = old_report.read_bytes()
+        self.processes.clear()
+        self.popen.side_effect = spawn
+        runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 2)
+        self.assertIn("train_5090.py", self.processes[0][0])
+        self.assertEqual(self.processes[1][0][self.processes[1][0].index("--checkpoint") + 1], str(self.output))
+        self.assertEqual(old_report.read_bytes(), old_contents)
+        self.assertNotEqual(self.state()["sft_candidates"]["final"]["report"], str(old_report))
+        self.assertEqual(self.state()["selected_checkpoint"], str(self.output))
+        self.assertTrue(self.state()["quality_passed"])
+
+    def test_changed_cached_candidate_weights_are_rejected(self):
+        self.final_candidate_monitor()
+        runner.main(self.argv)
+        self.output.write_bytes(b"different weights with the same mocked metadata")
+        self.processes.clear()
+        with self.assertRaisesRegex(ValueError, "candidate checkpoint changed"):
+            runner.main(self.argv + ["--resume"])
+        self.assertEqual(len(self.processes), 1)
+
+    def test_checkpoint_change_during_candidate_evaluation_is_rejected(self):
+        self.final_candidate_monitor()
+        spawn = self.spawn
+
+        def change_weights(command, **kwargs):
+            result = spawn(command, **kwargs)
+            if ("deploy/evaluate_model.py" in command
+                    and command[command.index("--checkpoint") + 1] == str(self.output.with_suffix(".best.pt"))):
+                self.output.with_suffix(".best.pt").write_bytes(b"replaced during evaluation")
+            return result
+
+        self.popen.side_effect = change_weights
+        with self.assertRaisesRegex(ValueError, "changed during evaluation"):
+            runner.main(self.argv)
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertFalse(self.state()["online_writes_allowed"])
+        self.assertNotIn("sft_candidates", self.state())
+
+    def test_final_candidate_flag_requires_a_real_boolean_before_gpu_work(self):
+        for value in ("true", 1, None):
+            with self.subTest(value=value):
+                self.settings["recovery"] = {"evaluate_final_checkpoint": value}
+                with self.assertRaisesRegex(ValueError, "evaluate_final_checkpoint must be a boolean"):
+                    runner.main(self.argv)
+        self.popen.assert_not_called()
 
     def test_requested_stop_forwards_term_and_launches_no_next_stage(self):
         original = self.spawn
