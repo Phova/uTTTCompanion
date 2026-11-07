@@ -1,0 +1,81 @@
+{
+  "cpu_regression": {
+    "total": 449,
+    "passed": 427,
+    "skipped": 22,
+    "failures": 0
+  },
+  "storage_probe": {
+    "write_fsync_seconds": 3.4082567000000004,
+    "MiB_per_second": 300.4468530788775,
+    "hardlink_rotation_supported": true,
+    "hash_verified": true,
+    "directory": "/mnt/c/uTTT-artifacts/checkpoints/20261107_continue",
+    "free_C": 244127662080,
+    "free_D": 25728880640,
+    "probe_files_cleaned": true,
+    "torch_save_mmap_verified": true
+  },
+  "source_preflight": {
+    "source": {
+      "path": "/root/uTTT/checkpoints/uttt_1.584b_20261107_expand.pt",
+      "sha256": "e0368d9f97f676812ba5164cd7a9b7e56040453ca8dcfbcc656fb515e49ad377",
+      "step": 2000,
+      "source_run_id": "20261107_expand",
+      "source_code_revision": "54efef40432cbcf182d1dd26c643e7e8ca6aae77",
+      "dataset_fingerprint": "c7b49e7f462f9244a39beb6395f98538416b0d7c525516021f50916d4c45b107",
+      "phase_best_reset": true,
+      "historical_best_validation_ce": 1.7713603987286193,
+      "historical_best_validation_score": 1.2543595211095635,
+      "validation_selection_metric": "validation_example_ce"
+    },
+    "schedule": {
+      "start_step": 2000,
+      "warmup_start_ratio": 0.4,
+      "max_steps": 6000,
+      "warmup_steps": 100,
+      "outer_lr": 5e-06,
+      "meta_fast_lr": 2.5e-06
+    },
+    "source_step": 2000,
+    "optimizer_states": 313,
+    "optimizer_steps_consistent": true,
+    "source_cursor": {
+      "version": 1,
+      "size": 97926,
+      "seed": 20261107,
+      "epoch": 0,
+      "offset": 32000
+    },
+    "cuda_rng_present": true,
+    "first_slow_lr": 2.0000000000000003e-06,
+    "warm_slow_lr": 5e-06,
+    "last_slow_lr": 5.000007300002861e-07,
+    "train_fingerprint": "c7b49e7f462f9244a39beb6395f98538416b0d7c525516021f50916d4c45b107",
+    "pipeline_binding": {
+      "protocol": "uttt-sft-continuation-v1",
+      "path": "/root/uTTT/checkpoints/uttt_1.584b_20261107_expand.pt",
+      "sha256": "e0368d9f97f676812ba5164cd7a9b7e56040453ca8dcfbcc656fb515e49ad377",
+      "step": 2000,
+      "run_id": "20261107_expand",
+      "code_revision": "54efef40432cbcf182d1dd26c643e7e8ca6aae77",
+      "dataset_fingerprint": "c7b49e7f462f9244a39beb6395f98538416b0d7c525516021f50916d4c45b107",
+      "parameter_scope": "all",
+      "validation_selection_metric": "validation_example_ce",
+      "micro_batch_size": 1,
+      "grad_accum_steps": 16,
+      "data_cursor": {
+        "version": 1,
+        "size": 97926,
+        "seed": 20261107,
+        "epoch": 0,
+        "offset": 32000
+      }
+    }
+  },
+  "candidate_code_sha256": {
+    "train_5090.py": "5e039fd907af12dcadc79362286bf7466170332b12eb663edd65cc488acc5973",
+    "deploy/run_recovery_training.py": "04129e8e02e1fd3d308a250ceb9257c5f7250b0bdad4f96b4dc70f045439f726",
+    "deploy/monitor_status.py": "8e7e47cacf77c885e2140f1e3c4524285a88d84e858cd94dbfd0f8e1967205d8"
+  }
+}

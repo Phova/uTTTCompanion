@@ -807,6 +807,126 @@ def get_cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float) 
     return base_lr * (0.1 + 0.9 * cosine_decay)
 
 
+def training_lr_schedule(stage, start_step, warmup_start_ratio, max_steps, warmup_steps, outer_lr, fast_lr):
+    """Describe an explicit phase without altering legacy zero-offset schedules."""
+    if not isinstance(start_step, int) or isinstance(start_step, bool) or not 0 <= start_step < max_steps:
+        raise ValueError("training.lr_schedule_start_step must be an integer in [0, max_steps)")
+    if (not isinstance(warmup_start_ratio, (int, float)) or isinstance(warmup_start_ratio, bool)
+            or not math.isfinite(warmup_start_ratio) or not 0 <= warmup_start_ratio <= 1):
+        raise ValueError("training.lr_warmup_start_ratio must be a finite fraction in [0, 1]")
+    if (start_step or warmup_start_ratio) and stage != "sft":
+        raise ValueError("A phase LR schedule requires stage=sft")
+    return {"start_step": start_step, "warmup_start_ratio": float(warmup_start_ratio),
+            "max_steps": max_steps, "warmup_steps": warmup_steps,
+            "outer_lr": outer_lr, "meta_fast_lr": fast_lr}
+
+
+def scheduled_training_lr(global_step, base_lr, schedule):
+    step = global_step - 1 - schedule["start_step"]
+    if step < 0:
+        raise ValueError("Training step precedes this phase LR schedule")
+    horizon = schedule["max_steps"] - schedule["start_step"]
+    warmup, ratio = schedule["warmup_steps"], schedule["warmup_start_ratio"]
+    if ratio and step < warmup:
+        return base_lr * (ratio + (1.0 - ratio) * step / max(1, warmup))
+    return get_cosine_lr(step, horizon, warmup, base_lr)
+
+
+def validate_resume_lr_schedule(metadata, schedule):
+    previous = metadata.get("lr_schedule")
+    explicit = bool(schedule["start_step"] or schedule["warmup_start_ratio"])
+    previous_explicit = isinstance(previous, dict) and bool(
+        previous.get("start_step") or previous.get("warmup_start_ratio"))
+    # Legacy callers intentionally extended zero-offset schedules with --steps.
+    if explicit or previous_explicit:
+        if previous != schedule:
+            raise ValueError("Resume checkpoint uses a different phase LR schedule")
+    record = metadata.get("continuation")
+    if schedule["start_step"] and (not isinstance(record, dict)
+            or record.get("step") != schedule["start_step"] or record.get("phase_best_reset") is not True
+            or not isinstance(record.get("path"), str)
+            or not isinstance(record.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+            or not all(isinstance(record.get(key), str) and record[key]
+                       for key in ("source_run_id", "source_code_revision"))):
+        raise ValueError("Resume checkpoint is missing valid continuation provenance")
+    return record
+
+
+def inspect_training_continuation(path, output, model_config, dataset, *, stage, scope, metric,
+                                  trim_padding, seed, micro_batch_size, grad_accum_steps, schedule,
+                                  require_cuda_rng=False):
+    """Validate a read-only, full-state parent before allocating a CUDA model."""
+    source, destination = Path(path).resolve(), Path(output).resolve()
+    if stage != "sft" or micro_batch_size != 1:
+        raise ValueError("--continue-from requires stage=sft and semantic micro_batch_size=1")
+    if source == destination or any(candidate.exists() for candidate in (
+            destination, Path(str(destination) + ".prev"), destination.with_suffix(".best.pt"),
+            Path(str(destination.with_suffix(".best.pt")) + ".prev"))):
+        raise ValueError("--continue-from requires a new output with no current/previous/best checkpoints")
+    before = source.stat()
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    saved = torch.load(source, map_location="cpu", weights_only=False, mmap=True)
+    after = source.stat()
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError("Continuation checkpoint changed while it was being verified")
+    metadata = saved.get("metrics", {})
+    step = saved.get("step")
+    if (not isinstance(step, int) or isinstance(step, bool) or step < 1
+            or step >= schedule["max_steps"] or schedule["start_step"] != step):
+        raise ValueError("Continuation step must match lr_schedule_start_step and precede the new target")
+    if (metadata.get("training_stage") != "sft" or metadata.get("training_pipeline") != 3
+            or not metadata.get("causal_ttt_v2") or metadata.get("dataset_fingerprint") != dataset.fingerprint
+            or metadata.get("inner_loop_protocol") != uTTTModel.INNER_LOOP_PROTOCOL):
+        raise ValueError("Continuation checkpoint has different data, stage or training protocol")
+    if not math.isfinite(float(metadata.get("total_loss", float("nan")))):
+        raise ValueError("Continuation checkpoint has invalid training loss")
+    if not all(isinstance(metadata.get(key), str) and metadata[key] for key in ("run_id", "code_revision")):
+        raise ValueError("Continuation checkpoint requires source run and code provenance")
+    validate_resume_parameter_scope(metadata, scope)
+    validate_resume_sft_padding(metadata, trim_padding)
+    validate_resume_validation_selection(metadata, metric)
+    previous = uTTTConfig.from_dict(saved.get("config", {}))
+    math_fields = ("vocab_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff_fast",
+                   "chunk_size", "sliding_window_size", "max_seq_len", "rope_theta", "rms_norm_eps",
+                   "dropout", "tie_word_embeddings", "write_schedule", "tokenizer_json")
+    for name in math_fields:
+        if getattr(previous, name) != getattr(model_config, name):
+            raise ValueError(f"Continuation checkpoint has different model/tokenizer configuration: {name}")
+    state = saved.get("training_state")
+    optimizer = saved.get("optimizer_state")
+    if not isinstance(state, dict) or not isinstance(optimizer, dict) or not optimizer.get("state"):
+        raise ValueError("Continuation requires full optimizer, data cursor and RNG state")
+    if (type(state.get("micro_batch_size")) is not int or type(state.get("grad_accum_steps")) is not int
+            or state["micro_batch_size"] != micro_batch_size or state["grad_accum_steps"] != grad_accum_steps):
+        raise ValueError("Continuation requires unchanged semantic batch/accumulation settings")
+    cursor, rng = state.get("data_cursor"), state.get("rng")
+    if (not isinstance(cursor, dict) or cursor.get("seed") != seed or cursor.get("size") != len(dataset)
+            or not isinstance(rng, dict) or not isinstance(rng.get("cpu"), torch.Tensor)
+            or rng["cpu"].dtype != torch.uint8 or rng["cpu"].ndim != 1
+            or rng["cpu"].numel() != torch.get_rng_state().numel()):
+        raise ValueError("Continuation checkpoint has invalid data cursor/RNG or a different seed")
+    probe = ResumableBatchSampler(len(dataset), micro_batch_size, seed)
+    probe.load_state_dict(cursor)
+    if probe.epoch * len(dataset) + probe.offset != step * micro_batch_size * grad_accum_steps:
+        raise ValueError("Continuation data cursor does not match its completed optimizer steps")
+    if require_cuda_rng and (not isinstance(rng.get("cuda"), list) or not rng["cuda"]):
+        raise ValueError("CUDA continuation requires saved CUDA RNG state")
+    if "cuda" in rng and (not isinstance(rng["cuda"], list)
+                          or any(not isinstance(value, torch.Tensor) or value.dtype != torch.uint8
+                                 or value.ndim != 1 for value in rng["cuda"])):
+        raise ValueError("Continuation checkpoint has invalid CUDA RNG state")
+    record = {"path": str(source), "sha256": digest.hexdigest(), "step": step,
+              "source_run_id": metadata["run_id"], "source_code_revision": metadata["code_revision"],
+              "dataset_fingerprint": dataset.fingerprint, "phase_best_reset": True,
+              "historical_best_validation_ce": metadata.get("best_validation_ce"),
+              "historical_best_validation_score": metadata.get("best_validation_score"),
+              "validation_selection_metric": metric}
+    return saved, record
+
+
 @torch.no_grad()
 def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=False, max_batches=32):
     was_training = model.training
@@ -1055,9 +1175,13 @@ def train(
     stage: Optional[str] = None,
     init_from: Optional[str] = None,
     tokenizer_path: Optional[str] = None,
+    continue_from: Optional[str] = None,
 ) -> Path:
     """Run outer-loop + inner-loop uTTT Meta-Training and export `base_uttt.pt`."""
     import yaml
+
+    if continue_from is not None and (init_from is not None or not resume or lightweight_preset or large_preset):
+        raise ValueError("--continue-from cannot be combined with --init-from, --no-resume or model presets")
 
     with open(config_path, "r", encoding="utf-8") as f:
         raw_cfg = yaml.safe_load(f)
@@ -1130,10 +1254,45 @@ def train(
         max_tokens_per_group=train_cfg.get("sft_max_group_tokens", 1536),
     )
 
+    requested_steps = override_steps or int(train_cfg.get("max_steps", 2000))
+    requested_micro = override_batch_size or (1 if large_preset else int(train_cfg.get("micro_batch_size", 4)))
+    requested_accum = int(train_cfg.get("large_grad_accum_steps", 32) if large_preset else train_cfg.get("grad_accum_steps", 8))
+    requested_seq_len = override_seq_len or int(train_cfg.get("seq_len", 1024))
+    lr_schedule = training_lr_schedule(
+        training_stage, train_cfg.get("lr_schedule_start_step", 0), train_cfg.get("lr_warmup_start_ratio", 0.),
+        requested_steps, 0, float(train_cfg.get("outer_lr", 3e-4)), float(train_cfg.get("meta_fast_lr", 1.5e-4)),
+    )
+    lr_schedule["warmup_steps"] = min(int(train_cfg.get("warmup_steps", 100)),
+                                      max(1, (requested_steps - lr_schedule["start_step"]) // 5))
+    output_path = Path(output_ckpt or train_cfg.get("base_checkpoint_path", "checkpoints/base_uttt.pt"))
+    if lr_schedule["start_step"] and continue_from is None and not (
+            resume and (output_path.exists() or Path(str(output_path) + ".prev").exists())):
+        raise ValueError("A nonzero lr_schedule_start_step requires --continue-from or this phase's full resume checkpoint")
+
     seed = int(train_cfg.get("seed", 42))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    continuation_payload = continuation_dataset = continuation_record = None
+    if continue_from is not None:
+        if not data_path:
+            raise ValueError("--continue-from requires the original external SFT dataset")
+        continuation_dataset = PersonaMetaDataset(
+            None, seq_len=requested_seq_len, data_path=data_path, pack_sequences=bool(train_cfg.get("pack_sequences", True)),
+            mode=training_stage, split="train" if train_cfg.get("validation_fraction", 0) else "all",
+            validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
+            validation_group_key=validation_group_key,
+        )
+        continuation_payload, continuation_record = inspect_training_continuation(
+            continue_from, output_path, model_cfg, continuation_dataset, stage=training_stage, scope=parameter_scope,
+            metric=validation_selection_metric, trim_padding=trim_sft_padding, seed=seed,
+            micro_batch_size=requested_micro, grad_accum_steps=requested_accum, schedule=lr_schedule,
+            require_cuda_rng=hw_cfg.get("device", "cuda") == "cuda",
+        )
+        print(f"[Continue] Verified full SFT parent {continuation_record['path']} at step "
+              f"{continuation_record['step']} (sha256={continuation_record['sha256']}); "
+              "Adam/data cursor/RNG continue; this phase starts a new best-selection window.", flush=True)
 
     device, amp_dtype = configure_rtx5090_environment(hw_cfg)
 
@@ -1189,7 +1348,7 @@ def train(
     max_steps = override_steps or int(train_cfg.get("max_steps", 2000))
     if min(micro_batch_size, grad_accum_steps, max_steps) < 1 or seq_len < 2:
         raise ValueError("Batch size, accumulation and steps must be positive; sequence length must be at least 2")
-    warmup_steps = min(int(train_cfg.get("warmup_steps", 100)), max(1, max_steps // 5))
+    warmup_steps = lr_schedule["warmup_steps"]
     max_outer_grad_norm = float(train_cfg.get("max_outer_grad_norm", 1.0))
     # Directly minimizing a learned reconstruction task has a trivial solution.
     # Language modelling, not small surprise, is the criterion for useful memory.
@@ -1206,7 +1365,7 @@ def train(
         validation_dataset = TokenizedCorpusDataset(data_path, seq_len=seq_len, split="validation")
         print(f"[Corpus] Memory-mapped train={dataset.token_count:,}, validation={validation_dataset.token_count:,} tokens; no text corpus loaded into RAM.", flush=True)
     else:
-        dataset = PersonaMetaDataset(
+        dataset = continuation_dataset if continuation_dataset is not None else PersonaMetaDataset(
             tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
             num_samples=max(4096, max_steps * micro_batch_size * grad_accum_steps),
             pack_sequences=pack_sequences, mode=training_stage,
@@ -1214,6 +1373,7 @@ def train(
             validation_fraction=float(train_cfg.get("validation_fraction", 0)), split_seed=seed,
             validation_group_key=validation_group_key,
         )
+        dataset.tokenizer = tokenizer
         if data_path and train_cfg.get("validation_fraction", 0):
             validation_dataset = PersonaMetaDataset(
                 tokenizer=tokenizer, seq_len=seq_len, data_path=data_path,
@@ -1249,23 +1409,26 @@ def train(
     cur_data_tag = str(Path(data_path).expanduser().resolve()) if data_path else "synthetic"
     ckpt_file = Path(ckpt_path)
     prev_ckpt_file = Path(str(ckpt_path) + ".prev")
-    if resume and not lightweight_preset and (ckpt_file.exists() or prev_ckpt_file.exists()):
-        saved = None
-        loaded_from = ckpt_file
-        for cand_file in (ckpt_file, prev_ckpt_file):
-            if not cand_file.exists():
-                continue
-            try:
-                saved = torch.load(cand_file, map_location="cpu", weights_only=False, mmap=True)
-                loaded_from = cand_file
-                break
-            except Exception as exc:
-                print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
+    if continuation_payload is not None or (resume and not lightweight_preset and (ckpt_file.exists() or prev_ckpt_file.exists())):
+        saved, loaded_from = continuation_payload, Path(continue_from) if continue_from is not None else ckpt_file
+        continuation_payload = None  # Do not retain a second whole-file mmap owner after restoration.
+        if saved is None:
+            for cand_file in (ckpt_file, prev_ckpt_file):
+                if not cand_file.exists():
+                    continue
+                try:
+                    saved = torch.load(cand_file, map_location="cpu", weights_only=False, mmap=True)
+                    loaded_from = cand_file
+                    break
+                except Exception as exc:
+                    print(f"[Resume] Warning: could not read {cand_file} ({exc}); trying fallback...", flush=True)
         if saved is not None:
             metadata = saved.get("metrics", {})
             validate_resume_parameter_scope(metadata, parameter_scope)
             validate_resume_sft_padding(metadata, trim_sft_padding)
             best_validation_score = validate_resume_validation_selection(metadata, validation_selection_metric)
+            if continue_from is None:
+                continuation_record = validate_resume_lr_schedule(metadata, lr_schedule)
             if training_stage == "meta" and metadata.get("inner_loop_protocol") != model.INNER_LOOP_PROTOCOL:
                 raise ValueError("Resume checkpoint uses a different meta inner-loop protocol. Use a new output path and --init-from for an intentional protocol transition.")
             if (metadata.get("training_pipeline") != 3 or metadata.get("training_stage") != training_stage
@@ -1290,6 +1453,11 @@ def train(
                 if not dims_match or not is_causal_v2 or not same_data or saved_step < 1 or not math.isfinite(saved_loss):
                     raise ValueError("Checkpoint model dimensions or training state are incompatible; use a new output path")
                 validate_resume_optimizer_state(optimizer, saved.get("optimizer_state"), saved_step)
+                if continue_from is not None:
+                    for current_group, source_group in zip(optimizer.param_groups, saved["optimizer_state"]["param_groups"]):
+                        for key in ("betas", "eps", "weight_decay", "amsgrad", "maximize"):
+                            if current_group.get(key) != source_group.get(key):
+                                raise ValueError(f"Continuation changes AdamW hyperparameter {key}")
                 if dims_match and is_causal_v2 and same_data and saved_step >= max_steps and math.isfinite(saved_loss):
                     print(f"[Resume] Checkpoint already reached step {saved_step} (requested {max_steps}); leaving it unchanged.", flush=True)
                     return loaded_from
@@ -1303,6 +1471,10 @@ def train(
                     start_step = saved_step + 1
                     tokens_seen = int(saved_metrics.get("tokens_seen", 0))
                     best_validation_ce = float(saved_metrics.get("best_validation_ce", float("inf")))
+                    if continue_from is not None:
+                        # Candidates belong to this new phase. The immutable parent
+                        # remains its baseline; its historical best is in provenance.
+                        best_validation_ce = best_validation_score = float("inf")
                     training_state = saved.get("training_state")
                     if training_state is not None:
                         batch_sampler.load_state_dict(training_state["data_cursor"])
@@ -1356,7 +1528,8 @@ def train(
         f"ChunkSize={model_cfg.chunk_size}, GradCkpt={model_cfg.gradient_checkpointing}, "
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
         f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}, "
-        f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}, SFTExecution={sft_execution}",
+        f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}, SFTExecution={sft_execution}, "
+        f"LRScheduleStart={lr_schedule['start_step']}, WarmupStartRatio={lr_schedule['warmup_start_ratio']}",
         flush=True,
     )
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
@@ -1379,8 +1552,8 @@ def train(
         # otherwise healthy writer before every optimizer step.
         _raise_active_save_error()
         # Update learning rates for both parameter groups
-        cur_slow_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, outer_lr)
-        cur_fast_lr = get_cosine_lr(step - 1, max_steps, warmup_steps, meta_fast_lr)
+        cur_slow_lr = scheduled_training_lr(step, outer_lr, lr_schedule)
+        cur_fast_lr = scheduled_training_lr(step, meta_fast_lr, lr_schedule)
         optimizer.param_groups[0]["lr"] = cur_slow_lr
         optimizer.param_groups[1]["lr"] = cur_fast_lr
 
@@ -1643,6 +1816,7 @@ def train(
                     "best_validation_ce": best_validation_ce,
                     "best_validation_score": best_validation_score,
                     "validation_selection_metric": validation_selection_metric, **validation_metrics,
+                    "lr_schedule": dict(lr_schedule), "continuation": continuation_record,
                     "data_source": cur_data_tag,
                     "peak_vram_gb": (
                         torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -1729,9 +1903,14 @@ def parse_args() -> argparse.Namespace:
         help="Start training from scratch even if checkpoints/base_uttt.pt exists.",
     )
     parser.add_argument("--stage", choices=["pretrain", "sft", "meta"], default=None)
-    parser.add_argument("--init-from", help="Load compatible model weights for a new training stage")
+    origins = parser.add_mutually_exclusive_group()
+    origins.add_argument("--init-from", help="Load compatible model weights for a new training stage")
+    origins.add_argument("--continue-from", help="Continue full SFT state into a new output, preserving the parent checkpoint")
     parser.add_argument("--tokenizer", help="Local BPE tokenizer JSON, embedded into new checkpoints")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.continue_from and args.no_resume:
+        parser.error("--continue-from cannot be combined with --no-resume")
+    return args
 
 
 if __name__ == "__main__":
@@ -1747,4 +1926,5 @@ if __name__ == "__main__":
         large_preset=args.large,
         resume=not args.no_resume,
         stage=args.stage, init_from=args.init_from, tokenizer_path=args.tokenizer,
+        continue_from=args.continue_from,
     )

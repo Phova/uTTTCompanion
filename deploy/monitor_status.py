@@ -3,12 +3,14 @@
 import argparse
 from collections import deque
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -51,6 +53,91 @@ def compact_training_line(line):
         if match:
             parts.append(short + match.group(1).strip())
     return " ".join(parts)
+
+
+def owner_checkpoint_output(root):
+    """Return (explicit_output, path) without exposing owner credentials.
+
+    The current owner protocol records workspace and argv, but not its cwd.
+    Relative outputs therefore use that workspace unless a future record also
+    supplies run_directory. An explicit missing/invalid output must not select
+    a different run's old checkpoint.
+    """
+    root = Path(root)
+    try:
+        with (root / "logs" / ".wsl_owners" / "uttt_train.json").open("rb") as source:
+            contents = source.read(65537)
+        if len(contents) > 65536:
+            return False, None
+        record = json.loads(contents.decode("utf-8"))
+        if not isinstance(record, dict) or record.get("session") != "uttt_train":
+            return False, None
+        workspace = record.get("workspace")
+        if not isinstance(workspace, str) or Path(workspace).resolve() != root.resolve():
+            return False, None
+        command = record.get("command")
+        if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
+            return False, None
+        explicit, value = False, None
+        for index, argument in enumerate(command):
+            if argument == "--output-ckpt":
+                explicit = True
+                value = command[index + 1] if index + 1 < len(command) else None
+                if value is not None and value.startswith("--"):
+                    value = None
+            elif argument.startswith("--output-ckpt="):
+                explicit, value = True, argument.partition("=")[2]
+        if not explicit:
+            return False, None
+        if not value or not value.strip() or "\0" in value:
+            return True, None
+        output = Path(value)
+        if not output.is_absolute():
+            working = record.get("run_directory", workspace)
+            if not isinstance(working, str) or not working.strip() or "\0" in working:
+                return True, None
+            working = Path(working)
+            if not working.is_absolute():
+                working = root / working
+            output = working / output
+        return True, output
+    except (OSError, ValueError, UnicodeError, RecursionError, RuntimeError):
+        return False, None
+
+
+def _checkpoint_description(path):
+    try:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        name = "".join(character if character.isprintable() else "?" for character in path.name)
+        return (f"{name} ({info.st_size / 1024**3:.2f} GiB updated "
+                f"{datetime.fromtimestamp(info.st_mtime):%H:%M:%S})")
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def checkpoint_status(root):
+    explicit, output = owner_checkpoint_output(root)
+    if explicit:
+        if output is None:
+            return "waiting for configured checkpoint (invalid output path)"
+        description = _checkpoint_description(output)
+        name = "".join(character if character.isprintable() else "?" for character in output.name)
+        return description or f"{name} (waiting for first save)"
+    # Legacy/manual runs without an explicit owner output keep the old display.
+    candidates = []
+    try:
+        for path in (Path(root) / "checkpoints").glob("*.pt"):
+            try:
+                info = path.stat()
+                if stat.S_ISREG(info.st_mode):
+                    candidates.append((info.st_mtime, path))
+            except OSError:
+                continue
+    except OSError:
+        return "none"
+    return (_checkpoint_description(max(candidates, key=lambda item: item[0])[1]) or "none") if candidates else "none"
 
 
 class Monitor:
@@ -104,14 +191,7 @@ class Monitor:
             self.sessions = ",".join(result.stdout.splitlines()) or "none"
         except (OSError, subprocess.TimeoutExpired):
             self.sessions = "none"
-        try:
-            paths = list((self.root / "checkpoints").glob("*.pt"))
-            newest = max(paths, key=lambda path: path.stat().st_mtime)
-            stat = newest.stat()
-            self.checkpoint = (f"{newest.name} ({stat.st_size / 1024**3:.2f} GiB updated "
-                               f"{datetime.fromtimestamp(stat.st_mtime):%H:%M:%S})")
-        except (OSError, ValueError):
-            self.checkpoint = "none"
+        self.checkpoint = checkpoint_status(self.root)
         self.training = latest_training_line(self.root / "logs" / "train_5090.log")
 
     def render(self, now):

@@ -75,7 +75,11 @@ def checkpoint_info(path):
     return {"step": int(saved.get("step", 0)), "metrics": saved.get("metrics", {}),
             "has_optimizer": isinstance(optimizer, dict) and bool(optimizer.get("state"))
                              and bool(optimizer.get("param_groups")),
-            "has_training_state": isinstance(state, dict) and "data_cursor" in state and "rng" in state}
+            "has_training_state": isinstance(state, dict) and "data_cursor" in state and "rng" in state,
+            "training_state_summary": ({"micro_batch_size": state.get("micro_batch_size"),
+                                        "grad_accum_steps": state.get("grad_accum_steps"),
+                                        "data_cursor": state.get("data_cursor")}
+                                       if isinstance(state, dict) else None)}
 
 
 def validate_checkpoint(path, *, stage, fingerprint, run_id, revision, target=None, full=True, parameter_scope="all", saved=None):
@@ -115,6 +119,63 @@ def resume_checkpoint_source(path, **expected):
     if failures:
         raise RuntimeError("No readable full recovery checkpoint; initialization was not attempted") from failures[-1][1]
     return None
+
+
+def continuation_source_binding(path, config, identity, target, run_id):
+    """Pin a new SFT phase to a read-only full parent, before any GPU work.
+
+    The trainer performs the detailed tensor/optimizer/math checks. This runner
+    preserves the source's identity and rejects a changed parent on every retry.
+    """
+    path = Path(path).resolve()
+    before = path.stat()
+    saved = checkpoint_info(path)
+    settings = config["training"]
+    metrics = saved["metrics"]
+    source_run, source_revision = metrics.get("run_id"), metrics.get("code_revision")
+    if (not isinstance(source_run, str) or not source_run or source_run == run_id
+            or not isinstance(source_revision, str) or not source_revision or source_revision == "unknown"):
+        raise ValueError("Continuation requires a distinct parent run with recorded source revision")
+    if settings.get("parameter_scope", "all") != "all":
+        raise ValueError("Continuation requires SFT parameter_scope=all")
+    validate_checkpoint(path, stage="sft", fingerprint=identity["fingerprint"],
+                        run_id=source_run, revision=source_revision, parameter_scope="all", saved=saved)
+    if saved["step"] >= target:
+        raise ValueError("Continuation source step must be below the new global target")
+    start = settings.get("lr_schedule_start_step", 0)
+    if type(start) is not int or start != saved["step"]:
+        raise ValueError("Continuation lr_schedule_start_step must equal the parent checkpoint step")
+    if settings.get("stage") != "sft":
+        raise ValueError("Continuation requires training.stage=sft")
+    if (type(settings.get("micro_batch_size")) is not int or settings["micro_batch_size"] != 1
+            or type(settings.get("grad_accum_steps")) is not int or settings["grad_accum_steps"] != 16):
+        raise ValueError("Continuation requires semantic micro_batch_size=1 and grad_accum_steps=16")
+    summary = saved.get("training_state_summary")
+    if (not isinstance(summary, dict) or type(summary.get("micro_batch_size")) is not int
+            or summary["micro_batch_size"] != 1 or type(summary.get("grad_accum_steps")) is not int
+            or summary["grad_accum_steps"] != 16):
+        raise ValueError("Continuation parent must record semantic B1/A16 training state")
+    cursor = summary.get("data_cursor")
+    if (not isinstance(cursor, dict) or cursor.get("size") != identity["documents"]
+            or cursor.get("seed") != int(settings.get("seed", 42))):
+        raise ValueError("Continuation parent data cursor does not match the fixed dataset and seed")
+    metric = settings.get("validation_selection_metric", "validation_ce")
+    if metric not in ("validation_ce", "validation_example_ce"):
+        raise ValueError("Continuation requires a recognized validation selection metric")
+    if metrics.get("validation_selection_metric", "validation_ce") != metric:
+        raise ValueError("Continuation cannot change the validation selection metric")
+    if not 0 < float(settings.get("validation_fraction", 0)) < 1:
+        raise ValueError("Continuation requires validation for the new phase's best checkpoint")
+    checksum = digest(path)
+    after = path.stat()
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if any(getattr(before, key) != getattr(after, key) for key in fields):
+        raise RuntimeError("Continuation source changed while its identity was being checked")
+    return {"protocol": "uttt-sft-continuation-v1", "path": str(path), "sha256": checksum,
+            "step": saved["step"], "run_id": source_run, "code_revision": source_revision,
+            "dataset_fingerprint": metrics["dataset_fingerprint"], "parameter_scope": "all",
+            "validation_selection_metric": metric, "micro_batch_size": 1, "grad_accum_steps": 16,
+            "data_cursor": dict(cursor)}
 
 
 def accepted_checkpoint_revisions(state):
@@ -254,6 +315,8 @@ def main(argv=None):
     parser.add_argument("--resume", action="store_true", help="Require the existing full checkpoint; do not initialize weights again")
     parser.add_argument("--resume-from-revision", metavar="OLD_SHA",
                         help="With --resume only, migrate an unfinished SFT run from this exact source revision; all other bindings remain fixed")
+    parser.add_argument("--continue-from", metavar="SOURCE",
+                        help="Start a distinct SFT phase with the full state of --init-from; resume that new run without this flag")
     parser.add_argument("--meta-config")
     parser.add_argument("--meta-data")
     parser.add_argument("--meta-output-ckpt")
@@ -261,6 +324,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.resume_from_revision and not args.resume:
         parser.error("--resume-from-revision requires --resume")
+    if args.continue_from and (args.resume or args.resume_from_revision):
+        parser.error("--continue-from starts a fresh phase and cannot be combined with --resume or --resume-from-revision")
     if not args.run_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in args.run_id):
         parser.error("run-id may contain only letters, numbers, underscores and hyphens")
     root = Path(__file__).resolve().parents[1]
@@ -272,6 +337,9 @@ def main(argv=None):
             raise FileNotFoundError(path)
     if output == initial:
         raise ValueError("Recovery output must differ from initialization checkpoint")
+    continuation_path = Path(args.continue_from).resolve() if args.continue_from else None
+    if continuation_path is not None and continuation_path != initial:
+        raise ValueError("--continue-from must identify the same parent checkpoint as --init-from")
     config = load_config(config_path)
     if config["training"].get("stage") != "sft":
         raise ValueError("Recovery config training.stage must be sft")
@@ -471,10 +539,21 @@ def main(argv=None):
     try:
         resume_source = None
         accepted_revisions = {revision}
+        if continuation_path is not None:
+            binding["continuation"] = continuation_source_binding(continuation_path, config, identity, steps, args.run_id)
         if args.resume:
             if not state_path.is_file():
                 raise ValueError("--resume requires this run's existing state manifest")
             previous_state = json.loads(state_path.read_text(encoding="utf-8"))
+            previous_continuation = previous_state.get("binding", {}).get("continuation")
+            if previous_continuation is not None:
+                if (not isinstance(previous_continuation, dict)
+                        or previous_continuation.get("path") != str(initial)):
+                    raise ValueError("Resume continuation source does not match this run's pinned parent")
+                current_continuation = continuation_source_binding(initial, config, identity, steps, args.run_id)
+                if current_continuation != previous_continuation:
+                    raise ValueError("Resume continuation source identity or SHA256 changed")
+                binding["continuation"] = current_continuation
             if args.resume_from_revision:
                 old_revision = previous_state.get("binding", {}).get("code_revision")
                 previous_binding = {**previous_state.get("binding", {}), "code_revision": revision}
@@ -532,6 +611,8 @@ def main(argv=None):
                      "online_writes_allowed": False}
         update(pid=os.getpid(), status="starting", error=None, online_writes_allowed=False,
                resume_action=(("full_checkpoint" if resume_source == output else "previous_full_checkpoint") if resume_source else
+                              ("continuation_retry_no_checkpoint" if args.resume else "new_continuation")
+                              if "continuation" in binding else
                               "initialization_retry_no_checkpoint" if args.resume else "new_initialization"),
                resume_checkpoint=str(resume_source) if resume_source else None)
         for signum in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", signal.SIGTERM)):
@@ -548,7 +629,10 @@ def main(argv=None):
         command = [sys.executable, "-u", "train_5090.py", "--config", str(config_path), "--data-path", str(data_path),
                    "--steps", str(steps), "--output-ckpt", str(output)]
         if resume_source is None:
-            command.extend(["--init-from", str(initial), "--no-resume"])
+            if "continuation" in binding:
+                command.extend(["--continue-from", binding["continuation"]["path"]])
+            else:
+                command.extend(["--init-from", str(initial), "--no-resume"])
         run("sft", command)
         saved = validate_checkpoint(output, stage="sft", fingerprint=identity["fingerprint"],
                                     run_id=args.run_id, revision=revision, target=steps)
