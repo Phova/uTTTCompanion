@@ -104,7 +104,7 @@ class InferenceWarmupTests(unittest.TestCase):
     def test_model_preparation_precedes_kernel_compilation(self):
         result = self.personalizer(False)
         order = []
-        result.model.prepare_for_inference.side_effect = lambda: order.append("prepare")
+        result.model.prepare_for_inference.side_effect = lambda **kwargs: order.append("prepare")
         ones, synchronize, autocast = self.contexts()
         with patch.object(personalization, "_INFERENCE_KERNELS_COMPILED", set()), ones, synchronize, autocast:
             def compile_kernel(function, **kwargs):

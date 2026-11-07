@@ -14,6 +14,27 @@ _INPUT_NAMES = ("input_ids", "labels", "attention_mask")
 _PADDING_MULTIPLES = (16, 32, 64, 128)
 
 
+def supervised_token_indices(labels: torch.Tensor) -> torch.Tensor:
+    """Select next-token CE positions on CPU, before asynchronous device transfer.
+
+    Indexing is into flattened ``hidden[:, :-1]`` / ``labels[:, 1:]``.
+    Keeping this operation on CPU avoids a CUDA nonzero synchronization and
+    preserves every real answer/EOS target while skipping prompt and PAD logits.
+    """
+    if (not isinstance(labels, torch.Tensor) or labels.device.type != "cpu"
+            or labels.dtype != torch.long or labels.ndim != 2 or labels.shape[1] < 2):
+        raise ValueError("supervised_token_indices requires CPU long labels with shape (B, T >= 2)")
+    return (labels[:, 1:] != -100).reshape(-1).nonzero(as_tuple=True)[0]
+
+
+def validate_sft_compute_option(name, value, *, stage, torch_compile):
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    if value and (stage != "sft" or torch_compile is not False):
+        raise ValueError(f"{name} requires stage=sft and torch_compile=false")
+    return value
+
+
 def _validate_options(execution_batch_size, padding_multiple, sort_by_length):
     if (not isinstance(execution_batch_size, int) or isinstance(execution_batch_size, bool)
             or execution_batch_size < 1):

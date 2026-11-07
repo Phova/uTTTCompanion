@@ -371,6 +371,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None, help="Override default sampling temperature")
     parser.add_argument("--surprise-threshold", type=float, default=None, help="Override Surprise Gate threshold tau")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile kernel fusion on startup")
+    packing = parser.add_mutually_exclusive_group()
+    packing.add_argument("--packed-projections", dest="packed_projections", action="store_const", const=True,
+                         default=None, help="Enable inference projection packing independently of compilation")
+    packing.add_argument("--no-packed-projections", dest="packed_projections", action="store_const", const=False,
+                         help="Disable inference projection packing")
     parser.add_argument("--lightweight", action="store_true", help="Use lightweight fallback model when cold-starting")
     args, _ = parser.parse_known_args()
 
@@ -390,6 +395,8 @@ def main() -> None:
         os.environ["UTTT_SURPRISE_THRESHOLD"] = str(args.surprise_threshold)
     if args.no_compile:
         os.environ["UTTT_NO_COMPILE"] = "1"
+    if args.packed_projections is not None:
+        os.environ["UTTT_PACKED_PROJECTIONS"] = "1" if args.packed_projections else "0"
     if args.lightweight:
         os.environ["UTTT_LIGHTWEIGHT"] = "1"
 

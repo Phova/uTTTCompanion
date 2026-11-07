@@ -64,6 +64,64 @@ class ModelPerformanceTests(unittest.TestCase):
         for tensor in cache:
             self.assertEqual(tensor.untyped_storage().nbytes(), tensor.numel() * tensor.element_size())
 
+    def test_short_packed_prefill_cache_does_not_retain_full_qkv_projection(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for batch in (1, 2):
+                for kv_heads in (1, 2, 4):
+                    for length in (1, 5, 8):
+                        with self.subTest(device=device, batch=batch, kv_heads=kv_heads, length=length):
+                            torch.manual_seed(527)
+                            plain = SlidingWindowAttention(32, 4, kv_heads, window_size=8).to(device).eval()
+                            packed = SlidingWindowAttention(32, 4, kv_heads, window_size=8).to(device).eval()
+                            packed.load_state_dict(plain.state_dict())
+                            packed.prepare_for_inference()
+                            tokens = torch.randn(batch, length + 3, 32, device=device)
+                            with torch.no_grad():
+                                expected, expected_cache = plain(tokens[:, :length])
+                                actual, actual_cache = packed(tokens[:, :length])
+                                torch.testing.assert_close(actual, expected)
+                                for position in range(length, length + 4):
+                                    for cached, reference in zip(actual_cache, expected_cache):
+                                        torch.testing.assert_close(cached, reference)
+                                        self.assertEqual(cached.untyped_storage().nbytes(),
+                                                         cached.numel() * cached.element_size())
+                                    if position < length + 3:
+                                        token = tokens[:, position:position + 1]
+                                        expected, expected_cache = plain(token, expected_cache, start_pos=position)
+                                        actual, actual_cache = packed(token, actual_cache, start_pos=position)
+                                        torch.testing.assert_close(actual, expected)
+
+    def test_window_one_packed_prefill_and_chunk_decode_keep_compact_current_kv(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for batch in (1, 2):
+                for kv_heads in (1, 4):
+                    with self.subTest(device=device, batch=batch, kv_heads=kv_heads):
+                        torch.manual_seed(207)
+                        plain = SlidingWindowAttention(32, 4, kv_heads, window_size=1).to(device).eval()
+                        packed = SlidingWindowAttention(32, 4, kv_heads, window_size=1).to(device).eval()
+                        packed.load_state_dict(plain.state_dict())
+                        packed.prepare_for_inference()
+                        tokens = torch.randn(batch, 6, 32, device=device)
+                        position, cache = 0, None
+                        with torch.no_grad():
+                            for count in (1, 1, 3, 1):
+                                actual, cache = packed(tokens[:, position:position + count], cache, start_pos=position)
+                                # With window=1, each query can see only its own
+                                # token, even when it arrives in a cached chunk.
+                                pieces = []
+                                for index in range(position, position + count):
+                                    expected, reference_cache = plain(tokens[:, index:index + 1], start_pos=index)
+                                    pieces.append(expected)
+                                torch.testing.assert_close(actual, torch.cat(pieces, dim=1))
+                                for tensor, reference in zip(cache, reference_cache):
+                                    torch.testing.assert_close(tensor, reference)
+                                    self.assertEqual(tensor.shape[2], 1)
+                                    self.assertEqual(tensor.untyped_storage().nbytes(),
+                                                     tensor.numel() * tensor.element_size())
+                                position += count
+
     def test_packed_readout_updates_and_inference_mode_are_correct(self):
         pool = SharedFastWeightPool(32, 64).eval()
         x = torch.randn(1, 3, 32)

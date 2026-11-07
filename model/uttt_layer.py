@@ -84,6 +84,10 @@ class FastWeightState:
     _packed_up_gate: Optional[torch.Tensor] = field(default=None, repr=False)
     _read_w_down: Optional[torch.Tensor] = field(default=None, repr=False)
     _packed_key: Optional[tuple] = field(default=None, repr=False)
+    # Only internal readonly_state() views carry this disposable optimization
+    # hint. Cloned, moved, persisted and mutable persona states use the ordinary
+    # batched readout, even when their current values happen to match W_0.
+    _shared_readonly: bool = field(default=False, repr=False)
 
     def clone(self, detach: bool = False) -> "FastWeightState":
         """Deep-copy all fast weight and momentum tensors."""
@@ -251,6 +255,25 @@ def swiglu_packed_forward(
     up, gate = torch.bmm(x, packed_up_gate.to(dtype=x.dtype)).chunk(2, dim=-1)
     projected = torch.bmm(F.silu(gate) * up, w_down.to(dtype=x.dtype))
     return x + F.layer_norm(projected, (projected.shape[-1],), ln_weight.to(x.dtype), ln_bias.to(x.dtype), eps)
+
+
+def swiglu_shared_readonly_forward(
+    x: torch.Tensor, w_up: torch.Tensor, w_gate: torch.Tensor, w_down: torch.Tensor,
+    ln_weight: torch.Tensor, ln_bias: torch.Tensor, eps: float = 1e-5,
+) -> torch.Tensor:
+    """Read shared 2-D W_0 with GEMMs and accumulate one weight gradient.
+
+    All batch rows still have independent activations. Unlike an expanded BMM,
+    backward does not materialize one full weight-gradient matrix per example.
+    The caller must establish that these are shared, read-only weights.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    up = flat @ w_up.to(dtype=x.dtype)
+    gate = flat @ w_gate.to(dtype=x.dtype)
+    projected = ((F.silu(gate) * up) @ w_down.to(dtype=x.dtype)).reshape_as(x)
+    return x + F.layer_norm(
+        projected, (x.shape[-1],), ln_weight.to(x.dtype), ln_bias.to(x.dtype), eps
+    )
 
 
 def analytical_swiglu_chunk_grad(
@@ -540,6 +563,9 @@ class SharedFastWeightPool(nn.Module):
         self.max_inner_grad_norm = max_inner_grad_norm
         self.normalize_loss_by_dim = normalize_loss_by_dim
         self.eps = rms_norm_eps
+        # Experimental until measured with the actual execution batch/lengths.
+        # This is not a checkpoint parameter and never changes persona writes.
+        self.shared_readonly_gemm = False
 
         # Meta-initialized base Fast Weights W_0 (optimized during outer-loop meta-training)
         std_in = 1.0 / math.sqrt(d_model)
@@ -616,6 +642,7 @@ class SharedFastWeightPool(nn.Module):
         return FastWeightState(
             up, gate, down, zero.expand_as(up), zero.expand_as(gate), zero.expand_as(down),
             view(self.ln_weight), view(self.ln_bias),
+            _shared_readonly=True,
         )
 
     def inference_read_weights(self, state: FastWeightState, dtype: torch.dtype, device: torch.device):
@@ -644,6 +671,11 @@ class SharedFastWeightPool(nn.Module):
         """Read out from current FastWeightState without modifying W_fast."""
         state = state.ensure_batch_size(x.shape[0])
         weights = (state.w_up, state.w_gate, state.w_down)
+        if (self.shared_readonly_gemm and state._shared_readonly
+                and all(weight.shape[0] == 1 or weight.stride(0) == 0 for weight in weights)):
+            return swiglu_shared_readonly_forward(
+                x, *(weight[0] for weight in weights), state.ln_weight, state.ln_bias, self.eps
+            )
         if (getattr(self, "fused_inference_readout", False) and not self.training
                 and not torch.is_grad_enabled() and not any(tensor.is_inference() for tensor in weights)):
             # Persona writes accumulate in FP32. Reuse activation-precision read
@@ -1033,7 +1065,8 @@ class SlidingWindowAttention(nn.Module):
 
         if self._packed_qkv is not None and not self.training and not torch.is_grad_enabled():
             self.prepare_for_inference()
-        if self._packed_qkv is not None and not self.training and not torch.is_grad_enabled():
+        packed_projection = self._packed_qkv is not None and not self.training and not torch.is_grad_enabled()
+        if packed_projection:
             q_raw, k_raw, v_raw = F.linear(x, self._packed_qkv).split(
                 (self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim), dim=-1
             )
@@ -1048,6 +1081,17 @@ class SlidingWindowAttention(nn.Module):
 
         if kv_cache is not None:
             k_prev, v_prev = kv_cache
+            if not self.training and not torch.is_grad_enabled():
+                # The first new query needs at most window-1 old tokens.
+                # Trim before concatenating so a one-token decode owns exactly
+                # one window's storage, rather than retaining a window+1
+                # allocation through the post-concatenation slice below.
+                history = self.window_size - 1
+                if history == 0:
+                    k_prev, v_prev = k_prev[:, :, :0, :], v_prev[:, :, :0, :]
+                elif k_prev.shape[2] > history:
+                    k_prev = k_prev[:, :, -history:, :]
+                    v_prev = v_prev[:, :, -history:, :]
             k = torch.cat([k_prev, k], dim=2)
             v = torch.cat([v_prev, v], dim=2)
             # Retain enough history for the FIRST query in a multi-token decode.
@@ -1061,6 +1105,11 @@ class SlidingWindowAttention(nn.Module):
         if not self.training and k.shape[2] > self.window_size:
             new_kv_cache = (k[:, :, -self.window_size :, :].clone(memory_format=torch.contiguous_format),
                             v[:, :, -self.window_size :, :].clone(memory_format=torch.contiguous_format))
+        elif packed_projection and kv_cache is None:
+            # Even a short or one-token prefill's V is a view into the entire
+            # fused QKV output. Only the returned cache needs a compact copy;
+            # attention below continues to consume the original projection.
+            new_kv_cache = (k, v.clone(memory_format=torch.contiguous_format))
         else:
             new_kv_cache = (k, v)
 

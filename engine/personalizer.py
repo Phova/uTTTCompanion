@@ -169,19 +169,38 @@ class uTTTPersonalizer:
         )
         self._warmup_complete = False
         self._warmup_compiled = False
+        self._warmup_packed = False
 
-    def warmup(self, compile_kernels: bool = True) -> None:
+    def warmup(self, compile_kernels: bool = True, packed_projections: Optional[bool] = None) -> None:
         """
-        Optionally compile read kernels and pre-warm ordinary inference kernels.
+        Independently configure projection packing and read-kernel compilation.
+        UTTT_PACKED_PROJECTIONS=0/1 overrides the legacy packing default: compile
+        enables packs, while eager warmup preserves any existing packs. An
+        explicit argument takes precedence over the environment.
         CUDA graph capture is deferred until after the first reply token, then
         reused for subsequent turns with unchanged model and persona weights.
         """
+        if packed_projections is None:
+            packing_env = os.environ.get("UTTT_PACKED_PROJECTIONS")
+            if packing_env is not None and packing_env not in ("0", "1"):
+                raise ValueError("UTTT_PACKED_PROJECTIONS must be 0 or 1")
+            if packing_env is None:
+                existing_packing = getattr(self.model.fast_weight_pool, "fused_inference_readout", False)
+                if not isinstance(existing_packing, bool):
+                    existing_packing = getattr(self, "_warmup_packed", False)
+                packed_projections = bool(compile_kernels or existing_packing)
+            else:
+                packed_projections = packing_env == "1"
+        if type(packed_projections) is not bool:
+            raise ValueError("packed_projections must be boolean or None")
+        packing_changed = packed_projections != getattr(self, "_warmup_packed", False)
         prepare = getattr(self.model, "prepare_for_inference", None)
-        if compile_kernels and callable(prepare):
-            prepare()
+        if callable(prepare):
+            prepare(enabled=packed_projections)
         if self.device.type != "cuda":
+            self._warmup_packed = packed_projections
             return
-        if self._warmup_complete and (not compile_kernels or self._warmup_compiled):
+        if self._warmup_complete and (not compile_kernels or self._warmup_compiled) and not packing_changed:
             return
 
         kernel_names = ["swiglu_fast_forward", "swiglu_packed_forward", "fused_fast_q_proj", "apply_rope"]
@@ -220,6 +239,7 @@ class uTTTPersonalizer:
                 )
         torch.cuda.synchronize(self.device)
         self._warmup_complete = True
+        self._warmup_packed = packed_projections
         dt_ms = (time.perf_counter() - t0) * 1000.0
         print(f"[Personalizer] Inference kernels warmed up in {dt_ms:.1f} ms (online TTT={self.online_updates_enabled}).")
 

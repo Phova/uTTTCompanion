@@ -46,7 +46,8 @@ from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
 from engine.corpus import ResumableBatchSampler, TokenizedCorpusDataset, read_manifest
 from engine.prompting import encode_chat_prompt
-from engine.sft_execution import validate_sft_execution, materialize_sft_execution_step
+from engine.sft_execution import (validate_sft_execution, materialize_sft_execution_step,
+                                  supervised_token_indices, validate_sft_compute_option)
 from deploy.training_diagnostics import repetition_metrics
 
 _ACTIVE_SAVE_THREAD: Optional[threading.Thread] = None
@@ -1204,6 +1205,14 @@ def train(
     validation_group_key = validate_sft_validation_group_key(training_stage, train_cfg.get("validation_group_key"))
     parameter_scope = validate_parameter_scope(training_stage, train_cfg.get("parameter_scope", "all"))
     update_fast_weights = training_stage == "meta"
+    sft_loss_only_head = validate_sft_compute_option(
+        "sft_loss_only_head", train_cfg.get("sft_loss_only_head", False),
+        stage=training_stage, torch_compile=hw_cfg.get("torch_compile", True),
+    )
+    sft_shared_readonly_gemm = validate_sft_compute_option(
+        "sft_shared_readonly_gemm", train_cfg.get("sft_shared_readonly_gemm", False),
+        stage=training_stage, torch_compile=hw_cfg.get("torch_compile", True),
+    )
     corpus_manifest = read_manifest(data_path)
     if corpus_manifest and training_stage != "pretrain":
         raise ValueError("Packed text corpus is for pretraining; use dialogue data for SFT/meta")
@@ -1298,6 +1307,7 @@ def train(
 
     # Instantiate uTTT Model
     model = uTTTModel(model_cfg).to(device=device)
+    model.fast_weight_pool.shared_readonly_gemm = sft_shared_readonly_gemm
     if init_from:
         initialized = torch.load(init_from, map_location="cpu", weights_only=False, mmap=True)
         previous = uTTTConfig.from_dict(initialized["config"])
@@ -1529,6 +1539,7 @@ def train(
         f"Precision={amp_dtype}, CheckpointEvery={model_cfg.gradient_checkpointing_every}, "
         f"AccumulationAmpCache={cache_across_accumulation}, TTTWrites={'enabled' if update_fast_weights else 'disabled'}, "
         f"ParameterScope={parameter_scope}, TrimSFTPadding={trim_sft_padding}, SFTExecution={sft_execution}, "
+        f"LossOnlyHead={sft_loss_only_head}, SharedReadonlyGemm={sft_shared_readonly_gemm}, "
         f"LRScheduleStart={lr_schedule['start_step']}, WarmupStartRatio={lr_schedule['warmup_start_ratio']}",
         flush=True,
     )
@@ -1600,6 +1611,7 @@ def train(
 
                         if not bool((batch["labels"][:, 1:] != -100).any()):
                             raise ValueError("Batch has no supervised next-token targets; check dialogue roles and training stage")
+                        ce_indices = supervised_token_indices(batch["labels"]) if sft_loss_only_head else None
                         input_ids = batch["input_ids"].to(device, non_blocking=True)
                         labels = batch["labels"].to(device, non_blocking=True)
                         # Packing can still leave padding (e.g. a one-row dataset).
@@ -1616,6 +1628,7 @@ def train(
                                 surprise_aux_weight=surprise_aux_weight,
                                 return_fast_state=False,
                                 **({"ce_reduction": "sequence_mean"} if sft_execution is not None else {}),
+                                **({"ce_token_indices": ce_indices} if ce_indices is not None else {}),
                             )
                             scaled_loss = out.loss * loss_weight
 
@@ -1803,6 +1816,8 @@ def train(
                     "training_pipeline": 3, "training_stage": training_stage,
                     "parameter_scope": parameter_scope,
                     "trim_sft_padding": trim_sft_padding,
+                    "sft_loss_only_head": sft_loss_only_head,
+                    "sft_shared_readonly_gemm": sft_shared_readonly_gemm,
                     "sft_execution": (dict(execution_batch_size=sft_execution.execution_batch_size,
                                            padding_multiple=sft_execution.padding_multiple,
                                            sort_by_length=sft_execution.sort_by_length,

@@ -398,13 +398,28 @@ class uTTTModel(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
 
-    def prepare_for_inference(self) -> None:
-        """Prepare disposable packed projections without changing checkpoint keys."""
+    def prepare_for_inference(self, enabled: bool = True) -> None:
+        """Configure disposable projection packs without changing checkpoint keys.
+
+        Packing is independent of kernel compilation. Changing its layout also
+        drops the decode graph, whose captured addresses retain the old packs.
+        """
+        if type(enabled) is not bool:
+            raise ValueError("Inference projection packing must be boolean")
         if self.training:
             raise ValueError("Call eval() before preparing inference projections")
+        changed = bool(getattr(self.fast_weight_pool, "fused_inference_readout", False)) != enabled
         for block in self.layers:
-            block.attn.prepare_for_inference()
-        self.fast_weight_pool.fused_inference_readout = True
+            previous = block.attn._packed_qkv
+            if enabled:
+                block.attn.prepare_for_inference()
+            else:
+                block.attn._packed_qkv = None
+                block.attn._packed_qkv_key = None
+            changed = changed or previous is not block.attn._packed_qkv
+        self.fast_weight_pool.fused_inference_readout = enabled
+        if changed:
+            self._cuda_graph_decoder = None
 
     def init_fast_state(
         self,
@@ -709,6 +724,7 @@ class uTTTModel(nn.Module):
         logits_to_keep: int = 0,
         return_fast_state: bool = True,
         ce_reduction: str = "token_mean",
+        ce_token_indices: Optional[torch.Tensor] = None,
     ) -> uTTTModelOutput:
         """
         Forward pass through all uTTTBlocks with sequential cross-layer FastWeightState passing.
@@ -729,6 +745,11 @@ class uTTTModel(nn.Module):
                                 Frozen-write labeled calls may use "sequence_mean"
                                 to give each sequence equal weight, matching the
                                 average of separate one-sequence forward losses.
+            ce_token_indices:   Optional sorted CPU long indices into flattened
+                                hidden[:, :-1], selecting all labels[:, 1:] != -100.
+                                Frozen-write loss-only calls return empty logits.
+                                Compute with supervised_token_indices before H2D;
+                                the full prompt still passes through every block.
         """
         if ce_reduction not in ("token_mean", "sequence_mean"):
             raise ValueError("ce_reduction must be token_mean or sequence_mean")
@@ -737,6 +758,17 @@ class uTTTModel(nn.Module):
         bsz, seq_len = input_ids.shape
         if seq_len == 0 or self.config.chunk_size < 1:
             raise ValueError("input sequence and chunk_size must be non-empty/positive")
+        if ce_token_indices is not None:
+            if labels is None or update_fast_weights:
+                raise ValueError("ce_token_indices requires labels and update_fast_weights=False")
+            if (not isinstance(ce_token_indices, torch.Tensor)
+                    or ce_token_indices.device.type != "cpu" or ce_token_indices.dtype != torch.long
+                    or ce_token_indices.ndim != 1 or seq_len < 2 or labels.shape != input_ids.shape):
+                raise ValueError("ce_token_indices requires a CPU long vector and matching labels with T >= 2")
+            if ce_token_indices.numel() and (
+                    int(ce_token_indices[0]) < 0 or int(ce_token_indices[-1]) >= bsz * (seq_len - 1)
+                    or bool((ce_token_indices[1:] <= ce_token_indices[:-1]).any())):
+                raise ValueError("ce_token_indices must be sorted, unique and within the shifted token range")
         h = self.tok_embeddings(input_ids)
         if torch.is_autocast_enabled():
             h = h.to(torch.get_autocast_dtype("cuda" if h.is_cuda else "cpu"))
@@ -804,7 +836,35 @@ class uTTTModel(nn.Module):
         ce_loss: Optional[torch.Tensor] = None
         total_loss: Optional[torch.Tensor] = None
 
-        if labels is not None and self.training and bsz > 2:
+        if ce_token_indices is not None:
+            # Gather only the loss positions before final norm and vocabulary
+            # projection. Attention/fast reads above retain the complete prompt
+            # graph, including the gradients carried from answer to prompt.
+            rows = ce_token_indices.div(seq_len - 1, rounding_mode="floor")
+            # Map the shifted positions back to the contiguous (B,T) layout;
+            # flattening h[:, :-1] would copy every prompt hidden for B > 1.
+            indices = (ce_token_indices + rows).to(h.device, non_blocking=True)
+            selected_h = h.reshape(-1, self.config.d_model).index_select(0, indices)
+            targets = labels.reshape(-1).index_select(0, indices + 1)
+            if ce_reduction == "sequence_mean":
+                counts = torch.bincount(rows, minlength=bsz).clamp_min(1)
+                loss_dtype = torch.float64 if h.dtype == torch.float64 else torch.float32
+                weights = counts.index_select(0, rows).to(device=h.device, dtype=loss_dtype).reciprocal() / bsz
+            ce_sums = []
+            # Bound large-vocabulary activations as in the existing B2 head
+            # slicing, including the all-ignored case's connected zero gradient.
+            head_chunk = 2 * (seq_len - 1)
+            for begin in range(0, max(1, indices.numel()), head_chunk):
+                end = begin + head_chunk
+                selected_logits = self.lm_head(self.norm(selected_h[begin:end]))
+                losses = F.cross_entropy(selected_logits, targets[begin:end], reduction="none", ignore_index=-100)
+                ce_sums.append((losses * weights[begin:end]).sum() if ce_reduction == "sequence_mean" else losses.sum())
+            ce_loss = torch.stack(ce_sums).sum()
+            if ce_reduction == "token_mean":
+                ce_loss = ce_loss / max(1, indices.numel())
+            total_loss = ce_loss if surprise_aux_weight == 0.0 else ce_loss + surprise_aux_weight * mean_surprise_loss
+            logits = torch.empty((bsz, 0, self.config.vocab_size), device=h.device, dtype=h.dtype)
+        elif labels is not None and self.training and bsz > 2:
             h = self.norm(ce_first_chunk_hidden if ce_first_chunk_only else h)
             # Memory-efficient sliced LM-Head + Cross-Entropy (saves ~3.0 GiB Peak VRAM
             # and prevents CUDACachingAllocator page-unmap stalls at the 28GB boundary)
