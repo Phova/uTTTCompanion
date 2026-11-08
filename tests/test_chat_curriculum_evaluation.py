@@ -166,7 +166,9 @@ class ChatEvaluationTests(unittest.TestCase):
 
     def test_wrapper_preserves_metadata_and_structured_history_and_tests_real_code(self):
         tasks = [task(history=[{"role": "user", "content": "我喜欢蓝色。"},
-                               {"role": "assistant", "content": "知道了。"}]),
+                               {"role": "assistant", "content": "知道了。"},
+                               {"role": "user", "content": "也请用短句回答。"},
+                               {"role": "assistant", "content": "好的。"}]),
                  task(category="coding", task="add", language="en", family="code:add", prompt="Define add.",
                       code_check={"protocol": "bounded_python_ast_v1", "function": "add",
                                   "cases": [{"args": [3, 4], "expected": 7}]})]
@@ -185,8 +187,13 @@ class ChatEvaluationTests(unittest.TestCase):
             report = evaluate("read-only.pt", tasks, output)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["protocol"], report["protocol"])
         self.assertEqual(prepared[0]["mode"], "continuation")
-        self.assertTrue(prepared[0]["prompt"].startswith("<|user|> 我喜欢蓝色。"))
-        self.assertTrue(prepared[0]["prompt"].endswith("<|assistant|>"))
+        self.assertEqual(prepared[0]["prompt"],
+                         "<|user|> 我喜欢蓝色。\n"
+                         "<|assistant|> 知道了。<|eos|>\n"
+                         "<|user|> 也请用短句回答。\n"
+                         "<|assistant|> 好的。<|eos|>\n"
+                         "<|user|> 今天怎么样？\n"
+                         "<|assistant|>")
         self.assertEqual(report["results"][0]["prompt"], tasks[0]["prompt"])
         self.assertEqual(report["results"][0]["family"], "diagnostic:one")
         self.assertIsNone(report["results"][0]["automatic_pass"])

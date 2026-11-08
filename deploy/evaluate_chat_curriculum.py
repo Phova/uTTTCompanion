@@ -308,7 +308,7 @@ def evaluate(checkpoint, tasks, output, *, max_new_tokens=128, device=None, seed
         task = dict(row)
         if row.get("history"):
             transcript = "".join(f"<|user|> {row['history'][i]['content'].strip()}\n<|assistant|> "
-                                 f"{row['history'][i+1]['content'].strip()}<|eos|>"
+                                 f"{row['history'][i+1]['content'].strip()}<|eos|>\n"
                                  for i in range(0, len(row["history"]), 2))
             task["prompt"] = transcript + f"<|user|> {row['prompt'].strip()}\n<|assistant|>"
             task["mode"] = "continuation"

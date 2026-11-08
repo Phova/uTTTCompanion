@@ -1,0 +1,1369 @@
+{
+  "protocol": "uttt-chat-pilot-completed-v1",
+  "date": "2026-11-08",
+  "run_id": "20261108_chat",
+  "training_source_revision": "ffc9f7614f0e52cdd882c953a0e830c2298dad6e",
+  "status": "quality_failed",
+  "training_complete": true,
+  "quality_passed": false,
+  "production_model_replaced": false,
+  "online_writes_enabled": false,
+  "training": {
+    "steps": 1000,
+    "tokens_seen": 2857749,
+    "duration_seconds_including_validation_and_saves": 1151.015276,
+    "steady_speed_median_tok_s": 4058.5,
+    "steady_speed_min_tok_s": 3661,
+    "steady_speed_max_tok_s": 4319,
+    "speed_sampling": "regular 10-step intervals; excludes first interval, validation and immediately post-save intervals",
+    "peak_vram_gib": 27.043940544128418,
+    "initial_validation_example_ce": 2.5605,
+    "final_validation_example_ce": 1.6458,
+    "final_checkpoint": {
+      "step": 1000,
+      "optimizer_steps": [
+        1000
+      ],
+      "data_cursor": {
+        "version": 1,
+        "size": 11400,
+        "seed": 20261108,
+        "epoch": 1,
+        "offset": 4600
+      },
+      "code_revision": "ffc9f7614f0e52cdd882c953a0e830c2298dad6e",
+      "dataset_fingerprint": "f311ddcd46f4f48d79530d7fd7a4ea06d1c50ba05b77af713d46c4848cafaba4",
+      "run_id": "20261108_chat",
+      "training_stage": "sft",
+      "sft_shared_readonly_gemm": true,
+      "sft_execution": {
+        "execution_batch_size": 4,
+        "padding_multiple": 32,
+        "sort_by_length": true,
+        "max_tokens_per_group": 1536,
+        "ce_reduction": "sequence_mean"
+      },
+      "peak_vram_gb": 27.043940544128418,
+      "has_rng": true,
+      "parent_checksum_unchanged": true,
+      "path": "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.pt",
+      "bytes": 15442222347
+    },
+    "free_C_bytes_at_outcome": 156779249664
+  },
+  "legacy_gate": {
+    "quality_passed": false,
+    "reasons": [
+      "heldout_accuracy_below_minimum",
+      "heldout_accuracy_did_not_improve"
+    ],
+    "baseline": {
+      "accuracy": 0.38333333333333336,
+      "accepted_tasks": 60,
+      "eos_rate": 1.0
+    },
+    "candidate": {
+      "accuracy": 0.35,
+      "accepted_tasks": 60,
+      "eos_rate": 1.0
+    },
+    "thresholds": {
+      "min_accuracy": 0.5,
+      "min_accuracy_improvement": 0.0,
+      "max_eos_rate_drop": 0.1
+    },
+    "scope": "This heldout curriculum only; not a general assistant or online-memory benchmark."
+  },
+  "selection": {
+    "protocol": "best_ce_and_final_v1",
+    "evaluated_candidates": [
+      "best_ce",
+      "final"
+    ],
+    "eligible_candidates": [],
+    "safe_intermediate_candidates": [],
+    "selected_candidate": "best_ce",
+    "may_start_meta": false,
+    "selection_status": "fallback_only",
+    "rule": "gate_passes_first; otherwise_nonregressing_intermediate; accuracy_tie_prefers_best_ce; no_safe_candidate_keeps_best_ce",
+    "scope": "Fixed monitoring-set candidate selection and gating; not an independent test or general-quality estimate."
+  },
+  "checkpoint_identity": {
+    "best_ce": {
+      "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.best.pt",
+      "checkpoint_sha256": "8d5e1d3fcd6a92516fef236bc52f9aa9ba35f4247aeb41f44703b45d7e966ffc",
+      "step": 1000,
+      "code_revision": "ffc9f7614f0e52cdd882c953a0e830c2298dad6e",
+      "report_sha256": "f66dd4bad21d701b8ead5fdcfb18d99407e82642bcaa08338acac7e5a6b23d11"
+    },
+    "final": {
+      "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.pt",
+      "checkpoint_sha256": "56d973a1c7a7f130d140f8d1195509becbd16f05cdd3974467e92a9016339dc7",
+      "step": 1000,
+      "code_revision": "ffc9f7614f0e52cdd882c953a0e830c2298dad6e",
+      "report_sha256": "b9f9b34dacbaef9b68ec949fefde84282df8fdbca8a8b858bed1fff7ae47382d"
+    }
+  },
+  "original_development_summary": {
+    "baseline": {
+      "all": {
+        "samples": 40,
+        "automatic_checks": 28,
+        "automatic_passes": 2,
+        "manual_review_required": 12,
+        "eos_rate": 0.775,
+        "token_limit_rate": 0.225,
+        "mean_text_4gram_repetition": 0.17541403628762126
+      },
+      "category:chat": {
+        "samples": 12,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 12,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.26854372320325165
+      },
+      "category:coding": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.169934936209446
+      },
+      "category:reasoning": {
+        "samples": 16,
+        "automatic_checks": 16,
+        "automatic_passes": 2,
+        "manual_review_required": 0,
+        "eos_rate": 0.875,
+        "token_limit_rate": 0.125,
+        "mean_text_4gram_repetition": 0.10967609615952989
+      },
+      "language:en": {
+        "samples": 10,
+        "automatic_checks": 7,
+        "automatic_passes": 1,
+        "manual_review_required": 3,
+        "eos_rate": 0.5,
+        "token_limit_rate": 0.5,
+        "mean_text_4gram_repetition": 0.2741226745327068
+      },
+      "language:zh": {
+        "samples": 30,
+        "automatic_checks": 21,
+        "automatic_passes": 1,
+        "manual_review_required": 9,
+        "eos_rate": 0.8666666666666667,
+        "token_limit_rate": 0.13333333333333333,
+        "mean_text_4gram_repetition": 0.14251115687259272
+      },
+      "task:basic_arithmetic": {
+        "samples": 4,
+        "automatic_checks": 4,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:basic_comparison": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:casual_chat": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:clarification": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.578125
+      },
+      "task:daily_advice": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.3665338645418327
+      },
+      "task:daily_support": {
+        "samples": 4,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 4,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.1541005291005291
+      },
+      "task:deduction": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.2486772486772487
+      },
+      "task:listening": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.676056338028169
+      },
+      "task:ordering_logic": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:pure_function": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.169934936209446
+      },
+      "task:recent_context": {
+        "samples": 3,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 3,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.18649381118032524
+      },
+      "task:recent_correction": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.42592592592592593
+      },
+      "task:rule_following": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:time_reasoning": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:word_arithmetic": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.3362619308402441
+      }
+    },
+    "best_ce": {
+      "all": {
+        "samples": 40,
+        "automatic_checks": 28,
+        "automatic_passes": 2,
+        "manual_review_required": 12,
+        "eos_rate": 0.775,
+        "token_limit_rate": 0.225,
+        "mean_text_4gram_repetition": 0.18012466406603853
+      },
+      "category:chat": {
+        "samples": 12,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 12,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.13179525329443595
+      },
+      "category:coding": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "category:reasoning": {
+        "samples": 16,
+        "automatic_checks": 16,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.875,
+        "token_limit_rate": 0.125,
+        "mean_text_4gram_repetition": 0.08375920060501232
+      },
+      "language:en": {
+        "samples": 10,
+        "automatic_checks": 7,
+        "automatic_passes": 1,
+        "manual_review_required": 3,
+        "eos_rate": 0.7,
+        "token_limit_rate": 0.3,
+        "mean_text_4gram_repetition": 0.17221850258916716
+      },
+      "language:zh": {
+        "samples": 30,
+        "automatic_checks": 21,
+        "automatic_passes": 1,
+        "manual_review_required": 9,
+        "eos_rate": 0.8,
+        "token_limit_rate": 0.2,
+        "mean_text_4gram_repetition": 0.18276005122499567
+      },
+      "task:basic_arithmetic": {
+        "samples": 4,
+        "automatic_checks": 4,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:basic_comparison": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:casual_chat": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:clarification": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.09375
+      },
+      "task:daily_advice": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.5268022181146026
+      },
+      "task:daily_support": {
+        "samples": 4,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 4,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0069444444444444475
+      },
+      "task:deduction": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.29434697855750486
+      },
+      "task:listening": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.17307692307692313
+      },
+      "task:ordering_logic": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.04545454545454547
+      },
+      "task:pure_function": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "task:recent_context": {
+        "samples": 3,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 3,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.12941176470588234
+      },
+      "task:recent_correction": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.371900826446281
+      },
+      "task:rule_following": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.3661971830985915
+      },
+      "task:time_reasoning": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:word_arithmetic": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      }
+    },
+    "final": {
+      "all": {
+        "samples": 40,
+        "automatic_checks": 28,
+        "automatic_passes": 2,
+        "manual_review_required": 12,
+        "eos_rate": 0.775,
+        "token_limit_rate": 0.225,
+        "mean_text_4gram_repetition": 0.18012466406603853
+      },
+      "category:chat": {
+        "samples": 12,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 12,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.13179525329443595
+      },
+      "category:coding": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "category:reasoning": {
+        "samples": 16,
+        "automatic_checks": 16,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.875,
+        "token_limit_rate": 0.125,
+        "mean_text_4gram_repetition": 0.08375920060501232
+      },
+      "language:en": {
+        "samples": 10,
+        "automatic_checks": 7,
+        "automatic_passes": 1,
+        "manual_review_required": 3,
+        "eos_rate": 0.7,
+        "token_limit_rate": 0.3,
+        "mean_text_4gram_repetition": 0.17221850258916716
+      },
+      "language:zh": {
+        "samples": 30,
+        "automatic_checks": 21,
+        "automatic_passes": 1,
+        "manual_review_required": 9,
+        "eos_rate": 0.8,
+        "token_limit_rate": 0.2,
+        "mean_text_4gram_repetition": 0.18276005122499567
+      },
+      "task:basic_arithmetic": {
+        "samples": 4,
+        "automatic_checks": 4,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:basic_comparison": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:casual_chat": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:clarification": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.09375
+      },
+      "task:daily_advice": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.5268022181146026
+      },
+      "task:daily_support": {
+        "samples": 4,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 4,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0069444444444444475
+      },
+      "task:deduction": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.29434697855750486
+      },
+      "task:listening": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.17307692307692313
+      },
+      "task:ordering_logic": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.04545454545454547
+      },
+      "task:pure_function": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "task:recent_context": {
+        "samples": 3,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 3,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.12941176470588234
+      },
+      "task:recent_correction": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.371900826446281
+      },
+      "task:rule_following": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.3661971830985915
+      },
+      "task:time_reasoning": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:word_arithmetic": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      }
+    }
+  },
+  "history_boundary_control": {
+    "base_revision": "ffc9f7614f0e52cdd882c953a0e830c2298dad6e",
+    "evaluator_source_sha256": "fb546e427d2734070971818aa0373e1265e4e9d3d3db74e318a1b660a69de483",
+    "tasks_sha256": "465e33ec382bd75af81f7972cbcbd3201a4d557a654c4ba78dd36ead504e14af",
+    "changed_task_ids": [
+      "chat-dev-009",
+      "chat-dev-010",
+      "chat-dev-011",
+      "chat-dev-012"
+    ],
+    "summaries": {
+      "baseline": {
+        "all": {
+          "samples": 4,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 4,
+          "eos_rate": 0.75,
+          "token_limit_rate": 0.25,
+          "mean_text_4gram_repetition": 0.28488354843495034
+        },
+        "category:chat": {
+          "samples": 4,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 4,
+          "eos_rate": 0.75,
+          "token_limit_rate": 0.25,
+          "mean_text_4gram_repetition": 0.28488354843495034
+        },
+        "language:en": {
+          "samples": 1,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 1,
+          "eos_rate": 0.0,
+          "token_limit_rate": 1.0,
+          "mean_text_4gram_repetition": 0.44112149532710276
+        },
+        "language:zh": {
+          "samples": 3,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 3,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.23280423280423282
+        },
+        "task:recent_context": {
+          "samples": 3,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 3,
+          "eos_rate": 0.6666666666666666,
+          "token_limit_rate": 0.3333333333333333,
+          "mean_text_4gram_repetition": 0.3279928793947486
+        },
+        "task:recent_correction": {
+          "samples": 1,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 1,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.15555555555555556
+        }
+      },
+      "chat1000": {
+        "all": {
+          "samples": 4,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 4,
+          "eos_rate": 0.75,
+          "token_limit_rate": 0.25,
+          "mean_text_4gram_repetition": 0.17457663353398703
+        },
+        "category:chat": {
+          "samples": 4,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 4,
+          "eos_rate": 0.75,
+          "token_limit_rate": 0.25,
+          "mean_text_4gram_repetition": 0.17457663353398703
+        },
+        "language:en": {
+          "samples": 1,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 1,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.0738255033557047
+        },
+        "language:zh": {
+          "samples": 3,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 3,
+          "eos_rate": 0.6666666666666666,
+          "token_limit_rate": 0.3333333333333333,
+          "mean_text_4gram_repetition": 0.20816034359341448
+        },
+        "task:recent_context": {
+          "samples": 3,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 3,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.030669107179174298
+        },
+        "task:recent_correction": {
+          "samples": 1,
+          "automatic_checks": 0,
+          "automatic_passes": 0,
+          "manual_review_required": 1,
+          "eos_rate": 0.0,
+          "token_limit_rate": 1.0,
+          "mean_text_4gram_repetition": 0.6062992125984252
+        }
+      }
+    },
+    "replies": {
+      "baseline": [
+        {
+          "id": "chat-dev-009",
+          "history": [
+            {
+              "role": "user",
+              "content": "我这周四下午有空，周末两天都要加班。"
+            },
+            {
+              "role": "assistant",
+              "content": "知道了，周四下午是你这周比较空闲的时间。"
+            }
+          ],
+          "prompt": "根据刚才的安排，你建议我什么时候约朋友喝咖啡？简短回答。",
+          "reply": "约朋友喝咖啡，需要根据自己的情况来定。如果朋友们有空，可以先喝一杯咖啡，再约朋友们一起喝。",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.0
+        },
+        {
+          "id": "chat-dev-010",
+          "history": [
+            {
+              "role": "user",
+              "content": "我叫阿禾。和我聊天时请尽量简洁。"
+            },
+            {
+              "role": "assistant",
+              "content": "好的，阿禾，我会简洁地回答。"
+            }
+          ],
+          "prompt": "按我的偏好，推荐一个五分钟能准备好的早餐。",
+          "reply": "我喜欢吃早餐，因为我知道我喜欢吃早餐。我喜欢吃早餐，因为我知道我喜欢吃早餐。",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.5428571428571429
+        },
+        {
+          "id": "chat-dev-011",
+          "history": [
+            {
+              "role": "user",
+              "content": "我吃不了辣，晚饭想吃点清淡的。"
+            },
+            {
+              "role": "assistant",
+              "content": "可以考虑微辣的炒菜。"
+            },
+            {
+              "role": "user",
+              "content": "不是少放辣椒，我一点辣椒都不能吃。"
+            },
+            {
+              "role": "assistant",
+              "content": "明白，要完全不含辣椒。"
+            }
+          ],
+          "prompt": "那你换一个符合我要求的菜吧，不要给太多选项。",
+          "reply": "辣椒可以吃，但是不能吃辣椒。\n\n辣椒是辣的，但是不能吃辣椒。\n\n所以，我吃不了辣，晚饭想吃点清淡的。",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.15555555555555556
+        },
+        {
+          "id": "chat-dev-012",
+          "history": [
+            {
+              "role": "user",
+              "content": "I prefer quiet indoor activities, and I can spend at most twenty dollars."
+            },
+            {
+              "role": "assistant",
+              "content": "Got it: quiet, indoors, and within twenty dollars."
+            }
+          ],
+          "prompt": "Would a loud concert suit me? Suggest something that fits my preferences better.",
+          "reply": "A concert suit is a great choice for a quiet, outdoor setting. It's comfortable, yet still allows for some natural light and sound. A good choice would be a soundproof suit with a built-in microphone and a built-in microphone.\n\nFor a concert, you might consider a suit with a built-in microphone and a built-in microphone. This would allow you to control the sound and create a more personalized experience.\n\nAnother option is a suit with a built-in microphone and a built-in microphone. This would allow you to control the sound and create",
+          "eos_generated": false,
+          "text_4gram_repetition": 0.44112149532710276
+        }
+      ],
+      "chat1000": [
+        {
+          "id": "chat-dev-009",
+          "history": [
+            {
+              "role": "user",
+              "content": "我这周四下午有空，周末两天都要加班。"
+            },
+            {
+              "role": "assistant",
+              "content": "知道了，周四下午是你这周比较空闲的时间。"
+            }
+          ],
+          "prompt": "根据刚才的安排，你建议我什么时候约朋友喝咖啡？简短回答。",
+          "reply": "当然，咖啡因含有咖啡因和咖啡因胺，所以约朋友喝咖啡是很有必要的。",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.0
+        },
+        {
+          "id": "chat-dev-010",
+          "history": [
+            {
+              "role": "user",
+              "content": "我叫阿禾。和我聊天时请尽量简洁。"
+            },
+            {
+              "role": "assistant",
+              "content": "好的，阿禾，我会简洁地回答。"
+            }
+          ],
+          "prompt": "按我的偏好，推荐一个五分钟能准备好的早餐。",
+          "reply": "好的，我建议你可以尝试一些简单易做的早餐，比如燕麦粥、酸奶、水果、全麦面包等。这些早餐都比较简单易做，而且营养丰富。",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.018181818181818188
+        },
+        {
+          "id": "chat-dev-011",
+          "history": [
+            {
+              "role": "user",
+              "content": "我吃不了辣，晚饭想吃点清淡的。"
+            },
+            {
+              "role": "assistant",
+              "content": "可以考虑微辣的炒菜。"
+            },
+            {
+              "role": "user",
+              "content": "不是少放辣椒，我一点辣椒都不能吃。"
+            },
+            {
+              "role": "assistant",
+              "content": "明白，要完全不含辣椒。"
+            }
+          ],
+          "prompt": "那你换一个符合我要求的菜吧，不要给太多选项。",
+          "reply": "好的，我可以帮你找到一些适合你口味的菜。比如，你喜欢辣椒、香蕉、鸡胸肉、鸡肉、豆腐、香蕉、香菜、香蕉、香菜、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、香豆腐、",
+          "eos_generated": false,
+          "text_4gram_repetition": 0.6062992125984252
+        },
+        {
+          "id": "chat-dev-012",
+          "history": [
+            {
+              "role": "user",
+              "content": "I prefer quiet indoor activities, and I can spend at most twenty dollars."
+            },
+            {
+              "role": "assistant",
+              "content": "Got it: quiet, indoors, and within twenty dollars."
+            }
+          ],
+          "prompt": "Would a loud concert suit me? Suggest something that fits my preferences better.",
+          "reply": "A concert suit is a great choice for a quiet, outdoor setting. It's comfortable, and the sound of the music can be just as relaxing as the music itself.",
+          "eos_generated": true,
+          "text_4gram_repetition": 0.0738255033557047
+        }
+      ]
+    }
+  },
+  "development_summary_with_history_format_corrected": {
+    "baseline": {
+      "all": {
+        "samples": 40,
+        "automatic_checks": 28,
+        "automatic_passes": 2,
+        "manual_review_required": 12,
+        "eos_rate": 0.775,
+        "token_limit_rate": 0.225,
+        "mean_text_4gram_repetition": 0.17926720714444375
+      },
+      "category:chat": {
+        "samples": 12,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 12,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.2813876260593266
+      },
+      "category:coding": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.169934936209446
+      },
+      "category:reasoning": {
+        "samples": 16,
+        "automatic_checks": 16,
+        "automatic_passes": 2,
+        "manual_review_required": 0,
+        "eos_rate": 0.875,
+        "token_limit_rate": 0.125,
+        "mean_text_4gram_repetition": 0.10967609615952989
+      },
+      "language:en": {
+        "samples": 10,
+        "automatic_checks": 7,
+        "automatic_passes": 1,
+        "manual_review_required": 3,
+        "eos_rate": 0.5,
+        "token_limit_rate": 0.5,
+        "mean_text_4gram_repetition": 0.29047817007302157
+      },
+      "language:zh": {
+        "samples": 30,
+        "automatic_checks": 21,
+        "automatic_passes": 1,
+        "manual_review_required": 9,
+        "eos_rate": 0.8666666666666667,
+        "token_limit_rate": 0.13333333333333333,
+        "mean_text_4gram_repetition": 0.1421968861682511
+      },
+      "task:basic_arithmetic": {
+        "samples": 4,
+        "automatic_checks": 4,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:basic_comparison": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:casual_chat": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:clarification": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.578125
+      },
+      "task:daily_advice": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.3665338645418327
+      },
+      "task:daily_support": {
+        "samples": 4,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 4,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.1541005291005291
+      },
+      "task:deduction": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.2486772486772487
+      },
+      "task:listening": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.676056338028169
+      },
+      "task:ordering_logic": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:pure_function": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.75,
+        "token_limit_rate": 0.25,
+        "mean_text_4gram_repetition": 0.169934936209446
+      },
+      "task:recent_context": {
+        "samples": 3,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 3,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.3279928793947486
+      },
+      "task:recent_correction": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.15555555555555556
+      },
+      "task:rule_following": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:time_reasoning": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:word_arithmetic": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.3362619308402441
+      }
+    },
+    "final": {
+      "all": {
+        "samples": 40,
+        "automatic_checks": 28,
+        "automatic_passes": 2,
+        "manual_review_required": 12,
+        "eos_rate": 0.8,
+        "token_limit_rate": 0.2,
+        "mean_text_4gram_repetition": 0.17857892440533904
+      },
+      "category:chat": {
+        "samples": 12,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 12,
+        "eos_rate": 0.8333333333333334,
+        "token_limit_rate": 0.16666666666666666,
+        "mean_text_4gram_repetition": 0.12664278775877097
+      },
+      "category:coding": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "category:reasoning": {
+        "samples": 16,
+        "automatic_checks": 16,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.875,
+        "token_limit_rate": 0.125,
+        "mean_text_4gram_repetition": 0.08375920060501232
+      },
+      "language:en": {
+        "samples": 10,
+        "automatic_checks": 7,
+        "automatic_passes": 1,
+        "manual_review_required": 3,
+        "eos_rate": 0.8,
+        "token_limit_rate": 0.2,
+        "mean_text_4gram_repetition": 0.14077752351297293
+      },
+      "language:zh": {
+        "samples": 30,
+        "automatic_checks": 21,
+        "automatic_passes": 1,
+        "manual_review_required": 9,
+        "eos_rate": 0.8,
+        "token_limit_rate": 0.2,
+        "mean_text_4gram_repetition": 0.19117939136946108
+      },
+      "task:basic_arithmetic": {
+        "samples": 4,
+        "automatic_checks": 4,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:basic_comparison": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:casual_chat": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:clarification": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.09375
+      },
+      "task:daily_advice": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.5268022181146026
+      },
+      "task:daily_support": {
+        "samples": 4,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 4,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0069444444444444475
+      },
+      "task:deduction": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.29434697855750486
+      },
+      "task:listening": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.17307692307692313
+      },
+      "task:ordering_logic": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.04545454545454547
+      },
+      "task:pure_function": {
+        "samples": 12,
+        "automatic_checks": 12,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 0.6666666666666666,
+        "token_limit_rate": 0.3333333333333333,
+        "mean_text_4gram_repetition": 0.35694135945234273
+      },
+      "task:recent_context": {
+        "samples": 3,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 3,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.030669107179174298
+      },
+      "task:recent_correction": {
+        "samples": 1,
+        "automatic_checks": 0,
+        "automatic_passes": 0,
+        "manual_review_required": 1,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.6062992125984252
+      },
+      "task:rule_following": {
+        "samples": 1,
+        "automatic_checks": 1,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 0.0,
+        "token_limit_rate": 1.0,
+        "mean_text_4gram_repetition": 0.3661971830985915
+      },
+      "task:time_reasoning": {
+        "samples": 2,
+        "automatic_checks": 2,
+        "automatic_passes": 0,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      },
+      "task:word_arithmetic": {
+        "samples": 3,
+        "automatic_checks": 3,
+        "automatic_passes": 1,
+        "manual_review_required": 0,
+        "eos_rate": 1.0,
+        "token_limit_rate": 0.0,
+        "mean_text_4gram_repetition": 0.0
+      }
+    }
+  },
+  "manual_review": [
+    "搬家闲聊从不合常理的回答变成自然邀请聊天；措辞改善不等同于理解充分。",
+    "整理书桌题不再输出三体循环，但仍把用户经历说成自己的；礼物题未完成问两个问题的要求。",
+    "五分钟休息题仍重复并达到128 token上限，重复问题尚未解决。",
+    "唯一功能通过的increment_by_two核心函数正确，但仍带解释，未严格服从只输出代码。",
+    "其余代码存在错误返回、未定义变量、缺失函数或截断；未发现明显的功能正确却被评估器误判的例子。",
+    "修正后历史题仍无可靠承接：咖啡回答编造咖啡因胺，晚餐违反清淡和少选项约束，英文活动题仍答concert suit服装。",
+    "历史题最初输入缺少EOS后的换行；修正后单独重测4题，原始报告保留，合并视图只替换这4题。",
+    "这些是已使用的开发/监控题，语义技能及措辞变体可能与训练重叠，不是独立盲测或通用能力基准。"
+  ],
+  "focused_static_audit": {
+    "scope": "SFT label/CE shift, role/EOS mask, gradient accumulation, readonly W0 gradients, right padding/causality, vocabulary and generation role boundary",
+    "result": "No blocking implementation defect found in inspected paths; history-format discrepancy fixed separately."
+  },
+  "cpu_regression_after_history_fix": {
+    "total": 519,
+    "skipped": 22,
+    "passed": 497,
+    "result": "OK"
+  }
+}
