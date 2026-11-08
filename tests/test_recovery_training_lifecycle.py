@@ -140,6 +140,20 @@ class RecoveryLifecycleTests(unittest.TestCase):
                 "meta_trained": "--allow-untrained-baseline" not in command,
                 "free_generation_accuracy_measured": False, "online_writes_allowed": False,
                 "summary": {"paired_ce_gain": .1}, "groups": {}}), encoding="utf-8")
+        elif "deploy/evaluate_chat_curriculum.py" in command:
+            from deploy.evaluate_chat_curriculum import validate_tasks
+            report_path = Path(command[command.index("--output") + 1])
+            task_path = Path(command[command.index("--tasks") + 1])
+            checkpoint = Path(command[command.index("--checkpoint") + 1])
+            with task_path.open(encoding="utf-8") as stream:
+                development = validate_tasks([json.loads(line) for line in stream if line.strip()])
+            identity = runner.hashlib.sha256(json.dumps(development, ensure_ascii=False, sort_keys=True,
+                                                        separators=(",", ":")).encode()).hexdigest()
+            report_path.write_text(json.dumps({
+                "protocol": "chat-curriculum-diagnostics-v1", "checkpoint": str(checkpoint), "tasks_sha256": identity,
+                "results": [{"id": task["id"], "automatic_pass": None if task["category"] == "chat" else True}
+                            for task in development],
+                "summary": {"category:chat": {"manual_review_required": 1, "automatic_checks": 0}}}), encoding="utf-8")
         elif "train_5090.py" in command:
             output = Path(command[command.index("--output-ckpt") + 1])
             output.touch()
@@ -198,6 +212,111 @@ class RecoveryLifecycleTests(unittest.TestCase):
         command = self.processes[1][0]
         self.assertIn("--init-from", command)
         self.assertIn("--no-resume", command)
+        self.assertNotIn("development_tasks", state["binding"])
+        self.assertNotIn("development_evaluations", state)
+
+    def development_arguments(self):
+        self.development_path = self.root / "development.jsonl"
+        rows = [{"id": "chat-one", "category": "chat", "task": "daily", "language": "zh", "family": "dev:chat",
+                 "prompt": "第一行\u2028仍在同一JSON字符串内。"},
+                {"id": "code-one", "category": "coding", "task": "function", "language": "en", "family": "dev:code",
+                 "prompt": "Define f(x) returning x.", "code_check": {"protocol": "bounded_python_ast_v1",
+                    "function": "f", "cases": [{"args": [2], "expected": 2}]}}]
+        self.development_path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+        return ["--development-tasks", str(self.development_path)]
+
+    def test_optional_development_records_identity_after_old_gate_without_changing_quality(self):
+        self.final_candidate_monitor()
+        runner.main(self.argv + self.development_arguments())
+        state = self.state()
+        self.assertEqual(state["binding"]["development_tasks"], {
+            "path": str(self.development_path), "sha256": runner.digest(self.development_path)})
+        self.assertEqual([entry["stage"] for entry in state["stages"]], [
+            "baseline_evaluate", "development_baseline_evaluate", "sft", "sft_evaluate", "sft_final_evaluate",
+            "development_best_ce_evaluate", "development_final_evaluate"])
+        self.assertEqual(set(state["development_evaluations"]), {"baseline", "best_ce", "final"})
+        self.assertEqual(state["quality"]["candidate"]["accuracy"], 14 / 60)
+        self.assertFalse(state["quality_passed"])
+        self.assertFalse(state["online_writes_allowed"])
+        for record in state["development_evaluations"].values():
+            self.assertEqual(record["report_sha256"], runner.digest(record["report"]))
+            self.assertEqual(record["checkpoint_sha256"], runner.digest(record["checkpoint"]))
+            report = json.loads(Path(record["report"]).read_text(encoding="utf-8"))
+            self.assertIsNone(report["results"][0]["automatic_pass"])
+            self.assertEqual(record["summary"]["category:chat"]["automatic_checks"], 0)
+
+    def test_resume_reuses_pinned_development_reports(self):
+        self.final_candidate_monitor()
+        extra = self.development_arguments()
+        runner.main(self.argv + extra)
+        records = self.state()["development_evaluations"]
+        contents = {Path(value["report"]): Path(value["report"]).read_bytes() for value in records.values()}
+        self.processes.clear()
+        runner.main(self.argv + extra + ["--resume"])
+        self.assertEqual(len(self.processes), 1)
+        self.assertIn("train_5090.py", self.processes[0][0])
+        self.assertEqual(self.state()["development_evaluations"], records)
+        for path, content in contents.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_changed_development_binding_is_rejected_before_resume_launch(self):
+        extra = self.development_arguments()
+        runner.main(self.argv + extra)
+        state_path = self.root / "logs/recovery_test/state.json"
+        original = state_path.read_bytes()
+        with self.development_path.open("a", encoding="utf-8") as stream:
+            stream.write("\n")
+        self.processes.clear()
+        with self.assertRaisesRegex(ValueError, "differs from the original run"):
+            runner.main(self.argv + extra + ["--resume"])
+        self.assertEqual(self.processes, [])
+        self.assertEqual(state_path.read_bytes(), original)
+
+    def test_changed_development_report_is_not_silently_recomputed(self):
+        extra = self.development_arguments()
+        runner.main(self.argv + extra)
+        path = Path(self.state()["development_evaluations"]["baseline"]["report"])
+        path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self.processes.clear()
+        with self.assertRaisesRegex(ValueError, "development evaluation report changed"):
+            runner.main(self.argv + extra + ["--resume"])
+        self.assertEqual(self.processes, [])
+        self.assertEqual(self.state()["status"], "failed")
+
+    def test_development_baseline_stop_retries_unique_report_before_training(self):
+        extra = self.development_arguments()
+        original = self.spawn
+        def interrupted(command, **kwargs):
+            process = original(command, **kwargs)
+            if "deploy/evaluate_chat_curriculum.py" in command:
+                def lines():
+                    self.stop()
+                    yield "development baseline interrupted\n"
+                process.stdout = lines()
+            return process
+        self.popen.side_effect = interrupted
+        runner.main(self.argv + extra)
+        state = self.state()
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["stage"], "development_baseline_evaluate")
+        self.assertFalse(self.output.exists())
+        old_path = Path(state["stages"][-1]["log"]).with_suffix(".json")
+        contents = old_path.read_bytes()
+        self.processes.clear()
+        self.popen.side_effect = original
+        runner.main(self.argv + extra + ["--resume"])
+        self.assertIn("deploy/evaluate_chat_curriculum.py", self.processes[0][0])
+        self.assertIn("--init-from", self.processes[1][0])
+        self.assertEqual(old_path.read_bytes(), contents)
+        self.assertNotEqual(self.state()["development_evaluations"]["baseline"]["report"], str(old_path))
+
+    def test_invalid_development_tasks_fail_before_any_gpu_child(self):
+        extra = self.development_arguments()
+        self.development_path.write_text('{"category":"coding","task":"bad","language":"en","family":"dev","prompt":"Bad"}\n',
+                                         encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Coding tasks require"):
+            runner.main(self.argv + extra)
+        self.popen.assert_not_called()
 
     def test_training_completion_is_distinct_from_failed_quality(self):
         self.candidate_correct = 1

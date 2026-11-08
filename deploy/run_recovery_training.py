@@ -311,6 +311,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "data-path", "init-from", "output-ckpt", "tasks", "run-id"):
         parser.add_argument(f"--{name}", required=True)
+    parser.add_argument("--development-tasks", help="Optional independent chat/reasoning/code diagnostic JSONL; does not alter the quality gate")
     parser.add_argument("--steps", type=int)
     parser.add_argument("--resume", action="store_true", help="Require the existing full checkpoint; do not initialize weights again")
     parser.add_argument("--resume-from-revision", metavar="OLD_SHA",
@@ -349,10 +350,21 @@ def main(argv=None):
     tasks = [json.loads(line) for line in task_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not tasks or any(not isinstance(task.get("prompt"), str) or not task["prompt"].strip() for task in tasks):
         raise ValueError("Heldout tasks must contain nonempty prompts")
+    development_path = Path(args.development_tasks).resolve() if args.development_tasks else None
+    development_identity = None
+    if development_path is not None:
+        from deploy.evaluate_chat_curriculum import validate_tasks
+        with development_path.open(encoding="utf-8") as stream:
+            development_tasks = validate_tasks([json.loads(line) for line in stream if line.strip()])
+        development_identity = hashlib.sha256(json.dumps(
+            development_tasks, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     settings = config.get("recovery", {})
     evaluate_final_checkpoint = settings.get("evaluate_final_checkpoint", False)
     if type(evaluate_final_checkpoint) is not bool:
         raise ValueError("recovery.evaluate_final_checkpoint must be a boolean")
+    development_max_tokens = settings.get("development_eval_max_new_tokens", 128)
+    if development_path is not None and (type(development_max_tokens) is not int or development_max_tokens < 1):
+        raise ValueError("development_eval_max_new_tokens must be a positive integer")
     # Validate quality settings before any GPU work.
     dummy = {"results": [{"prompt": task["prompt"], "exact_match": False, "eos_generated": False} for task in tasks]}
     dummy_quality = quality_comparison(dummy, dummy, tasks, settings)
@@ -408,6 +420,10 @@ def main(argv=None):
                "init_from": str(initial), "output_checkpoint": str(output), "steps": steps,
                "tasks": str(task_path), "tasks_sha256": digest(task_path), "code_revision": revision,
                "meta": ({key: str(value) if isinstance(value, Path) else value for key, value in meta.items()} if meta else None)}
+    if development_path is not None:
+        # Absence adds no binding key, preserving every existing run's resume
+        # identity. Supplying this option pins both the file and its contents.
+        binding["development_tasks"] = {"path": str(development_path), "sha256": digest(development_path)}
     active = None
     stopping = False
     handlers = {}
@@ -504,6 +520,43 @@ def main(argv=None):
         update(sft_candidates=records)
         return report, path, comparison
 
+    def evaluate_development(key, checkpoint):
+        """Preserve a separate diagnostic; never manufacture an open-chat gate."""
+        if development_path is None:
+            return
+        checkpoint_sha256 = digest(checkpoint)
+        previous = state.get("development_evaluations", {}).get(key)
+        if args.resume and previous:
+            if (previous.get("checkpoint") != str(checkpoint)
+                    or previous.get("checkpoint_sha256") != checkpoint_sha256
+                    or previous.get("tasks_sha256") != development_identity
+                    or previous.get("evaluation_code_revision") != revision):
+                raise ValueError("A recorded development evaluation identity changed")
+            path = Path(previous["report"])
+            if digest(path) != previous["report_sha256"]:
+                raise ValueError("A recorded development evaluation report changed")
+            report = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            stage = f"development_{key}_evaluate"
+            path = report_path(stage)
+            run(stage, [sys.executable, "-u", "deploy/evaluate_chat_curriculum.py", "--checkpoint", str(checkpoint),
+                        "--tasks", str(development_path), "--output", str(path), "--seed", "42",
+                        "--max-new-tokens", str(development_max_tokens)])
+            if digest(checkpoint) != checkpoint_sha256:
+                raise ValueError("A checkpoint changed during development evaluation")
+            report = json.loads(path.read_text(encoding="utf-8"))
+        if (report.get("protocol") != "chat-curriculum-diagnostics-v1"
+                or report.get("checkpoint") != str(checkpoint)
+                or report.get("tasks_sha256") != development_identity
+                or [row.get("id") for row in report.get("results", [])] != [row["id"] for row in development_tasks]):
+            raise ValueError("Development evaluation must match this checkpoint and fixed diagnostic set")
+        evaluations = dict(state.get("development_evaluations", {}))
+        evaluations[key] = {"checkpoint": str(checkpoint), "checkpoint_sha256": checkpoint_sha256,
+                            "report": str(path), "report_sha256": digest(path),
+                            "tasks_sha256": development_identity, "evaluation_code_revision": revision,
+                            "summary": report.get("summary"), "scope": "development_only; open chat requires human review"}
+        update(development_evaluations=evaluations)
+
     def evaluate_memory(key, checkpoint, *, allow_untrained=False):
         previous = state.get("memory_evaluations", {}).get(key)
         if args.resume and previous:
@@ -582,6 +635,8 @@ def main(argv=None):
                              "saved_step": saved["step"], "checkpoint": str(resume_source),
                              "discarded_baseline_report": previous_state.get("baseline_report"),
                              "discarded_baseline_sha256": previous_state.get("baseline_sha256")}
+                if development_path is not None:
+                    migration["discarded_development_evaluations"] = previous_state.get("development_evaluations")
                 accepted_revisions.add(revision)
                 migration["accepted_revisions"] = sorted(accepted_revisions)
                 # Do not assign state until every migration constraint and
@@ -591,6 +646,8 @@ def main(argv=None):
                 state["binding"] = binding
                 state.pop("baseline_report", None)
                 state.pop("baseline_sha256", None)
+                if development_path is not None:
+                    state.pop("development_evaluations", None)
                 update(accepted_code_revisions=sorted(accepted_revisions), quality_passed=False,
                        online_writes_allowed=False)
             else:
@@ -626,6 +683,7 @@ def main(argv=None):
         else:
             baseline, baseline_path = evaluate("baseline_evaluate", initial)
             update(baseline_report=str(baseline_path), baseline_sha256=digest(baseline_path))
+        evaluate_development("baseline", initial)
         command = [sys.executable, "-u", "train_5090.py", "--config", str(config_path), "--data-path", str(data_path),
                    "--steps", str(steps), "--output-ckpt", str(output)]
         if resume_source is None:
@@ -658,6 +716,11 @@ def main(argv=None):
             comparison = quality_comparison(baseline, candidate, tasks, settings)
         update(quality=comparison, quality_passed=comparison["quality_passed"], selected_checkpoint=str(selected_sft),
                sft_quality_report=str(candidate_path), sft_quality_sha256=digest(candidate_path))
+        if development_path is not None:
+            # Both fixed endpoint reports follow the existing heldout candidate
+            # evaluations. Their scores neither select a winner nor permit meta.
+            evaluate_development("best_ce", best)
+            evaluate_development("final", output)
         if meta and comparison["quality_passed"]:
             evaluate_memory("baseline", selected_sft, allow_untrained=True)
             meta_command = [sys.executable, "-u", "train_5090.py", "--config", str(meta["config"]),
