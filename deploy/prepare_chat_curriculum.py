@@ -121,8 +121,9 @@ def complete_prefix(text, turns, max_tokens, length_fn):
 
 
 def _select(pool, required, *, seed, split, min_multi_turn_fraction):
-    ranked = {category: sorted(pool[category], key=lambda row: stable_hash(
-        f"selection:{seed}:{row['text_sha256']}")) for category in CATEGORIES}
+    ranked = {category: sorted(pool[category], key=lambda row: (
+        row.get("selection_priority", 0), stable_hash(f"selection:{seed}:{row['text_sha256']}")))
+              for category in CATEGORIES}
     available = {category: len(ranked[category]) for category in CATEGORIES}
     multi = {category: [row for row in ranked[category] if row["turns"] > 1] for category in CATEGORIES}
     if any(available[category] < required[category] for category in CATEGORIES):
@@ -155,6 +156,8 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
     keywords. Missing classification/provenance fails; malformed conversations,
     exclusions and explicit deterministic-answer conflicts are rejected with
     manifest counts. Open-ended questions may have multiple reasonable answers.
+    Optional selection_priority is a nonnegative integer: smaller values rank
+    first within the existing split/category and multi-turn quota, default 0.
     """
     if (type(count) is not int or count < 3 or max_tokens < 16 or not 0 < validation_fraction < .5
             or not 0 < heldout_fraction < .5 or not 0 <= min_multi_turn_fraction <= 1):
@@ -188,6 +191,9 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
                 or any(not isinstance(original.get(key), str) or not original[key].strip()
                        for key in ("language", "source", "text"))):
             raise ValueError(f"Candidate {index} requires explicit category/language/source/family/text")
+        priority = original.get("selection_priority", 0)
+        if type(priority) is not int or priority < 0:
+            raise ValueError(f"Candidate {index} selection_priority must be a nonnegative integer")
         if "deterministic_answer" in original and type(original["deterministic_answer"]) is not bool:
             raise ValueError(f"Candidate {index} deterministic_answer must be boolean")
         try:

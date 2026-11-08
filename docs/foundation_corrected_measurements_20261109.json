@@ -1,0 +1,491 @@
+{
+  "protocol": "uttt-foundation-corrected-preparation-v1",
+  "date": "2026-11-09",
+  "run_id": "20261109_foundation_corrected",
+  "base_revision": "49457f6eefb4c6622d18644bee86dc4e47335184",
+  "status": "prepared_and_tested; actual outcome will be reported separately",
+  "training_plan": {
+    "steps": 1000,
+    "seed": 20261110,
+    "fresh_optimizer": true,
+    "parent_step": 1500,
+    "parent_checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261108_foundation/uttt_1.584b_20261108_foundation.best.pt",
+    "parent_checkpoint_sha256": "fbf683a4c160896ef2e9a831e47d908c0eb7809729653bfc5c8b7cc034b9fe3c",
+    "ratios": {
+      "reasoning": 0.5,
+      "coding": 0.3,
+      "chat": 0.2
+    },
+    "outer_lr": 1e-05,
+    "w0_lr": 5e-06,
+    "retention": {
+      "checkpoint_keep_previous": false,
+      "checkpoint_full_on_validation_improvement": false,
+      "checkpoint_save_initial_full": true
+    },
+    "estimated_new_checkpoint_steady_bytes": 21781000000,
+    "estimated_peak_additional_checkpoint_bytes": 37223000000,
+    "C_minimum_free_reserve_bytes": 100000000000,
+    "automatic_meta_training": false,
+    "automatic_service_replacement": false
+  },
+  "first_foundation_results": {
+    "training_source_revision": "49457f6eefb4c6622d18644bee86dc4e47335184",
+    "step": 1500,
+    "legacy_gate": {
+      "quality_passed": false,
+      "reasons": [
+        "heldout_accuracy_below_minimum",
+        "heldout_accuracy_did_not_improve"
+      ],
+      "baseline": {
+        "accuracy": 0.38333333333333336,
+        "accepted_tasks": 60,
+        "eos_rate": 1.0
+      },
+      "candidate": {
+        "accuracy": 0.3333333333333333,
+        "accepted_tasks": 60,
+        "eos_rate": 1.0
+      },
+      "thresholds": {
+        "min_accuracy": 0.5,
+        "min_accuracy_improvement": 0.0,
+        "max_eos_rate_drop": 0.1
+      },
+      "scope": "This heldout curriculum only; not a general assistant or online-memory benchmark."
+    },
+    "development": {
+      "baseline": {
+        "category:coding": {
+          "samples": 24,
+          "automatic_checks": 24,
+          "automatic_passes": 0,
+          "manual_review_required": 0,
+          "eos_rate": 0.875,
+          "token_limit_rate": 0.125,
+          "mean_text_4gram_repetition": 0.12963044688999023
+        },
+        "category:reasoning": {
+          "samples": 40,
+          "automatic_checks": 40,
+          "automatic_passes": 8,
+          "manual_review_required": 0,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.0016666666666666663
+        }
+      },
+      "best_ce": {
+        "category:coding": {
+          "samples": 24,
+          "automatic_checks": 24,
+          "automatic_passes": 2,
+          "manual_review_required": 0,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.06726506129830861
+        },
+        "category:reasoning": {
+          "samples": 40,
+          "automatic_checks": 40,
+          "automatic_passes": 14,
+          "manual_review_required": 0,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.0
+        }
+      },
+      "final": {
+        "category:coding": {
+          "samples": 24,
+          "automatic_checks": 24,
+          "automatic_passes": 2,
+          "manual_review_required": 0,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.06726506129830861
+        },
+        "category:reasoning": {
+          "samples": 40,
+          "automatic_checks": 40,
+          "automatic_passes": 14,
+          "manual_review_required": 0,
+          "eos_rate": 1.0,
+          "token_limit_rate": 0.0,
+          "mean_text_4gram_repetition": 0.0
+        }
+      }
+    },
+    "parameter_holdout_model_outputs_examined": false
+  },
+  "corrections": [
+    "Two of four presentations swap commutative operands; canonical semantic families unchanged.",
+    "Four name variations per code family are bound together, not counted as new semantics.",
+    "Curator priority retains limited basic arithmetic/comparison examples before larger clock/parameter pools.",
+    "Earlier family holdout is excluded again; internal validation may share skills/families previously seen by the parent through earlier presentation formats."
+  ],
+  "storage_cleanup": {
+    "at": "2026-11-09T00:15:08.929999",
+    "audit": "/root/uTTT/logs/foundation_training_20261108/previous_backup_audit.json",
+    "removed_superseded_backups": [
+      "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.pt.prev",
+      "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.best.pt.prev"
+    ],
+    "preserved_latest_and_best": [
+      "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.pt",
+      "/mnt/c/uTTT-artifacts/checkpoints/20261108_chat/uttt_1.584b_20261108_chat.best.pt"
+    ],
+    "free_C_before": 137850888192,
+    "free_C_after": 159631261696,
+    "removed_logical_bytes": 21780368104
+  },
+  "data_manifest": {
+    "protocol": "uttt-chat-curriculum-v1",
+    "seed": 20261110,
+    "count_including_internal_validation": 12000,
+    "ratios": {
+      "chat": 0.2,
+      "reasoning": 0.5,
+      "coding": 0.3
+    },
+    "validation_fraction": 0.05,
+    "heldout_candidate_fraction": 0.1,
+    "max_tokens": 512,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "input_sha256": "a060ebde811efcc388b5e12b7c37fc410f6cbe7e9b1e05c2ccb3ec795a6ed795",
+    "exclusion_files": {
+      "/root/uTTT/data/instruction_recovery_20261105/heldout.jsonl": "d9a86976fa8a1d2db851fd746be9d981607c4fed6e0af8809a83a6db5f1a4e4b",
+      "/root/uTTT/data/instruction_recovery_20261105/eval_tasks.jsonl": "b6c2b208cfc274e8473ddae83e7e05bc516dae439e559902b1c28949967b699d",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/docs/quality_diagnosis_20261108.json": "953f78836afdc72534d7a79c367ad0c44142638b8c1608dccf77c4570fd96860",
+      "/root/uTTT/data/chat_curriculum_20261108_final3/heldout.jsonl": "a43882e2f37e7ab3312c43eb6ef6e23d074f8b04b29d5356d0a30ceb621c7e0c",
+      "/root/uTTT/data/foundation_curriculum_20261108_v2/heldout.jsonl": "17a1c7803b14ae41073b2565ad3c1d1649c2a0547d0df685487c542c9776a3b4",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/chat_development_tasks_20261108.jsonl": "d59806817a00f97702abe8dee9461be39a733a760c9e49fc12c2a58389de3868",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/foundation_development_tasks_20261108.jsonl": "6db4cf980459d0b5fe731c4c3cb35e84374229e6fafa084c435024295a9805e3",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/foundation_holdout_tasks_20261108.jsonl": "e1d6992b70affda652b0fedd40889ad6cd79134bcfa0b581b50300790356e78e"
+    },
+    "input_rows": 29919,
+    "rejected": {
+      "excluded_probe_or_family": 2628,
+      "duplicate_text": 0
+    },
+    "grouping": {
+      "connected_components": 12576,
+      "largest_candidate_group": 137,
+      "initial_greeting_links_skipped": 3
+    },
+    "available": {
+      "train": {
+        "chat": 6078,
+        "reasoning": 11858,
+        "coding": 5168
+      },
+      "validation": {
+        "chat": 355,
+        "reasoning": 693,
+        "coding": 248
+      },
+      "heldout": {
+        "chat": 858,
+        "reasoning": 1449,
+        "coding": 584
+      }
+    },
+    "training": {
+      "rows": 11400,
+      "category": {
+        "coding": 3420,
+        "reasoning": 5700,
+        "chat": 2280
+      },
+      "language": {
+        "zh": 6816,
+        "en": 4584
+      },
+      "multi_turn": 2277,
+      "groups": 5916,
+      "shortened_complete_prefixes": 6
+    },
+    "validation": {
+      "rows": 600,
+      "category": {
+        "coding": 180,
+        "chat": 120,
+        "reasoning": 300
+      },
+      "language": {
+        "zh": 358,
+        "en": 242
+      },
+      "multi_turn": 120,
+      "groups": 288,
+      "shortened_complete_prefixes": 0
+    },
+    "heldout": {
+      "rows": 600,
+      "category": {
+        "reasoning": 300,
+        "coding": 180,
+        "chat": 120
+      },
+      "language": {
+        "zh": 350,
+        "en": 250
+      },
+      "multi_turn": 119,
+      "groups": 297,
+      "shortened_complete_prefixes": 2
+    },
+    "all_mixture": {
+      "rows": 12000,
+      "category": {
+        "coding": 3600,
+        "reasoning": 6000,
+        "chat": 2400
+      },
+      "language": {
+        "zh": 7174,
+        "en": 4826
+      },
+      "multi_turn": 2397,
+      "groups": 6204,
+      "shortened_complete_prefixes": 6
+    },
+    "group_overlap": 0,
+    "files": {
+      "train.jsonl": {
+        "sha256": "af6956a3b5007a951cfc392eed4d04f3320055bdec3e3df3a6a7ff120f91ee51",
+        "rows": 12000
+      },
+      "validation.jsonl": {
+        "sha256": "aecfd636aff108841090a79d0e8720989f1b3c71d73b1f27879e861850e202f5",
+        "rows": 600
+      },
+      "heldout.jsonl": {
+        "sha256": "66fd55041340558b02d58d0fc5018d19c8b533fb06f4d75faf7184a858fe60ca",
+        "rows": 600
+      }
+    },
+    "notes": [
+      "Category labels come from the input curator, never keyword inference.",
+      "Alternate open-ended answers are retained; only deterministic_answer=true conflicts are rejected.",
+      "Generic initial greetings do not join unrelated topics; original families/full conversations/later contexts still bind.",
+      "train.jsonl includes internal validation: use the SAME seed, fraction and validation_group_id in the trainer.",
+      "validation.jsonl is an inspection copy, not a second independent holdout.",
+      "heldout.jsonl is independently family isolated and excluded from train.jsonl.",
+      "No duplicate upsampling or fake EOS; long conversations retain only a complete prefix."
+    ]
+  },
+  "data_parity": {
+    "train_rows": 11400,
+    "validation_rows": 600,
+    "heldout_rows": 600,
+    "train_fingerprint": "24211e10671dbf2805ebc10552bc6a6f443477e6b0bdfaca012da547a9aac38a",
+    "validation_fingerprint": "74148a6f1942c7b4f7c1b2e1fe127ca6e01d1fdd469bb893ec03e50c6e46e3b5",
+    "group_overlap": 0,
+    "audited_windows": 1024,
+    "bad_windows": 0,
+    "max_audited_length": 472,
+    "sample_actual_tokens": {
+      "reasoning": 19841,
+      "coding": 29025,
+      "chat": 32494
+    },
+    "sample_supervised_tokens": {
+      "reasoning": 3740,
+      "coding": 12224,
+      "chat": 24299
+    },
+    "human_quality_verified": false,
+    "verified_ability_rows": {
+      "coding_generated": 3780,
+      "reasoning_generated": 5241,
+      "prior_reference_replay": 1059
+    },
+    "category_language": {
+      "coding:zh": 1906,
+      "reasoning:en": 3202,
+      "coding:en": 1874,
+      "reasoning:zh": 3098,
+      "chat:zh": 2520
+    },
+    "operations": {
+      "clamp": 1741,
+      "add": 768,
+      "length_test": 122,
+      "max": 732,
+      "min": 774,
+      "replay:copy": 149,
+      "replay:lowercase": 146,
+      "affine": 952,
+      "interval": 786,
+      "clock": 564,
+      "mod_equals": 86,
+      "subtract": 821,
+      "quantity": 354,
+      "order": 626,
+      "multiply": 204,
+      "divide": 349,
+      "replay:reverse": 156,
+      "replay:uppercase": 154,
+      "replay:extract": 142,
+      "slice_text": 19,
+      "weekday": 39,
+      "replay:length": 153,
+      "replay:sort": 159,
+      "nth_default": 51,
+      "sort_items": 4,
+      "safe_divide": 7,
+      "reverse_value": 7,
+      "lookup_default": 3,
+      "boolean": 10,
+      "repeat_text": 2
+    },
+    "comparator_presentations": {
+      "ascending": 749,
+      "descending": 757
+    },
+    "function_names": {
+      "solve": 479,
+      "apply_rule": 470,
+      "process_value": 464,
+      "transform": 486,
+      "evaluate_value": 450,
+      "get_result": 467,
+      "compute": 486,
+      "calculate": 478
+    }
+  },
+  "candidate_generation": {
+    "protocol": "uttt:foundation-curriculum-v1",
+    "seed": 20261110,
+    "rows": 20000,
+    "distinct_families": 7061,
+    "by_category": {
+      "reasoning": 14000,
+      "coding": 6000
+    },
+    "by_language": {
+      "en": 10000,
+      "zh": 10000
+    },
+    "reference_code_case_checks": 35756,
+    "rejected_families": {
+      "reasoning:excluded_family": 271,
+      "coding:excluded_family": 152,
+      "coding:matches_heldout_case_behavior": 690
+    },
+    "exclusion_files": {
+      "/root/uTTT/data/chat_curriculum_20261108_final3/heldout.jsonl": "a43882e2f37e7ab3312c43eb6ef6e23d074f8b04b29d5356d0a30ceb621c7e0c",
+      "/root/uTTT/data/foundation_curriculum_20261108_v2/heldout.jsonl": "17a1c7803b14ae41073b2565ad3c1d1649c2a0547d0df685487c542c9776a3b4",
+      "/root/uTTT/data/instruction_recovery_20261105/eval_tasks.jsonl": "b6c2b208cfc274e8473ddae83e7e05bc516dae439e559902b1c28949967b699d",
+      "/root/uTTT/data/instruction_recovery_20261105/heldout.jsonl": "d9a86976fa8a1d2db851fd746be9d981607c4fed6e0af8809a83a6db5f1a4e4b",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/chat_development_tasks_20261108.jsonl": "d59806817a00f97702abe8dee9461be39a733a760c9e49fc12c2a58389de3868",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/foundation_development_tasks_20261108.jsonl": "6db4cf980459d0b5fe731c4c3cb35e84374229e6fafa084c435024295a9805e3",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/deploy/foundation_holdout_tasks_20261108.jsonl": "e1d6992b70affda652b0fedd40889ad6cd79134bcfa0b581b50300790356e78e",
+      "/root/uTTT/runs/20261109_foundation_corrected_prepare/docs/quality_diagnosis_20261108.json": "953f78836afdc72534d7a79c367ad0c44142638b8c1608dccf77c4570fd96860"
+    },
+    "available_families": {
+      "reasoning": {
+        "add": 197,
+        "subtract": 210,
+        "multiply": 52,
+        "divide": 89,
+        "max": 188,
+        "min": 196,
+        "quantity": 331,
+        "clock": 8597,
+        "weekday": 40,
+        "boolean": 12,
+        "order": 2619
+      },
+      "coding": {
+        "affine": 365,
+        "clamp": 765,
+        "interval": 309,
+        "mod_equals": 36,
+        "length_test": 51,
+        "nth_default": 25,
+        "slice_text": 7,
+        "safe_divide": 3,
+        "lookup_default": 2,
+        "repeat_text": 2,
+        "sort_items": 2,
+        "reverse_value": 2
+      }
+    },
+    "notes": [
+      "Candidates contain reasoning/coding in a 5:3 ratio; root adds chat to obtain 50/30/20 overall.",
+      "Every semantic family binds two languages and direct/explanatory variants; four variants are not four novel cases.",
+      "There are 12 programming behaviors; parameter/boundary variations are not claimed as distinct algorithms.",
+      "Exclusions remove exact prompts and particular semantic families, never all individual small numbers.",
+      "Old 40-task arithmetic families are explicitly mapped; typed new evaluation metadata removes its complete families.",
+      "Code families observationally matching any heldout function cases are conservatively excluded without executing code.",
+      "This is a development curriculum; skill overlap and prior simple-capability replay are intentional, not blind-test novelty.",
+      "Optional verified prior instruction replay retains its original groups and may have fewer than four presentations."
+    ],
+    "generated_ability_rows": 16000,
+    "generated_ability_by_operation_or_behavior": {
+      "weekday": 160,
+      "order": 2368,
+      "affine": 1460,
+      "add": 788,
+      "interval": 1236,
+      "clock": 2372,
+      "clamp": 2784,
+      "quantity": 1324,
+      "min": 784,
+      "max": 752,
+      "divide": 356,
+      "mod_equals": 144,
+      "length_test": 204,
+      "subtract": 840,
+      "multiply": 208,
+      "slice_text": 28,
+      "nth_default": 100,
+      "boolean": 48,
+      "repeat_text": 8,
+      "reverse_value": 8,
+      "lookup_default": 8,
+      "safe_divide": 12,
+      "sort_items": 8
+    },
+    "replay": {
+      "source": "/root/uTTT/data/instruction_expansion_20261107/train.jsonl",
+      "source_sha256": "bf1855dea665a72a86ce982f6cf3d2afe243be8642c267810c909148417ba1c9",
+      "rows": 4000,
+      "by_task": {
+        "copy": 572,
+        "extract": 572,
+        "length": 572,
+        "lowercase": 572,
+        "reverse": 572,
+        "sort": 570,
+        "uppercase": 570
+      },
+      "by_language": {
+        "en": 2000,
+        "zh": 2000
+      }
+    },
+    "sha256": "eaf0edd46f486ea9e7498c0d5125423435229daf2afab248c064d664243abace"
+  },
+  "combined_candidates": {
+    "abilities_and_replay_rows": 20000,
+    "generated_ability_rows": 16000,
+    "prior_replay_rows": 4000,
+    "chat_candidates": 9919,
+    "combined_sha256": "a060ebde811efcc388b5e12b7c37fc410f6cbe7e9b1e05c2ccb3ec795a6ed795",
+    "chat_source": "/root/uTTT/data/chat_sources_20261108/combined_final3.jsonl",
+    "chat_source_sha256": "af1175a16074c215f492699442b7b073827d4325efafb25d50cf52362030f224"
+  },
+  "cpu_regression": [
+    "Ran 550 tests in 14.564s",
+    "OK (skipped=22)"
+  ],
+  "free_bytes": {
+    "C": 159523368960,
+    "D": 25726070784
+  },
+  "data_disk_bytes": 91179637
+}

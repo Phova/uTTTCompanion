@@ -1,9 +1,11 @@
 """Verify lesson answers, semantic exclusions, and complete bilingual families."""
 from collections import Counter, defaultdict
+import ast
 import datetime
 import json
 from pathlib import Path
 import tempfile
+import re
 import unittest
 
 from deploy.evaluate_chat_curriculum import restricted_python_check
@@ -61,6 +63,30 @@ class FoundationCurriculumTests(unittest.TestCase):
                       for a, b in ((False, False), (False, True), (True, False), (True, True))]
             self.assertEqual(actual, list(map(str, expected)))
 
+    def test_commutative_presentations_balance_order_without_changing_truth_or_family(self):
+        arguments = {'a': 2, 'b': 9}
+        for seed in (27, 20261109):
+            for operation, expected in (('add', '11'), ('multiply', '18'), ('max', '9'), ('min', '2')):
+                orders = Counter()
+                key = canonical_key('reasoning', operation, arguments)
+                for language in ('en', 'zh'):
+                    for explain in (False, True):
+                        prompt, answer, final = reasoning_lesson(operation, arguments, language, explain, seed)
+                        presented = tuple(map(int, re.findall(r'\d+', prompt)))
+                        orders[presented] += 1
+                        self.assertEqual(final, expected)
+                        self.assertEqual(arguments, {'a': 2, 'b': 9})
+                        self.assertEqual(canonical_key('reasoning', operation, arguments), key)
+                        if explain:
+                            a, b = presented
+                            symbol = {'add': '+', 'multiply': '*'}.get(operation)
+                            step = (f'{a} {symbol} {b} = {expected}.' if symbol else
+                                    f'{a} {">" if a > b else "<"} {b}.')
+                            self.assertTrue(answer.startswith(step), answer)
+                        else:
+                            self.assertEqual(answer, expected)
+                self.assertEqual(orders, {(2, 9): 2, (9, 2): 2})
+
     def test_code_templates_cover_boundaries_without_executing_generated_code(self):
         specifications = coding_specs()
         self.assertEqual(set(specifications), set(CODE_BEHAVIORS))
@@ -78,19 +104,48 @@ class FoundationCurriculumTests(unittest.TestCase):
         self.assertIsNone(coding_lesson('lookup_default', {'default': -1})['reference']({'a': None}, 'a'))
 
     def test_generated_code_obeys_requested_response_format_and_function_cases(self):
+        families = defaultdict(list)
         for row in self.rows:
             if row['category'] != 'coding':
                 continue
             check = row['code_check']
+            families[row['family']].append(row)
             self.assertTrue(restricted_python_check(row['answer'], check['function'], check['cases'])['passed'])
             if row['requested_format'] == 'code_only':
                 self.assertTrue(row['answer'].startswith('def '))
                 self.assertNotIn('```', row['answer'])
+                code = row['answer']
+                self.assertIn('只输出Python代码' if row['language'] == 'zh' else 'Return Python code only', row['prompt'])
             else:
                 self.assertEqual(row['answer'].count('```'), 2)
+                code = row['answer'].split('```python\n')[1].split('\n```')[0]
+                self.assertNotIn('只输出Python代码', row['prompt'])
+                self.assertNotIn('Return Python code only', row['prompt'])
+            definition = ast.parse(code).body[0]
+            self.assertEqual(definition.name, check['function'])
+            signature = code.splitlines()[0].removeprefix('def ').removesuffix(':')
+            self.assertIn(signature, row['prompt'])
+            base = coding_lesson(row['foundation_behavior'], row['arguments'])
+            base_definition = ast.parse(base['code']).body[0]
+            definition.name = base_definition.name
+            self.assertEqual(ast.dump(definition), ast.dump(base_definition))
+            self.assertEqual(check['cases'], [{'args': values, 'expected': base['reference'](*values)} for values in base['inputs']])
             if row['language'] == 'zh':
                 self.assertIn('调用示例', row['prompt'])
                 self.assertIn('内置函数', row['prompt'])
+        for rows in families.values():
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(len({row['code_check']['function'] for row in rows}), 4)
+            self.assertEqual(len({row['semantic_key'] for row in rows}), 1)
+            self.assertEqual(len({json.dumps(row['arguments'], sort_keys=True) for row in rows}), 1)
+        self.assertEqual(self.report['reference_code_case_checks'],
+                         sum(len(row['code_check']['cases']) for row in self.rows if row['category'] == 'coding'))
+
+    def test_selection_priority_preserves_elementary_arithmetic_without_changing_groups(self):
+        for row in self.rows:
+            elementary = row['category'] == 'reasoning' and row['task'] in {'add', 'subtract', 'multiply', 'divide', 'max', 'min'}
+            self.assertEqual(row['selection_priority'], 0 if elementary else 1)
+            self.assertEqual(row['family'], 'foundation:' + canonical_key(row['category'], row['task'], row['arguments']))
 
     def test_typed_and_legacy_exclusions_remove_whole_parameter_families(self):
         cache = Path(__file__).resolve().parents[1] / '.cache'
@@ -145,6 +200,7 @@ class FoundationCurriculumTests(unittest.TestCase):
             self.assertEqual(replay[0]['family'], 'original-family')
             self.assertEqual(replay[0]['text'], row['text'])
             self.assertTrue(replay[0]['reference_verified'])
+            self.assertEqual(replay[0]['selection_priority'], 1)
             self.assertEqual(proof['rows'], 1)
             with self.assertRaisesRegex(ValueError, 'Insufficient'):
                 collect_reference_replay(path, 2)
