@@ -661,6 +661,61 @@ def _cpu_copy_nested(obj: Any, tensor_memo=None) -> Any:
     return obj
 
 
+def checkpoint_save_policy(settings):
+    """Keep legacy saves unless an operator explicitly selects compact storage."""
+    defaults = {"checkpoint_keep_previous": True,
+                "checkpoint_full_on_validation_improvement": True,
+                "checkpoint_save_initial_full": False}
+    policy = {}
+    for name, default in defaults.items():
+        value = settings.get(name, default)
+        if type(value) is not bool:
+            raise ValueError(f"training.{name} must be a boolean")
+        policy[name] = value
+    return policy
+
+
+def resume_compact_validation_best(saved, best_path, metric, max_steps):
+    """Recover selection history from best without borrowing its training step.
+
+    Compact saves may leave best newer than the latest resumable state. The
+    model, Adam and cursor still come exclusively from that full state.
+    """
+    metadata = saved["metrics"]
+    score = validate_resume_validation_selection(metadata, metric)
+    ce = float(metadata.get("best_validation_ce", float("inf")))
+    path = Path(best_path)
+    if not path.exists():
+        if math.isfinite(score):
+            raise ValueError("Compact resume is missing its model-only best checkpoint; restore that file or use a new run")
+        return score, ce
+    best = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    best_metadata = best.get("metrics", {})
+    for key in ("training_pipeline", "training_stage", "dataset_fingerprint", "run_id", "code_revision"):
+        if best_metadata.get(key) != metadata.get(key):
+            raise ValueError(f"Compact resume best checkpoint has different {key}")
+    if best_metadata.get("parameter_scope", "all") != metadata.get("parameter_scope", "all"):
+        raise ValueError("Compact resume best checkpoint has different parameter_scope")
+    if best.get("config") != saved.get("config"):
+        raise ValueError("Compact resume best checkpoint has different model/tokenizer configuration")
+    step = best.get("step")
+    if type(step) is not int or not 1 <= step <= max_steps:
+        raise ValueError("Compact resume best checkpoint has an invalid step")
+    best_score = validate_resume_validation_selection(best_metadata, metric)
+    actual_score = best_metadata.get(metric)
+    if (not isinstance(actual_score, (int, float)) or isinstance(actual_score, bool)
+            or not math.isfinite(actual_score) or actual_score != best_score):
+        raise ValueError("Compact resume best checkpoint is missing its matching validation score")
+    best_ce = float(best_metadata.get("best_validation_ce", float("inf")))
+    if not math.isfinite(best_ce):
+        raise ValueError("Compact resume best checkpoint has invalid validation CE")
+    # Best is committed before a simultaneous full save in compact mode. A
+    # lower score recorded only in latest would mean its best file was lost.
+    if score < best_score:
+        raise ValueError("Compact resume best checkpoint is older than the recorded best validation score")
+    return min(score, best_score), min(ce, best_ce)
+
+
 def export_base_checkpoint(
     model: uTTTModel,
     optimizer: Optional[torch.optim.Optimizer],
@@ -671,6 +726,9 @@ def export_base_checkpoint(
     async_save: bool = False,
     training_state: Optional[Dict[str, Any]] = None,
     best_save_path: Optional[str | Path] = None,
+    save_full: bool = True,
+    keep_previous: bool = True,
+    best_before_full: bool = False,
 ) -> Path:
     """
     Export the dual-track Base Checkpoint (`checkpoints/base_uttt.pt`).
@@ -685,6 +743,13 @@ def export_base_checkpoint(
     global _ACTIVE_SAVE_THREAD
     _wait_for_active_save()
 
+    for name, value in (("save_full", save_full), ("keep_previous", keep_previous),
+                        ("best_before_full", best_before_full)):
+        if type(value) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+    if not save_full and best_save_path is None:
+        raise ValueError("A model-only save requires best_save_path")
+
     out_path = Path(save_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     best_path = Path(best_save_path) if best_save_path is not None else None
@@ -694,9 +759,10 @@ def export_base_checkpoint(
         best_path.parent.mkdir(parents=True, exist_ok=True)
 
     model_state = model.state_dict()
-    optimizer_state = optimizer.state_dict() if optimizer is not None else None
+    optimizer_state = optimizer.state_dict() if save_full and optimizer is not None else None
+    saved_training_state = training_state if save_full else None
     estimated_bytes, has_cuda = _checkpoint_storage_bytes(
-        (model_state, optimizer_state, metrics, training_state)
+        (model_state, optimizer_state, metrics, saved_training_state)
     )
     host_memory = _host_memory_status()
     available = host_memory.get("available")
@@ -733,10 +799,10 @@ def export_base_checkpoint(
         "init_fast_weights": {key[len(fast_prefix):]: value for key, value in model_snapshot.items() if key.startswith(fast_prefix)},
         "metrics": snapshot(metrics),
     }
-    if optimizer is not None:
+    if save_full and optimizer is not None:
         payload["optimizer_state"] = snapshot(optimizer_state)
-    if training_state is not None:
-        payload["training_state"] = snapshot(training_state)
+    if saved_training_state is not None:
+        payload["training_state"] = snapshot(saved_training_state)
     # Best shares the same stable weights: immutable CPU copies for async
     # writers, or live storages while the synchronous caller remains paused.
     best_payload = ({key: value for key, value in payload.items()
@@ -751,7 +817,7 @@ def export_base_checkpoint(
                 torch.save(contents, f)
                 f.flush()
                 os.fsync(f.fileno())
-            if path.exists():
+            if keep_previous and path.exists():
                 backup_tmp = Path(str(prev_path) + ".tmp")
                 try:
                     backup_tmp.unlink(missing_ok=True)
@@ -764,6 +830,10 @@ def export_base_checkpoint(
                 finally:
                     backup_tmp.unlink(missing_ok=True)
             os.replace(tmp_path, path)
+            if not keep_previous:
+                # Never remove an existing recovery copy until the replacement
+                # has been fully written, fsynced and atomically committed.
+                prev_path.unlink(missing_ok=True)
         finally:
             tmp_path.unlink(missing_ok=True)
         size_mb = path.stat().st_size / (1024 * 1024)
@@ -771,8 +841,11 @@ def export_base_checkpoint(
 
     def _write_to_disk() -> None:
         print(f"[Checkpoint] write_start step={step} mode={mode} {_host_memory_summary()}", flush=True)
-        _write_one(out_path, payload)
-        if best_payload is not None:
+        if best_payload is not None and best_before_full:
+            _write_one(best_path, best_payload)
+        if save_full:
+            _write_one(out_path, payload)
+        if best_payload is not None and not best_before_full:
             # The full file is durable; best needs only weights and metadata.
             payload.pop("optimizer_state", None)
             payload.pop("training_state", None)
@@ -790,7 +863,7 @@ def export_base_checkpoint(
         _ACTIVE_SAVE_THREAD.start()
     else:
         _write_to_disk()
-    return out_path
+    return out_path if save_full else best_path
 
 
 # ==============================================================================
@@ -1189,6 +1262,7 @@ def train(
 
     hw_cfg = raw_cfg.get("hardware", {})
     train_cfg = raw_cfg.get("training", {})
+    checkpoint_policy = checkpoint_save_policy(train_cfg)
     model_cfg = uTTTConfig.from_dict(raw_cfg)
     model_cfg.gradient_checkpointing_every = int(train_cfg.get(
         "gradient_checkpointing_every", getattr(model_cfg, "gradient_checkpointing_every", 1)
@@ -1485,6 +1559,14 @@ def train(
                         # Candidates belong to this new phase. The immutable parent
                         # remains its baseline; its historical best is in provenance.
                         best_validation_ce = best_validation_score = float("inf")
+                    elif (not checkpoint_policy["checkpoint_full_on_validation_improvement"]
+                          or metadata.get("checkpoint_retention", {}).get(
+                              "checkpoint_full_on_validation_improvement") is False):
+                        best_validation_score, best_validation_ce = resume_compact_validation_best(
+                            saved, ckpt_file.with_suffix(".best.pt"), validation_selection_metric, max_steps,
+                        )
+                        print(f"[Resume] Retained compact best selection score={best_validation_score:.4f}; "
+                              f"weights, optimizer and cursor still resume at step {saved_step}.", flush=True)
                     training_state = saved.get("training_state")
                     if training_state is not None:
                         batch_sampler.load_state_dict(training_state["data_cursor"])
@@ -1543,6 +1625,11 @@ def train(
         f"LRScheduleStart={lr_schedule['start_step']}, WarmupStartRatio={lr_schedule['warmup_start_ratio']}",
         flush=True,
     )
+    print(f"[Checkpoint policy] FullEvery={save_interval}, "
+          f"InitialFull={checkpoint_policy['checkpoint_save_initial_full']}, "
+          f"FullOnImprovement={checkpoint_policy['checkpoint_full_on_validation_improvement']}, "
+          f"KeepPrevious={checkpoint_policy['checkpoint_keep_previous']}; "
+          "stop/final always save full training state.", flush=True)
     if hw_cfg.get("torch_compile", True) and device.type == "cuda":
         print(
             "[Train] First step includes one-time Triton kernel compilation (~5-15s on RTX 5090)...",
@@ -1724,7 +1811,8 @@ def train(
         tokens_since_log += step_tokens
 
         should_log = (step % log_interval == 0) or (step == start_step)
-        should_save = (step % save_interval == 0) or (step == max_steps) or bool(_STOP_REQUESTED)
+        should_save = ((step % save_interval == 0) or (step == max_steps) or bool(_STOP_REQUESTED)
+                       or (step == 1 and checkpoint_policy["checkpoint_save_initial_full"]))
 
         improved = False
         if validation_dataset is not None and (step % evaluation_interval == 0 or step == start_step or step == max_steps):
@@ -1751,7 +1839,8 @@ def train(
                 )
                 for sample in validation_metrics["validation_samples"]:
                     print("[Validation sample] " + json.dumps(sample, ensure_ascii=False), flush=True)
-        should_save = should_save or bool(_STOP_REQUESTED)
+        should_save = (should_save or bool(_STOP_REQUESTED)
+                       or (improved and checkpoint_policy["checkpoint_full_on_validation_improvement"]))
         checkpoint_saved = False
         if should_log or should_save or improved:
             sync_vals = torch.stack(
@@ -1831,6 +1920,7 @@ def train(
                     "best_validation_ce": best_validation_ce,
                     "best_validation_score": best_validation_score,
                     "validation_selection_metric": validation_selection_metric, **validation_metrics,
+                    "checkpoint_retention": dict(checkpoint_policy),
                     "lr_schedule": dict(lr_schedule), "continuation": continuation_record,
                     "data_source": cur_data_tag,
                     "peak_vram_gb": (
@@ -1847,11 +1937,15 @@ def train(
                     step=step,
                     metrics=metrics,
                     async_save=(step < max_steps and not _STOP_REQUESTED),
-                    training_state={"data_cursor": batch_sampler.state_dict(), "rng": capture_training_rng(),
-                                    "micro_batch_size": micro_batch_size, "grad_accum_steps": grad_accum_steps},
+                    training_state=({"data_cursor": batch_sampler.state_dict(), "rng": capture_training_rng(),
+                                     "micro_batch_size": micro_batch_size, "grad_accum_steps": grad_accum_steps}
+                                    if should_save else None),
                     best_save_path=str(Path(ckpt_path).with_suffix(".best.pt")) if improved else None,
+                    save_full=should_save,
+                    keep_previous=checkpoint_policy["checkpoint_keep_previous"],
+                    best_before_full=not checkpoint_policy["checkpoint_full_on_validation_improvement"],
                 )
-                checkpoint_saved = True
+                checkpoint_saved = should_save
         if _STOP_REQUESTED and checkpoint_saved:
             _wait_for_active_save()
             raise SystemExit(128 + _STOP_REQUESTED)
