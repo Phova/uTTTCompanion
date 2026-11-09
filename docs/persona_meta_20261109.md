@@ -55,6 +55,9 @@ The initial training budget is 512 steps, with latest resumable and best
 weights-only checkpoints. There is no `.prev` copy. Tensor-only steady storage
 is about 16.24 GB and atomic replacement can temporarily reach 26.14 GB;
 launch requires another 100 GB free on C after that peak. Old models are retained.
+The first launch rejected an SFT-only selection option before any optimizer
+step. The corrected preset selects token-weighted `validation_ce`; per-example
+CE is still reported. A regression now checks the actual published preset.
 
 Exact full W/S/LN persona state costs 424,693,760 bytes (405.02 MiB), plus
 106,168,320 bytes for optional BF16 read caches. Alias files share storage when

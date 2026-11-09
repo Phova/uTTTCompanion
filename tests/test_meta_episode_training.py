@@ -18,6 +18,17 @@ from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 
 
 class EpisodeMetaTests(unittest.TestCase):
+    def test_published_meta_configuration_passes_stage_and_selection_contracts(self):
+        path=Path(__file__).resolve().parents[1]/'configs/5090_persona_meta_20261109.yaml'
+        raw=yaml.safe_load(path.read_text(encoding='utf-8'))
+        settings=raw['training'];config=uTTTConfig.from_yaml(str(path))
+        stage=settings['stage']
+        scope=training.validate_parameter_scope(stage,settings['parameter_scope'])
+        self.assertEqual(training.validate_meta_objective(stage,settings['meta_objective'],scope,config,settings),
+                         training.EPISODE_META_PROTOCOL)
+        self.assertEqual(training.validate_validation_selection_metric(stage,settings['validation_selection_metric']),
+                         'validation_ce')
+
     @classmethod
     def setUpClass(cls):
         cls.threads = torch.get_num_threads()

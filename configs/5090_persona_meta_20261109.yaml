@@ -60,7 +60,7 @@ training:
   autocast_cache_across_accumulation: false
   pack_sequences: false
   validation_fraction: 0.0
-  validation_selection_metric: validation_example_ce
+  validation_selection_metric: validation_ce
   eval_interval: 64
   eval_samples: 32
   log_interval: 16
