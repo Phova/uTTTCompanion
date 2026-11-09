@@ -521,34 +521,12 @@ def main() -> None:
             print("\n[Client] Session closed. Goodbye!")
             return
         except Exception as exc:
-            try:
-                import torch as _  # noqa: F401
-                has_local_torch = True
-            except ImportError:
-                has_local_torch = False
-
-            if has_local_torch:
-                print(
-                    f"\n[Client] Could not reach WebSocket server at {args.ws_url} ({exc}).\n"
-                    "[Client] Falling back to in-process local Personalizer mode (--local)...\n"
-                )
-                run_local_session(
-                    user_id=args.user_id,
-                    config_path=args.config,
-                    base_ckpt=args.base_ckpt,
-                    personas_dir=args.personas_dir,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    lightweight=args.lightweight,
-                    demo_prompts=demo_script,
-                )
-            else:
-                print(
-                    f"\n[Client Error] Could not connect to WebSocket server at {args.ws_url} ({exc}).\n"
-                    "Please make sure the remote server & SSH tunnel are running in another terminal:\n"
-                    f"  ./deploy/remote_ctl.sh serve --user-id {args.user_id}\n"
-                )
-                sys.exit(1)
+            print(
+                f"\n[Client Error] WebSocket session failed at {args.ws_url} ({exc}).\n"
+                "Check that the remote service and SSH tunnel are running, then retry.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ python3 client_chat.py --user-id Phova \
   --max-new-tokens 256 --temperature 0.3
 ```
 
-客户端会发送生成长度和温度，故需要显式设置；否则其默认64 token/0.7会覆盖服务默认值。服务健康检查为：
+客户端会发送生成长度和温度，故需要显式设置；否则其默认64 token/0.7会覆盖服务默认值。连接失败会明确报错并退出，不会自动改用本地模型；只有显式指定`--local`才进入本地模式。服务健康检查为：
 
 ```bash
 curl http://localhost:8000/health
