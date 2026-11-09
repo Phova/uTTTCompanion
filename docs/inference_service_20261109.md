@@ -46,3 +46,5 @@ curl http://localhost:8000/health
 ```
 
 此连接方式使用WSL版`.sh`控制器；`.ps1`版本面向原生Windows远端。若本机8000端口已占用，可设置 `LOCAL_TUNNEL_PORT=8001`启动serve，并把客户端和health地址一起改成8001。
+
+本轮3000步训练未形成整体能力提升，故上述示例继续使用父corrected实验权重；具体得失见 [本轮结果](foundation_balanced_results_20261109.md)。HTTP或自写WebSocket客户端需显式传入history成对消息，服务不会只凭user-id自动聚合文字历史；上述CLI会自动维护近期上下文。
