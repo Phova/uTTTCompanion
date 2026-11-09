@@ -44,6 +44,10 @@ def _sanitize_id(raw_id: str) -> str:
     return cleaned
 
 
+class PersonaCompatibilityError(ValueError):
+    """An incompatible meta persona must be preserved for explicit recovery."""
+
+
 class DualTrackCheckpointManager:
     """
     Manages the single shared Base Model (Slow Weights + W_0 in GPU VRAM) and
@@ -302,6 +306,72 @@ class DualTrackCheckpointManager:
         if state is not None and decoder is not None and getattr(decoder, "fast_state", None) is state:
             self.model._cuda_graph_decoder = None
 
+    @property
+    def _requires_meta_persona_masters(self) -> bool:
+        metadata = getattr(self, "training_metadata", {})
+        return (metadata.get("training_stage") == "meta"
+                and metadata.get("inner_loop_protocol") == self.model.INNER_LOOP_PROTOCOL)
+
+    def _require_meta_persona_fingerprint(self, fingerprint) -> None:
+        if self._requires_meta_persona_masters and fingerprint != self.base_fingerprint:
+            raise PersonaCompatibilityError(
+                "Meta persona requires an explicit matching base_fingerprint; legacy signatures or "
+                "different checkpoint files cannot verify compatibility. Use /reset or a new persona directory."
+            )
+
+    def _require_meta_persona_precision(self, state: FastWeightState) -> None:
+        if not self._requires_meta_persona_masters:
+            return
+        names = ("w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")
+        invalid = [name for name in names if not isinstance(getattr(state, name, None), torch.Tensor)
+                   or getattr(state, name).dtype != torch.float32]
+        if invalid:
+            raise PersonaCompatibilityError(
+                "Meta persona requires FP32 W/S/LN masters; invalid tensor precision: "
+                + ", ".join(invalid) + ". Rounded state cannot be recovered by casting. "
+                "Use /reset or a new persona directory."
+            )
+
+    def _load_disk_persona(self, user_id: str, disk_path: Path):
+        """Validate on CPU before any cache eviction or persona publication."""
+        try:
+            payload = torch.load(disk_path, map_location="cpu", weights_only=False)
+            if payload.get("user_id", user_id) != user_id:
+                raise ValueError("Persona file belongs to another user")
+            saved_fingerprint = payload.get("base_fingerprint")
+            self._require_meta_persona_fingerprint(saved_fingerprint)
+            compatible = (saved_fingerprint == self.base_fingerprint if saved_fingerprint is not None
+                          else payload.get("base_signature") == self.base_signature)
+            if compatible:
+                state = FastWeightState.from_state_dict(payload.get("fast_state", payload))
+                self._require_meta_persona_precision(state)
+                if self._valid_state_shapes(state) and self._valid_state_values(state):
+                    return state, dict(payload.get("metadata", {}))
+            if self._requires_meta_persona_masters:
+                raise PersonaCompatibilityError(
+                    "Meta persona has invalid shapes or non-finite values. "
+                    "Use /reset or a new persona directory."
+                )
+            print(
+                f"[CheckpointManager] Persona '{user_id}' on disk was created under a "
+                "different or incompatible Base Checkpoint; auto-resetting to current Base W_0.",
+                flush=True,
+            )
+        except PersonaCompatibilityError:
+            # Never silently replace rounded/legacy meta memory with a cold state.
+            raise
+        except Exception as exc:
+            if self._requires_meta_persona_masters:
+                raise PersonaCompatibilityError(
+                    f"Could not validate meta persona '{user_id}' ({exc}); existing state was preserved. "
+                    "Use /reset or a new persona directory."
+                ) from exc
+            print(
+                f"[CheckpointManager] Could not load persona '{user_id}' from {disk_path} ({exc}); "
+                "re-initializing from Base W_0.", flush=True,
+            )
+        return None, None
+
     def get_user_state(self, user_id: str) -> FastWeightState:
         """
         Retrieve a user's `FastWeightState` on the active compute device (GPU VRAM):
@@ -314,8 +384,19 @@ class DualTrackCheckpointManager:
         with self._lock:
             # Tier 1: GPU VRAM Hit
             if safe_uid in self._gpu_lru:
+                self._require_meta_persona_precision(self._gpu_lru[safe_uid])
                 self._gpu_lru.move_to_end(safe_uid)
                 return self._gpu_lru[safe_uid]
+
+            # Reject incompatible memory before reserving a slot: rejection must
+            # not evict/save another user or alter LRU ordering and metadata.
+            loaded_state, loaded_metadata = None, None
+            if safe_uid in self._cpu_lru:
+                self._require_meta_persona_precision(self._cpu_lru[safe_uid])
+            else:
+                disk_path = self._find_existing_persona_file(safe_uid)
+                if disk_path is not None:
+                    loaded_state, loaded_metadata = self._load_disk_persona(safe_uid, disk_path)
 
             with self._reserve_gpu_slot(safe_uid) as cpu_state:
                 # Tier 2: CPU RAM Hit
@@ -324,53 +405,13 @@ class DualTrackCheckpointManager:
                     self._gpu_lru[safe_uid] = gpu_state
                     return gpu_state
 
-                # Tier 3: Disk Persona Checkpoint Hit
-                disk_path = self._find_existing_persona_file(safe_uid)
-                if disk_path is not None:
-                    loaded_state = None
-                    loaded_metadata = None
-                    try:
-                        payload = torch.load(disk_path, map_location="cpu", weights_only=False)
-                        if payload.get("user_id", safe_uid) != safe_uid:
-                            raise ValueError("Persona file belongs to another user")
-                        saved_sig = payload.get("base_signature")
-                        saved_fingerprint = payload.get("base_fingerprint")
-                        compatible = (
-                            saved_fingerprint == self.base_fingerprint
-                            if saved_fingerprint is not None
-                            else saved_sig == self.base_signature
-                        )
-                        if compatible:
-                            fast_dict = payload.get("fast_state", payload)
-                            # Validate CPU tensors before allocating any GPU memory
-                            # for a malformed or non-finite saved persona.
-                            loaded_state = FastWeightState.from_state_dict(fast_dict)
-                            if self._valid_state_shapes(loaded_state) and self._valid_state_values(loaded_state):
-                                loaded_metadata = dict(payload.get("metadata", {}))
-                            else:
-                                loaded_state = None
-                        if loaded_metadata is None:
-                            print(
-                                f"[CheckpointManager] Persona '{safe_uid}' on disk was created under a "
-                                "different or incompatible Base Checkpoint; "
-                                "auto-resetting to current Base W_0.",
-                                flush=True,
-                            )
-                    except Exception as exc:
-                        print(
-                            f"[CheckpointManager] Could not load persona '{safe_uid}' from {disk_path} ({exc}); "
-                            "re-initializing from Base W_0.",
-                            flush=True,
-                        )
-                        loaded_state = None
-                    if loaded_state is not None and loaded_metadata is not None:
-                        # Allocation/transfer failures do not make a valid disk
-                        # persona corrupt. Propagate them so a smaller fresh
-                        # state cannot silently replace an FP32 master persona.
-                        gpu_state = loaded_state.to(device=self.device)
-                        self._user_metadata[safe_uid] = loaded_metadata
-                        self._gpu_lru[safe_uid] = gpu_state
-                        return gpu_state
+                # Tier 3: validated disk hit. Transfer failures propagate; they
+                # cannot turn a valid FP32 persona into a cold replacement.
+                if loaded_state is not None:
+                    gpu_state = loaded_state.to(device=self.device)
+                    self._user_metadata[safe_uid] = loaded_metadata
+                    self._gpu_lru[safe_uid] = gpu_state
+                    return gpu_state
 
                 # Cold Start: Clone W_0 from SharedFastWeightPool
                 fresh_state = self.model.init_fast_state(
@@ -390,12 +431,7 @@ class DualTrackCheckpointManager:
     @property
     def persona_dtype(self) -> torch.dtype:
         """Match the meta-training master precision, independently of AMP reads."""
-        metadata = getattr(self, "training_metadata", {})
-        if (self.dtype in (torch.float16, torch.bfloat16)
-                and metadata.get("training_stage") == "meta"
-                and metadata.get("inner_loop_protocol") == self.model.INNER_LOOP_PROTOCOL):
-            return torch.float32
-        return self.dtype
+        return torch.float32 if self._requires_meta_persona_masters else self.dtype
 
     def update_user_state(
         self,
@@ -408,6 +444,7 @@ class DualTrackCheckpointManager:
         with self._lock:
             # Master W/S may be FP32 even when serving parameters are BF16.
             # Device moves and persistence must preserve those accumulated bits.
+            self._require_meta_persona_precision(new_state)
             if not self._valid_state_shapes(new_state) or not self._valid_state_values(new_state):
                 raise ValueError("Persona state must have valid shapes and finite weights, momentum and metrics")
             with self._reserve_gpu_slot(safe_uid):
@@ -496,6 +533,7 @@ class DualTrackCheckpointManager:
         """Internal atomic writer for `personas/{user_id}_state.pt` and `{user_id}.pt`."""
         safe_uid = _sanitize_id(user_id)
         primary_path, alias_path = self.get_persona_paths(safe_uid)
+        self._require_meta_persona_precision(state)
         if not self._valid_state_shapes(state) or not self._valid_state_values(state):
             raise ValueError("Cannot persist a persona with invalid shapes or non-finite values")
         drift_info = self.model.fast_weight_pool.compute_drift(state)
@@ -572,6 +610,7 @@ class DualTrackCheckpointManager:
         tag = _sanitize_id(snapshot_tag) if snapshot_tag else time.strftime("%Y%m%d_%H%M%S")
         with self._lock:
             state = self.get_user_state(safe_uid)
+            self._require_meta_persona_precision(state)
             drift_info = self.model.fast_weight_pool.compute_drift(state)
             user_snapshots = self.snapshots_dir / safe_uid
             user_snapshots.mkdir(parents=True, exist_ok=True)
@@ -617,11 +656,13 @@ class DualTrackCheckpointManager:
             payload = torch.load(snap_path, map_location="cpu", weights_only=False)
             if payload.get("user_id") != safe_uid or payload.get("snapshot_tag") != tag:
                 raise ValueError("Snapshot belongs to a different user or tag")
+            self._require_meta_persona_fingerprint(payload.get("base_fingerprint"))
             if payload.get("base_fingerprint") != self.base_fingerprint:
                 raise ValueError("Snapshot base checkpoint is different or cannot be verified")
             restored = FastWeightState.from_state_dict(
                 payload["fast_state"], device="cpu"
             )
+            self._require_meta_persona_precision(restored)
             if not self._valid_state_shapes(restored) or not self._valid_state_values(restored):
                 raise ValueError("Snapshot fast-weight shapes or finite values do not match the base model")
             self.update_user_state(safe_uid, restored, auto_save=True)

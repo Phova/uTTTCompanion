@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep a foreground WSL client alive until its owned tmux training pane exits."""
+"""Keep a foreground WSL client alive until its owned tmux workload exits."""
 import argparse
 import importlib
 import json
@@ -148,6 +148,28 @@ def validate_owned_session(record, workspace, session, *, identity=process_ident
         raise RuntimeError("tmux session pane layout changed; refusing stop")
 
 
+def is_server_command(command):
+    """Recognize a direct Python module invocation without inspecting shell text.
+
+    Only this exact module opts into the service process selector. Training and
+    legacy records keep the original training-only stop behavior; a wrapper or
+    Python program merely containing the module arguments cannot broaden it.
+    """
+    if not isinstance(command, (list, tuple)):
+        return False
+    module_index = next((index for index in range(1, len(command))
+                         if command[index - 1] == "-m" and command[index] == "server.app"), None)
+    if module_index is None:
+        return False
+    interpreter_flags = {"-u", "-B", "-E", "-I", "-s", "-S", "-q", "-v", "-b", "-bb"}
+    if (not isinstance(command[0], str)
+            or not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", Path(command[0]).name)
+            or any(not isinstance(argument, str) or argument not in interpreter_flags
+                   for argument in command[1:module_index - 1])):
+        raise RuntimeError("ambiguous service command; safe stop requires direct python -m server.app")
+    return True
+
+
 def stop_owned_session(workspace, session, timeout, *, identity=process_identity, tmux_call=tmux, runner=None):
     _, lock_path, record_path = owner_paths(workspace, session)
     if not record_path.exists():
@@ -166,7 +188,10 @@ def stop_owned_session(workspace, session, timeout, *, identity=process_identity
         runner = importlib.import_module(module_name).stop
     # Keep the already verified pane as the root. Re-discovering by session
     # name here could select a replacement session created after validation.
-    runner([record["pane"]["pid"]], workspace, timeout)
+    if is_server_command(record.get("command")):
+        runner([record["pane"]["pid"]], workspace, timeout, scripts={"server.app"})
+    else:
+        runner([record["pane"]["pid"]], workspace, timeout)
 
 
 def run_owner(workspace, session, working_directory, log_path, command, timeout=300):

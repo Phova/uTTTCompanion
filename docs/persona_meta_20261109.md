@@ -110,3 +110,35 @@ explicitly opts in; `--no-cuda-graph` selects the standard path.
 Direct training launch must set `PYTORCH_ALLOC_CONF=expandable_segments:True`
 before importing Torch, as specified by the hardware preset. The trainer
 rejects a missing or mismatched allocator setting before any optimizer update.
+
+## Runtime integrity and content diagnostics
+
+Compatible meta personas require all eight W/S/LN tensors in FP32 and an
+explicit matching checkpoint-file fingerprint. Rounded, corrupt, legacy or
+different-base meta files now raise an error before cache eviction or writing;
+the original file remains available. `/reset` explicitly starts fresh. Language
+checkpoint legacy loading retains its earlier behavior. Full and best files
+have different fingerprints even when their model tensors happen to match;
+use one fixed serving file and a separate persona directory.
+
+The current CPU suite passes 647 tests, including actual tiny-model HTTP writes,
+independent next-turn input, two-user isolation, exact save/snapshot/reset/restore,
+fresh-manager reload and unchanged base parameters. Twenty-three CUDA checks
+are skipped in that CPU run; separate CUDA precision/graph checks were run above.
+
+`deploy/diagnose_persona_recall.py` compares padded support writes with real short
+messages, full teacher-forced logits with cached decoding fed identical gold
+tokens, and payload NLL against a same-query counterfactual memory. EOS, READY
+and whitespace losses are reported separately. Four direct copy examples contain
+the answer in the current question and are explicitly excluded from memory scores.
+
+Paired recall requires both distinct answers to be correct; merely changing a
+reply is insufficient. `--persistence-samples 2` limits large real disk roundtrips
+while retaining all selected rows for content controls; untested reloads are
+omitted and never counted as successes. Use `--temp-dir /mnt/c/uTTT-artifacts/tmp`
+to preserve the D volume reserve.
+
+The independent Windows/WSL owner can safely stop a directly launched
+`python -m server.app` using the verified service process selector. Shell/env
+wrappers are refused for this service stop mode; training stop behavior is
+unchanged. This lets the service remain alive after the SSH launch session ends.

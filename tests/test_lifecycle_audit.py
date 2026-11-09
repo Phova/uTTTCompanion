@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import torch
 
-from engine.checkpoint_manager import DualTrackCheckpointManager
+from engine.checkpoint_manager import DualTrackCheckpointManager, PersonaCompatibilityError
 from engine.personalizer import uTTTPersonalizer
 from model.uttt_model import uTTTConfig, uTTTModel
 import server.app as service
@@ -106,7 +106,13 @@ class LifecycleAuditTests(unittest.TestCase):
         payload["fast_state"]["w_down"].fill_(float("nan"))
         payload["fast_state"]["step"] = 17
         torch.save(payload, path)
-        restored = self.manager().get_user_state("alice")
+        corrupted_bytes = path.read_bytes()
+        recovery = self.manager()
+        with self.assertRaisesRegex(PersonaCompatibilityError, "non-finite"):
+            recovery.get_user_state("alice")
+        self.assertEqual(path.read_bytes(), corrupted_bytes)
+        self.assertNotIn("alice", recovery._gpu_lru)
+        restored = recovery.reset_user_state("alice")
         self.assertEqual(restored.step, 0)
         self.assertTrue(torch.isfinite(restored.w_down).all().item())
 

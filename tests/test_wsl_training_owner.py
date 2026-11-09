@@ -130,20 +130,62 @@ class OwnerTests(unittest.TestCase):
         self.assertIn("tmux wait-for ack", wrapper)
         self.assertNotIn("sleep", wrapper)
 
-    def record(self):
-        return {"workspace": str(self.root), "session": "uttt_train", "session_id": "$3", "pane_id": "%4",
-                "token": "token", "owner": self.identities[os.getpid()], "pane": self.identities[42]}
+    def record(self, session="uttt_train", command=None):
+        return {"workspace": str(self.root), "session": session, "session_id": "$3", "pane_id": "%4",
+                "token": "token", "owner": self.identities[os.getpid()], "pane": self.identities[42],
+                "command": command if command is not None else ["/usr/bin/python3", "-u", "train_5090.py"]}
 
     def test_safe_stop_delegates_only_after_identity_token_pane_and_lock_checks(self):
         _, lock_path, record_path = owner.owner_paths(self.root, "uttt_train")
         owner.atomic_json(record_path, self.record())
         with mock.patch.object(owner, "OwnerLock", side_effect=owner.OwnerBusyError("busy")):
-            calls = []
+            runner = mock.Mock()
             owner.stop_owned_session(self.root, "uttt_train", 300, identity=self.identities.get,
-                                     tmux_call=self.fake_tmux, runner=lambda *args, **kwargs: calls.append(args))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0], ([42], self.root, 300))
+                                     tmux_call=self.fake_tmux, runner=runner)
+        runner.assert_called_once_with([42], self.root, 300)
         self.assertIn(("list-panes", "-t", "$3:", "-F", "#{pane_pid}"), self.calls)
+
+    def test_owned_service_uses_only_service_selector_under_verified_pane(self):
+        for command in (["/root/uTTT/.venv/bin/python", "-u", "-m", "server.app", "--enable-ttt"],
+                        ["/usr/bin/python3.12", "-m", "server.app"]):
+            with self.subTest(command=command):
+                _, _, record_path = owner.owner_paths(self.root, "uttt_serve")
+                owner.atomic_json(record_path, self.record("uttt_serve", command))
+                runner = mock.Mock()
+                with mock.patch.object(owner, "OwnerLock", side_effect=owner.OwnerBusyError("busy")):
+                    owner.stop_owned_session(self.root, "uttt_serve", 30, identity=self.identities.get,
+                                             tmux_call=self.fake_tmux, runner=runner)
+                runner.assert_called_once_with([42], self.root, 30, scripts={"server.app"})
+                self.assertFalse(any(args[0] in ("kill-pane", "kill-session") for args in self.calls))
+
+    def test_service_selector_still_refuses_stale_owner_or_pane_before_delegating(self):
+        original = self.record("uttt_serve", ["/usr/bin/python3", "-m", "server.app"])
+        _, _, record_path = owner.owner_paths(self.root, "uttt_serve")
+        for field in ("owner", "pane"):
+            changed = copy.deepcopy(original)
+            changed[field]["start_time"] += 1
+            owner.atomic_json(record_path, changed)
+            runner = mock.Mock()
+            with self.subTest(field=field), mock.patch.object(owner, "OwnerLock") as lock:
+                with self.assertRaisesRegex(RuntimeError, "stale|changed"):
+                    owner.stop_owned_session(self.root, "uttt_serve", 30, identity=self.identities.get,
+                                             tmux_call=self.fake_tmux, runner=runner)
+                runner.assert_not_called()
+                lock.assert_not_called()
+
+    def test_service_looking_wrappers_cannot_broaden_process_selection(self):
+        for command in (["/bin/bash", "-m", "server.app"],
+                        ["/usr/bin/python3", "-c", "print('unused')", "-m", "server.app"],
+                        ["/usr/bin/python3", "train_5090.py", "-m", "server.app"]):
+            with self.subTest(command=command):
+                _, _, record_path = owner.owner_paths(self.root, "uttt_serve")
+                owner.atomic_json(record_path, self.record("uttt_serve", command))
+                runner = mock.Mock()
+                with mock.patch.object(owner, "OwnerLock", side_effect=owner.OwnerBusyError("busy")):
+                    with self.assertRaisesRegex(RuntimeError, "ambiguous service command"):
+                        owner.stop_owned_session(self.root, "uttt_serve", 30, identity=self.identities.get,
+                                                 tmux_call=self.fake_tmux, runner=runner)
+                runner.assert_not_called()
 
     def test_stop_refuses_pid_reuse_token_change_or_workspace_mismatch(self):
         original = self.record()

@@ -125,7 +125,7 @@ def balanced_indices(rows, maximum):
     return chosen
 
 
-def evaluate_episode(adapter, row, other):
+def evaluate_episode(adapter, row, other, *, check_persistence=True):
     """Adapter reads receive exactly query_text and a cloned tensor-only state."""
     base = adapter.base_state()
     untouched_user = adapter.clone(base)
@@ -145,12 +145,16 @@ def evaluate_episode(adapter, row, other):
     for text in support_texts(other):
         wrong = adapter.write(wrong, text)
     other_after = adapter.read(adapter.clone(untouched_user), other["query_text"])
-    reloaded = adapter.save_reload(adapter.clone(written))
+    reloaded = adapter.save_reload(adapter.clone(written)) if check_persistence else None
     states = {"base_w0": base, "no_write": no_write, "mismatched_state": wrong,
-              "correct_write": written, "save_reload": reloaded}
+              "correct_write": written}
+    if check_persistence:
+        states["save_reload"] = reloaded
     outcomes = {}
     replies = {}
     for name in ARMS:
+        if name not in states:
+            continue
         reply = adapter.read(adapter.clone(states[name]), row["query_text"]).strip()
         replies[name] = reply
         outcomes[name] = {"exact_match": reply == row["answer"],
@@ -166,14 +170,36 @@ def evaluate_episode(adapter, row, other):
             "no_write_state_unchanged": adapter.equal(base, no_write),
             "other_user_state_unchanged": adapter.equal(base, untouched_user),
             "other_user_reply_unchanged": other_before == other_after,
-            "save_reload_state_exact": adapter.equal(written, reloaded),
-            "save_reload_reply_exact": replies["correct_write"] == replies["save_reload"],
+            "save_reload_state_exact": adapter.equal(written, reloaded) if check_persistence else None,
+            "save_reload_reply_exact": replies["correct_write"] == replies["save_reload"] if check_persistence else None,
             "correction": correction}
 
 
-def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
+def counterfactual_pair_metrics(results):
+    """Count each family/query pair once, requiring both distinct targets."""
+    pairs = {}
+    for row in results:
+        control = row.get("counterfactual_control")
+        if control is None:
+            continue
+        pair = pairs.setdefault(control["pair_id"], {"members": defaultdict(list), "original_answer_leaked": False})
+        pair["members"][row["expected"]].append(row["arms"]["correct_write"]["exact_match"])
+        pair["members"][control["expected_counterfactual"]].append(control["counterfactual_exact"])
+        pair["original_answer_leaked"] |= control["original_answer_leaked"]
+    count = len(pairs)
+    both_exact = sum(len(pair["members"]) == 2 and all(all(observed) for observed in pair["members"].values())
+                     for pair in pairs.values())
+    return {"unique_pairs": count, "both_members_exact_pairs": both_exact,
+            "both_members_exact_accuracy": both_exact / count if count else 0.0,
+            "original_answer_leak_pairs": sum(pair["original_answer_leaked"] for pair in pairs.values()),
+            "pair_metric_scope": "One count per family/query hash; both distinct answers must be exact. Repeated member observations must all pass; a changed reply alone is insufficient."}
+
+
+def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None, persistence_samples=None):
     if len(rows) < 2:
         raise ValueError("At least two independent users are required")
+    if persistence_samples is not None and (type(persistence_samples) is not int or persistence_samples < 0):
+        raise ValueError("persistence_samples must be a nonnegative integer or None")
     results = []
     for index in balanced_indices(rows, max_samples):
         row = rows[index]
@@ -183,7 +209,8 @@ def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
         same_group = [other for other in candidates if (other["memory_task"]["task"], other["memory_task"]["language"])
                       == (row["memory_task"]["task"], row["memory_task"]["language"])]
         other = (same_group or candidates)[0]
-        results.append(evaluate_episode(adapter, row, other))
+        check_persistence = persistence_samples is None or len(results) < persistence_samples
+        results.append(evaluate_episode(adapter, row, other, check_persistence=check_persistence))
         paired = [candidate for candidate in rows if candidate["memory_task"]["entity"] == row["memory_task"]["entity"]
                   and candidate["answer"] != row["answer"] and candidate["query_text"] == row["query_text"]]
         if paired:
@@ -191,7 +218,11 @@ def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
             for text in support_texts(paired[0]):
                 state = adapter.write(state, text)
             reply = adapter.read(adapter.clone(state), row["query_text"]).strip()
+            pair_family = row.get("family") or row["memory_task"].get("counterfactual_pair") or "entity:" + row["memory_task"]["entity"]
+            pair_id = hashlib.sha256(json.dumps([pair_family, results[-1]["query_sha256"]],
+                                               ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
             results[-1]["counterfactual_control"] = {
+                "pair_id": pair_id,
                 "same_query": True, "reply": reply, "expected_counterfactual": paired[0]["answer"],
                 "counterfactual_exact": reply == paired[0]["answer"],
                 "original_answer_leaked": reply == row["answer"],
@@ -201,30 +232,40 @@ def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
                       "correct_write": results[-1]["arms"]["correct_write"]["exact_match"]})
     def aggregate(items):
         count = len(items)
-        arms = {arm: {"passes": sum(row["arms"][arm]["exact_match"] for row in items), "total": count,
-                      "accuracy": sum(row["arms"][arm]["exact_match"] for row in items) / count}
-                for arm in ARMS}
+        arms = {}
+        for arm in ARMS:
+            tested = [row["arms"][arm] for row in items if arm in row["arms"]]
+            passes = sum(result["exact_match"] for result in tested)
+            arms[arm] = {"passes": passes, "total": len(tested), "accuracy": passes / len(tested) if tested else None}
         return {"episodes": count, "arms": arms,
                 "write_minus_no_write_accuracy": arms["correct_write"]["accuracy"] - arms["no_write"]["accuracy"],
                 "write_minus_mismatch_accuracy": arms["correct_write"]["accuracy"] - arms["mismatched_state"]["accuracy"],
                 "state_changed_episodes": sum(row["correct_state_changed"] for row in items),
                 "isolation_failures": sum(not row["other_user_state_unchanged"] or not row["other_user_reply_unchanged"] for row in items),
-                "persistence_failures": sum(not row["save_reload_state_exact"] or not row["save_reload_reply_exact"] for row in items),
+                "persistence_checks": sum(row["save_reload_state_exact"] is not None for row in items),
+                "persistence_failures": sum(row["save_reload_state_exact"] is False or row["save_reload_reply_exact"] is False for row in items),
                 "no_write_state_failures": sum(not row["no_write_state_unchanged"] for row in items)}
     groups = {field: {value: aggregate([row for row in results if row[field] == value])
                       for value in sorted({row[field] for row in results})} for field in ("task", "language")}
     counterfactual = [row["counterfactual_control"] for row in results if "counterfactual_control" in row]
-    return {"protocol": "persona_query_only_free_generation_v1", "free_generation_accuracy_measured": True,
+    pair_metrics = counterfactual_pair_metrics(results) if counterfactual else {}
+    report = {"protocol": "persona_query_only_free_generation_v1", "free_generation_accuracy_measured": True,
             "teacher_forcing_used": False, "support_text_or_kv_carried_to_query": False,
             "summary": aggregate(results), "groups": groups, "results": results,
             "counterfactual_controls": {"total": len(counterfactual),
                 "counterfactual_exact": sum(row["counterfactual_exact"] for row in counterfactual),
                 "reply_changes_with_memory": sum(row["reply_changes_with_memory"] for row in counterfactual),
-                "original_answer_leaked": sum(row["original_answer_leaked"] for row in counterfactual)},
+                "original_answer_leaked": sum(row["original_answer_leaked"] for row in counterfactual),
+                **pair_metrics},
             "notes": ["Every read is query-only, starts at position zero and uses an independently cloned fast-weight/momentum state.",
                       "State changes or low surprise alone do not demonstrate useful memory; compare exact recall against both no-write and mismatch.",
                       "Isolation checks independent persona states and persistence, not concurrent HTTP session routing.",
                       "Reply-prefix exercises are narrow verifiable personalization, not a natural-conversation quality score."]}
+    if persistence_samples is not None:
+        report["persistence_sampling"] = {"requested": persistence_samples,
+                                          "tested": report["summary"]["persistence_checks"],
+                                          "selection": "First N episodes in the existing balanced sample order; untested checks are null and excluded from persistence scoring."}
+    return report
 
 
 class ModelAdapter:
@@ -348,7 +389,8 @@ def evaluate_production_turns(manager, rows, *, maximum=2, max_new_tokens=32):
 
 
 def evaluate(checkpoint, data_path, output, *, split="test", max_samples=64, max_new_tokens=32,
-             device=None, apply_guards=False, allow_untrained_baseline=False, production_turns=0, temp_dir=None):
+             device=None, apply_guards=False, allow_untrained_baseline=False, production_turns=0, temp_dir=None,
+             persistence_samples=None):
     import torch
     from engine.checkpoint_manager import DualTrackCheckpointManager
     from model.uttt_model import uTTTModel
@@ -361,6 +403,8 @@ def evaluate(checkpoint, data_path, output, *, split="test", max_samples=64, max
         raise ValueError("max_new_tokens must be positive")
     if type(production_turns) is not int or not 0 <= production_turns <= 8:
         raise ValueError("production_turns must be between 0 and 8")
+    if persistence_samples is not None and (type(persistence_samples) is not int or persistence_samples < 0):
+        raise ValueError("persistence_samples must be a nonnegative integer or None")
     identity = file_hash(checkpoint)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type not in ("cpu", "cuda"):
@@ -398,6 +442,7 @@ def evaluate(checkpoint, data_path, output, *, split="test", max_samples=64, max
         versions = {name: value._version for name, value in manager.model.named_parameters()}
         adapter = ModelAdapter(manager, max_new_tokens=max_new_tokens, apply_guards=apply_guards)
         report = evaluate_with_adapter(rows, adapter, max_samples=max_samples,
+                                       persistence_samples=persistence_samples,
                                        progress=lambda row: print("PERSONA_EVAL " + json.dumps(row), flush=True))
         if production_turns:
             report["production_turns"] = evaluate_production_turns(
@@ -434,12 +479,14 @@ def main():
     parser.add_argument("--apply-guards", action="store_true")
     parser.add_argument("--allow-untrained-baseline", action="store_true")
     parser.add_argument("--production-turns", type=int, default=0)
+    parser.add_argument("--persistence-samples", type=int,
+                        help="At most N real save/evict/reload checks; omitted tests every sampled row, 0 skips persistence")
     parser.add_argument("--temp-dir", type=Path, help="Scratch volume for temporary exact persona states")
     args = parser.parse_args()
     report = evaluate(args.checkpoint, args.data_path, args.output, split=args.split, max_samples=args.max_samples,
                       max_new_tokens=args.max_new_tokens, device=args.device, apply_guards=args.apply_guards,
                       allow_untrained_baseline=args.allow_untrained_baseline, production_turns=args.production_turns,
-                      temp_dir=args.temp_dir)
+                      temp_dir=args.temp_dir, persistence_samples=args.persistence_samples)
     print(json.dumps(report["summary"], sort_keys=True))
 
 
