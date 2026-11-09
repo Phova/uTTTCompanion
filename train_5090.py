@@ -45,7 +45,7 @@ import model.uttt_layer as uttt_layer_mod
 from model.uttt_model import SimpleUTF8Tokenizer, uTTTConfig, uTTTModel
 from model.tokenizer import build_tokenizer
 from engine.corpus import ResumableBatchSampler, TokenizedCorpusDataset, read_manifest
-from engine.prompting import encode_chat_prompt
+from engine.prompting import encode_chat_prompt, format_chat_prompt, validate_chat_history
 from engine.sft_execution import (validate_sft_execution, materialize_sft_execution_step,
                                   supervised_token_indices, validate_sft_compute_option)
 from deploy.training_diagnostics import repetition_metrics
@@ -96,6 +96,132 @@ def validate_sft_validation_group_key(mode, key):
     if key is not None and (mode != "sft" or not isinstance(key, str) or not key.strip()):
         raise ValueError("validation_group_key requires stage=sft and a nonempty string field name")
     return key
+
+
+EPISODE_META_PROTOCOL = "episode_support_query_v1"
+MAX_EPISODE_WRITES = 10
+
+
+class EpisodeMetaDataset(Dataset):
+    """Explicitly split episodes; no packing, random crops or silent truncation."""
+    def __init__(self, tokenizer, seq_len, data_path, split="train"):
+        if type(seq_len) is not int or seq_len < 5:
+            raise ValueError("Episode seq_len must be at least 5")
+        if split not in {"train", "dev", "test", "all"} or not data_path:
+            raise ValueError("Episodes require a JSONL file and an explicit train/dev/test/all split")
+        self.tokenizer, self.seq_len, self.split = tokenizer, seq_len, split
+        raw = Path(data_path).read_bytes()
+        backend = getattr(tokenizer, "backend", None)
+        tokenizer_identity = (backend.to_str() if backend is not None else json.dumps({
+            "class": type(tokenizer).__module__ + "." + type(tokenizer).__qualname__,
+            "vocab_size": tokenizer.vocab_size,
+        }, sort_keys=True))
+        self.tokenizer_sha256 = hashlib.sha256(tokenizer_identity.encode("utf-8")).hexdigest()
+        binding = {"protocol": EPISODE_META_PROTOCOL, "seq_len": seq_len, "split": split,
+                   "max_writes": MAX_EPISODE_WRITES, "tokenizer_sha256": self.tokenizer_sha256,
+                   "file_sha256": hashlib.sha256(raw).hexdigest()}
+        self.fingerprint = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+        self.rows, self.encoded = [], []
+        groups = {}
+        for line in raw.decode("utf-8").split("\n"):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            metadata = row.get("memory_task") if isinstance(row, dict) else None
+            if not isinstance(metadata, dict):
+                raise ValueError("Every episode requires memory_task metadata")
+            partition = metadata.get("split")
+            group = row.get("validation_group_id", metadata.get("validation_group_id"))
+            if partition not in {"train", "dev", "test"} or not isinstance(group, str) or not group.strip():
+                raise ValueError("Every episode requires memory_task.split and a nonblank validation_group_id")
+            if group in groups and groups[group] != partition:
+                raise ValueError("An episode validation group occurs in multiple explicit splits")
+            groups[group] = partition
+            encoded = self.encode_row(tokenizer, row, seq_len)
+            if split == "all" or partition == split:
+                self.rows.append(row)
+                self.encoded.append(encoded)
+        if not self.rows:
+            raise ValueError(f"Episode split {split} is empty: {data_path}")
+
+    @staticmethod
+    def encode_row(tokenizer, row, seq_len):
+        if not isinstance(row, dict) or type(seq_len) is not int or seq_len < 5:
+            raise ValueError("Invalid episode row or sequence budget")
+        writes = [row.get("write_text")]
+        if row.get("correction_text") is not None:
+            writes.append(row["correction_text"])
+        interference = row.get("interference_texts", [])
+        if not isinstance(interference, list):
+            raise ValueError("interference_texts must be a list of complete support turns")
+        writes.extend(interference)
+        if len(writes) > MAX_EPISODE_WRITES:
+            raise ValueError("Episode has too many support writes")
+
+        def pad(ids, labels=None):
+            if len(ids) > seq_len:
+                raise ValueError("Episode exceeds its sequence budget; cropping is forbidden")
+            missing = seq_len - len(ids)
+            result = {"input_ids": torch.tensor(ids + [tokenizer.PAD_ID] * missing, dtype=torch.long),
+                      "attention_mask": torch.tensor([1.0] * len(ids) + [0.0] * missing)}
+            if labels is not None:
+                result["labels"] = torch.tensor(labels + [-100] * missing, dtype=torch.long)
+            return result
+
+        support = []
+        for text in writes:
+            if not isinstance(text, str) or not text.startswith("<|user|> ") or not text.rstrip().endswith("<|eos|>"):
+                raise ValueError("Support writes must be complete user/assistant turns ending in a real EOS")
+            ids = tokenizer.encode(text.strip(), add_bos=True, add_eos=False)
+            if (ids.count(tokenizer.USER_ID) != 1 or ids.count(tokenizer.ASSISTANT_ID) != 1
+                    or ids.count(tokenizer.BOS_ID) != 1 or ids.count(tokenizer.EOS_ID) != 1
+                    or ids[-1] != tokenizer.EOS_ID or ids.index(tokenizer.USER_ID) >= ids.index(tokenizer.ASSISTANT_ID)):
+                raise ValueError("Each support write must contain exactly one complete user/assistant pair")
+            support.append(pad(ids))
+        query, answer = row.get("query_text"), row.get("answer")
+        clean = validate_chat_history([{"role": "user", "content": query}, {"role": "assistant", "content": answer}])
+        text = format_chat_prompt(clean[0]["content"]) + " " + clean[1]["content"] + "<|eos|>"
+        ids = tokenizer.encode(text, add_bos=True, add_eos=False)
+        assistant = ids.index(tokenizer.ASSISTANT_ID)
+        if ids[-1] != tokenizer.EOS_ID or len(ids) - assistant < 3:
+            raise ValueError("Episode query must supervise answer content and a real EOS")
+        query_batch = pad(ids, [-100] * (assistant + 1) + ids[assistant + 1:])
+        return {**query_batch, "write_input_ids": torch.stack([value["input_ids"] for value in support]),
+                "write_attention_mask": torch.stack([value["attention_mask"] for value in support])}
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return {name: value.clone() for name, value in self.encoded[index].items()}
+
+
+def episode_forward(model, batch, *, apply_writes=True):
+    """Independent support writes then query-only read; CE trains the write chain."""
+    if batch["input_ids"].ndim != 2 or batch["input_ids"].shape[0] != 1:
+        raise ValueError("Episode meta training currently requires micro_batch_size=1")
+    if model.config.meta_checkpoint_reentrant:
+        raise ValueError("Episode meta requires non-reentrant checkpointing for frozen support inputs")
+    state, losses = None, []
+    if apply_writes:
+        for index in range(batch["write_input_ids"].shape[1]):
+            written = model(batch["write_input_ids"][:, index], fast_state=state,
+                            attention_mask=batch["write_attention_mask"][:, index], update_fast_weights=True,
+                            surprise_aux_weight=0.0, logits_to_keep=-1, return_fast_state=True,
+                            detach_returned_fast_state=False)
+            source = written.fast_state
+            # Only recurrent weights/momentum/LN cross the boundary, never the
+            # support text, attention KV cache or a detached write cursor.
+            state = uttt_layer_mod.FastWeightState(**{name: getattr(source, name) for name in (
+                "w_up", "w_gate", "w_down", "s_up", "s_gate", "s_down", "ln_weight", "ln_bias")},
+                step=source.step)
+            losses.append(written.surprise_loss)
+            del written
+    result = model(batch["input_ids"], fast_state=state, labels=batch["labels"],
+                   attention_mask=batch["attention_mask"], update_fast_weights=False,
+                   surprise_aux_weight=0.0, return_fast_state=False)
+    result.surprise_loss = torch.stack(losses).mean() if losses else result.ce_loss.new_zeros(())
+    return result
 
 
 class PersonaMetaDataset(Dataset):
@@ -1026,15 +1152,17 @@ def evaluate_language_model(model, dataset, device, dtype, update_fast_weights=F
                 if not count:
                     continue
                 inputs = {name: value.unsqueeze(0).to(device) for name, value in batch.items()}
-                result = model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0,
-                               return_fast_state=False, fast_state=None if update_fast_weights else frozen_state)
+                result = (episode_forward(model, inputs) if isinstance(dataset, EpisodeMetaDataset) else
+                          model(**inputs, update_fast_weights=update_fast_weights, surprise_aux_weight=0.0,
+                                return_fast_state=False, fast_state=None if update_fast_weights else frozen_state))
                 example_ce = float(result.ce_loss)
                 nll += example_ce * count
                 example_nll += example_ce
                 examples += 1
                 if update_fast_weights:
-                    frozen = model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0,
-                                   return_fast_state=False, fast_state=frozen_state)
+                    frozen = (episode_forward(model, inputs, apply_writes=False) if isinstance(dataset, EpisodeMetaDataset) else
+                              model(**inputs, update_fast_weights=False, surprise_aux_weight=0.0,
+                                    return_fast_state=False, fast_state=frozen_state))
                     frozen_nll += float(frozen.ce_loss) * count
                 else:
                     frozen_nll += example_ce * count
@@ -1143,10 +1271,10 @@ def restore_training_rng(state):
 
 def validate_parameter_scope(stage, scope):
     """A frozen language backbone is an explicit meta-training configuration."""
-    if scope not in ("all", "memory"):
-        raise ValueError("training.parameter_scope must be all or memory")
-    if scope == "memory" and stage != "meta":
-        raise ValueError("training.parameter_scope=memory is supported only for stage=meta")
+    if scope not in ("all", "memory", "writer"):
+        raise ValueError("training.parameter_scope must be all, memory or writer")
+    if scope in {"memory", "writer"} and stage != "meta":
+        raise ValueError(f"training.parameter_scope={scope} is supported only for stage=meta")
     return scope
 
 
@@ -1160,13 +1288,37 @@ def apply_training_parameter_scope(model, stage, scope):
     validate_parameter_scope(stage, scope)
     total, trainable = 0, 0
     for name, parameter in model.named_parameters():
-        enabled = scope == "all" or name.startswith("fast_weight_pool.") or ".uttt." in name
+        enabled = (scope == "all" or (scope == "memory" and (
+            name.startswith("fast_weight_pool.") or ".uttt." in name)) or (scope == "writer" and any(
+                f".uttt.{part}." in name for part in ("w_k", "w_v", "w_eta", "w_alpha"))))
         parameter.requires_grad_(enabled)
         total += parameter.numel()
         trainable += parameter.numel() if enabled else 0
     if not trainable:
         raise ValueError("Training parameter scope is empty")
     return {"total": total, "trainable": trainable, "frozen": total - trainable}
+
+
+def validate_meta_objective(stage, objective, scope, config, settings):
+    if objective not in {"chunk_lm_v1", EPISODE_META_PROTOCOL}:
+        raise ValueError("Unknown training.meta_objective")
+    if objective == EPISODE_META_PROTOCOL:
+        if stage != "meta" or scope != "writer":
+            raise ValueError("Episode meta requires stage=meta and parameter_scope=writer")
+        if config.meta_checkpoint_reentrant:
+            raise ValueError("Episode meta requires non-reentrant checkpointing")
+        if settings.get("pack_sequences", False) or settings.get("validation_fraction", 0):
+            raise ValueError("Episodes require explicit splits, no packing or hash validation split")
+        if float(settings.get("surprise_aux_loss_weight", 0.0)) != 0.0:
+            raise ValueError("Episode query CE is the objective; surprise auxiliary loss must be zero")
+    elif scope == "writer":
+        raise ValueError("Writer-only scope requires the episode support/query objective")
+    return objective
+
+
+def validate_resume_meta_objective(metadata, objective):
+    if metadata.get("meta_objective", "chunk_lm_v1") != objective:
+        raise ValueError("Resume checkpoint uses a different meta_objective; use a new output and --init-from")
 
 
 def validate_resume_parameter_scope(metadata, scope):
@@ -1278,6 +1430,10 @@ def train(
     )
     validation_group_key = validate_sft_validation_group_key(training_stage, train_cfg.get("validation_group_key"))
     parameter_scope = validate_parameter_scope(training_stage, train_cfg.get("parameter_scope", "all"))
+    meta_objective = validate_meta_objective(
+        training_stage, train_cfg.get("meta_objective", "chunk_lm_v1"), parameter_scope, model_cfg, train_cfg,
+    )
+    episodic = meta_objective == EPISODE_META_PROTOCOL
     update_fast_weights = training_stage == "meta"
     sft_loss_only_head = validate_sft_compute_option(
         "sft_loss_only_head", train_cfg.get("sft_loss_only_head", False),
@@ -1339,6 +1495,8 @@ def train(
 
     requested_steps = override_steps or int(train_cfg.get("max_steps", 2000))
     requested_micro = override_batch_size or (1 if large_preset else int(train_cfg.get("micro_batch_size", 4)))
+    if episodic and requested_micro != 1:
+        raise ValueError("Episode meta currently requires micro_batch_size=1")
     requested_accum = int(train_cfg.get("large_grad_accum_steps", 32) if large_preset else train_cfg.get("grad_accum_steps", 8))
     requested_seq_len = override_seq_len or int(train_cfg.get("seq_len", 1024))
     lr_schedule = training_lr_schedule(
@@ -1430,6 +1588,8 @@ def train(
     grad_accum_steps = int(train_cfg.get("large_grad_accum_steps", 32) if large_preset else train_cfg.get("grad_accum_steps", 8))
     seq_len = override_seq_len or int(train_cfg.get("seq_len", 1024))
     max_steps = override_steps or int(train_cfg.get("max_steps", 2000))
+    if episodic and micro_batch_size != 1:
+        raise ValueError("Episode meta currently requires micro_batch_size=1")
     if min(micro_batch_size, grad_accum_steps, max_steps) < 1 or seq_len < 2:
         raise ValueError("Batch size, accumulation and steps must be positive; sequence length must be at least 2")
     warmup_steps = lr_schedule["warmup_steps"]
@@ -1444,7 +1604,11 @@ def train(
     tokenizer = build_tokenizer(model_cfg)
     pack_sequences = bool(train_cfg.get("pack_sequences", True))
     validation_dataset = None
-    if corpus_manifest:
+    if episodic:
+        dataset = EpisodeMetaDataset(tokenizer, seq_len, data_path, split="train")
+        validation_dataset = EpisodeMetaDataset(tokenizer, seq_len, data_path, split="dev")
+        print(f"[Episodes] Explicit train={len(dataset):,}, dev={len(validation_dataset):,}; no support/query text or KV sharing.", flush=True)
+    elif corpus_manifest:
         dataset = TokenizedCorpusDataset(data_path, seq_len=seq_len, split="train")
         validation_dataset = TokenizedCorpusDataset(data_path, seq_len=seq_len, split="validation")
         print(f"[Corpus] Memory-mapped train={dataset.token_count:,}, validation={validation_dataset.token_count:,} tokens; no text corpus loaded into RAM.", flush=True)
@@ -1509,6 +1673,7 @@ def train(
         if saved is not None:
             metadata = saved.get("metrics", {})
             validate_resume_parameter_scope(metadata, parameter_scope)
+            validate_resume_meta_objective(metadata, meta_objective)
             validate_resume_sft_padding(metadata, trim_sft_padding)
             best_validation_score = validate_resume_validation_selection(metadata, validation_selection_metric)
             if continue_from is None:
@@ -1693,6 +1858,8 @@ def train(
                                 data_iter = iter(loader)
                                 batch = next(data_iter)
                             step_tokens += int(batch["attention_mask"].sum())
+                            if episodic:
+                                step_tokens += int(batch["write_attention_mask"].sum())
                         elif device.type == "cuda":
                             batch = {name: tensor.pin_memory() for name, tensor in batch.items()}
 
@@ -1706,7 +1873,11 @@ def train(
 
                         # Native BF16 mixed precision forward + analytical inner-loop TTT update
                         with torch.amp.autocast(autocast_device_type, dtype=amp_dtype, enabled=amp_dtype != torch.float32):
-                            out = model(
+                            out = episode_forward(model, {
+                                "input_ids": input_ids, "labels": labels, "attention_mask": attention_mask,
+                                "write_input_ids": batch["write_input_ids"].to(device, non_blocking=True),
+                                "write_attention_mask": batch["write_attention_mask"].to(device, non_blocking=True),
+                            }) if episodic else model(
                                 input_ids=input_ids,
                                 fast_state=None,  # Starts at meta-learned W_0 and evolves across layers
                                 labels=labels,
@@ -1903,6 +2074,10 @@ def train(
                     "surprise_loss_measured": update_fast_weights,
                     "causal_ttt_v2": True,
                     "training_pipeline": 3, "training_stage": training_stage,
+                    "meta_objective": meta_objective,
+                    "episode_protocol": EPISODE_META_PROTOCOL if episodic else None,
+                    "online_adaptation_experimental": episodic,
+                    "online_memory_quality_verified": False,
                     "parameter_scope": parameter_scope,
                     "trim_sft_padding": trim_sft_padding,
                     "sft_loss_only_head": sft_loss_only_head,

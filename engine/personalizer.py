@@ -94,6 +94,7 @@ class uTTTPersonalizer:
     """
     High-level engine orchestrating multi-user Test-Time Personalization on RTX 5090.
     """
+    _online_ttt_disabled_reason = "memory writes require compatible meta-training"
 
     def __init__(
         self,
@@ -109,6 +110,7 @@ class uTTTPersonalizer:
         temperature: float = 0.7,
         top_p: float = 0.9,
         lightweight_fallback: bool = False,
+        enable_online_ttt: Optional[bool] = None,
     ) -> None:
         if checkpoint_manager is None:
             self.ckpt_manager = DualTrackCheckpointManager(
@@ -127,12 +129,21 @@ class uTTTPersonalizer:
         self.tokenizer = build_tokenizer(self.config)
         metadata = self.ckpt_manager.training_metadata
         protocol = getattr(self.model, "INNER_LOOP_PROTOCOL", None)
-        self.online_updates_enabled = (
+        compatible_meta = (
             metadata.get("training_stage") == "meta" and isinstance(protocol, str)
             and metadata.get("inner_loop_protocol") == protocol
         )
+        if enable_online_ttt is not None and type(enable_online_ttt) is not bool:
+            raise ValueError("enable_online_ttt must be boolean or None")
+        if enable_online_ttt is True and not compatible_meta:
+            raise ValueError("Online TTT requires a compatible meta-trained checkpoint, not pretrain/SFT weights")
+        self.online_updates_enabled = compatible_meta and enable_online_ttt is not False
+        self._online_ttt_disabled_reason = (
+            "disabled by request" if compatible_meta and enable_online_ttt is False
+            else "memory writes require compatible meta-training"
+        )
         if not self.online_updates_enabled:
-            print("[Personalizer] Online TTT disabled: memory writes require compatible meta-training.")
+            print(f"[Personalizer] Online TTT disabled: {self._online_ttt_disabled_reason}.")
 
         # Stability Guard hyperparameters (auto-calibrate when normalize_loss_by_dim=True)
         raw_thresh = (
@@ -455,7 +466,7 @@ class uTTTPersonalizer:
                 gate_triggered=False, weight_drift_frobenius=float(drift["drift_frobenius"]),
                 weight_drift_pct=float(drift["drift_pct"]), persona_saved=False,
                 persona_path=str(primary_path), step=int(drift["step"]),
-                status_bar="[LM Status] Online TTT disabled: memory writes require compatible meta-training.",
+                status_bar=f"[LM Status] Online TTT disabled: {self._online_ttt_disabled_reason}.",
                 drift_details=drift,
                 seed=seed,
             )

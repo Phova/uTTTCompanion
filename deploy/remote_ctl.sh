@@ -84,6 +84,8 @@ Core Commands:
                           --max-new-tokens <int>     Default max generated tokens per turn (default: 96)
                           --temperature <float>      Default sampling temperature (default: 0.7)
                           --surprise-threshold <f>   Override Surprise Gate threshold tau (default: 0.015)
+                          --enable-ttt              Require meta-trained weights and enable online writes
+                          --disable-ttt             Disable online writes for a read-only comparison
                           --no-compile               Disable torch.compile kernel fusion on startup
                           --lightweight              Use lightweight fallback model when cold-starting
   status                Show remote RTX 5090 GPU utilization, tmux sessions, and checkpoint info

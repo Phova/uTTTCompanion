@@ -725,6 +725,7 @@ class uTTTModel(nn.Module):
         return_fast_state: bool = True,
         ce_reduction: str = "token_mean",
         ce_token_indices: Optional[torch.Tensor] = None,
+        detach_returned_fast_state: bool = True,
     ) -> uTTTModelOutput:
         """
         Forward pass through all uTTTBlocks with sequential cross-layer FastWeightState passing.
@@ -750,7 +751,12 @@ class uTTTModel(nn.Module):
                                 Frozen-write loss-only calls return empty logits.
                                 Compute with supervised_token_indices before H2D;
                                 the full prompt still passes through every block.
+            detach_returned_fast_state: Preserve the historical detached training
+                                 result by default. False lets a later independent
+                                 read loss differentiate through a support write.
         """
+        if type(detach_returned_fast_state) is not bool:
+            raise ValueError("detach_returned_fast_state must be boolean")
         if ce_reduction not in ("token_mean", "sequence_mean"):
             raise ValueError("ce_reduction must be token_mean or sequence_mean")
         if ce_reduction == "sequence_mean" and (labels is None or update_fast_weights):
@@ -945,7 +951,7 @@ class uTTTModel(nn.Module):
 
         return uTTTModelOutput(
             logits=logits,
-            fast_state=(cur_fast_state.detach() if self.training else cur_fast_state) if return_fast_state else None,
+            fast_state=(cur_fast_state.detach() if self.training and detach_returned_fast_state else cur_fast_state) if return_fast_state else None,
             loss=total_loss,
             ce_loss=ce_loss,
             surprise_loss=mean_surprise_loss,

@@ -133,6 +133,9 @@ def get_personalizer() -> uTTTPersonalizer:
             auto_create_base_if_missing=False,
             lightweight_fallback=lightweight,
         )
+        ttt_mode = os.environ.get("UTTT_ONLINE_TTT", "auto")
+        if ttt_mode not in ("auto", "0", "1"):
+            raise ValueError("UTTT_ONLINE_TTT must be auto, 0 or 1")
         _personalizer = uTTTPersonalizer(
             checkpoint_manager=ckpt_manager,
             config_path=config_path,
@@ -141,6 +144,7 @@ def get_personalizer() -> uTTTPersonalizer:
             default_max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
+            enable_online_ttt=None if ttt_mode == "auto" else ttt_mode == "1",
         )
     return _personalizer
 
@@ -245,6 +249,7 @@ async def health_check() -> Dict[str, Any]:
         "vram_allocated_gb": round(vram_allocated_gb, 3),
         "vram_reserved_gb": round(vram_reserved_gb, 3),
         "pool": pool,
+        "online_ttt_enabled": bool(getattr(engine, "online_updates_enabled", False)),
     }
 
 
@@ -380,6 +385,11 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Override default max generated tokens per turn")
     parser.add_argument("--temperature", type=float, default=None, help="Override default sampling temperature")
     parser.add_argument("--surprise-threshold", type=float, default=None, help="Override Surprise Gate threshold tau")
+    ttt = parser.add_mutually_exclusive_group()
+    ttt.add_argument("--enable-ttt", dest="online_ttt", action="store_const", const=True, default=None,
+                     help="Require compatible meta weights and enable per-user online writes")
+    ttt.add_argument("--disable-ttt", dest="online_ttt", action="store_const", const=False,
+                     help="Read the same model without per-turn online writes")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile kernel fusion on startup")
     packing = parser.add_mutually_exclusive_group()
     packing.add_argument("--packed-projections", dest="packed_projections", action="store_const", const=True,
@@ -403,6 +413,8 @@ def main() -> None:
         os.environ["UTTT_TEMPERATURE"] = str(args.temperature)
     if args.surprise_threshold is not None:
         os.environ["UTTT_SURPRISE_THRESHOLD"] = str(args.surprise_threshold)
+    if args.online_ttt is not None:
+        os.environ["UTTT_ONLINE_TTT"] = "1" if args.online_ttt else "0"
     if args.no_compile:
         os.environ["UTTT_NO_COMPILE"] = "1"
     if args.packed_projections is not None:

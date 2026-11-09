@@ -1,0 +1,922 @@
+{
+  "baseline_raw_dev": {
+    "protocol": "persona_query_only_free_generation_v1",
+    "free_generation_accuracy_measured": true,
+    "teacher_forcing_used": false,
+    "support_text_or_kv_carried_to_query": false,
+    "summary": {
+      "episodes": 12,
+      "arms": {
+        "base_w0": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "no_write": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "mismatched_state": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "correct_write": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "save_reload": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        }
+      },
+      "write_minus_no_write_accuracy": 0.0,
+      "write_minus_mismatch_accuracy": 0.0,
+      "state_changed_episodes": 12,
+      "isolation_failures": 0,
+      "persistence_failures": 0,
+      "no_write_state_failures": 0
+    },
+    "groups": {
+      "task": {
+        "correction": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "recall": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "reply_prefix": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        }
+      },
+      "language": {
+        "en": {
+          "episodes": 6,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 6,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "zh": {
+          "episodes": 6,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 6,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        }
+      }
+    },
+    "results": [
+      {
+        "episode_id": "dev-000028",
+        "task": "correction",
+        "language": "en",
+        "query_sha256": "56c57b5bf81fbe67b3939ed5800e045368d083daadebed40080cae56f299842a",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000013",
+        "task": "correction",
+        "language": "zh",
+        "query_sha256": "1daeb3f8f905849a023dfdf3f5fdd7882a7161a75d80430241ca7d14ae8fdad2",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000026",
+        "task": "recall",
+        "language": "en",
+        "query_sha256": "67ba7d4e8cdaf888b7fa42a3203e3f3b0ac9c4439ef028833adbeb7572dbf3a9",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000003",
+        "task": "recall",
+        "language": "zh",
+        "query_sha256": "d9fbb286367fef35087aa44f05c8a4df4648911435f62c0654a7fa0054786b15",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000030",
+        "task": "reply_prefix",
+        "language": "en",
+        "query_sha256": "e8c86080097adaf2ec613ebe26206fa74e2bcafaf8166ebfd2fe12729d717488",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000015",
+        "task": "reply_prefix",
+        "language": "zh",
+        "query_sha256": "66854a2ff541bd890d3c7b56509253ab55aff8b17986ebfdcefcf087a595d6df",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000012",
+        "task": "correction",
+        "language": "en",
+        "query_sha256": "522220ffb823c48ed73a1c1a371d3b17066ed6e790ef7ea7e27dbda8c8deeb59",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000029",
+        "task": "correction",
+        "language": "zh",
+        "query_sha256": "d616c92cb54e7096fb5f92d2b5060b5471a6936fa5bf3ed76c9235b85858c624",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000002",
+        "task": "recall",
+        "language": "en",
+        "query_sha256": "72702583d6ea235f640b04d0647ee517c9d03dfc373f8f7703c4f1b685b37d2f",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000025",
+        "task": "recall",
+        "language": "zh",
+        "query_sha256": "e7b55f42f6e7d91ff24dcfb9c490d81d7c005ee1f464cd560e39704cd9992fa9",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000014",
+        "task": "reply_prefix",
+        "language": "en",
+        "query_sha256": "6bcf1f607e99dacdc3bdc4b703122acddae66b45d6456763ee72693e8014f265",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000031",
+        "task": "reply_prefix",
+        "language": "zh",
+        "query_sha256": "d73a52d06fa0d9eb7a4805aed215f3645ac0a801720adbc814377fde80ab7ff8",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      }
+    ],
+    "notes": [
+      "Every read is query-only, starts at position zero and uses an independently cloned fast-weight/momentum state.",
+      "State changes or low surprise alone do not demonstrate useful memory; compare exact recall against both no-write and mismatch.",
+      "Isolation checks independent persona states and persistence, not concurrent HTTP session routing.",
+      "Reply-prefix exercises are narrow verifiable personalization, not a natural-conversation quality score."
+    ],
+    "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_foundation_corrected/uttt_1.584b_20261109_foundation_corrected.best.pt",
+    "checkpoint_sha256": "f289fa44b107129f6463668b9ad66310a06a130f47c7cb123995d43482c05718",
+    "meta_trained": false,
+    "untrained_baseline": true,
+    "data_path": "/root/uTTT/data/persona_memory_20261109_v1/train.jsonl",
+    "data_sha256": "561f3fb287efe0712d27f133e6b84fc7c07148578d5bdf45594825c27bb920ea",
+    "manifest_sha256": "3f79bdedfb5cf86606f23cf0b5871a4a6f97989cb0f5d09f001ed1961f063dbc",
+    "split": "dev",
+    "verified_split_intersections": 0,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "max_new_tokens": 16,
+    "decoding": "raw_greedy",
+    "stability_guards_applied": false,
+    "write_mode": "raw_analytical_mechanism_probe",
+    "support_writes": 32,
+    "committed_support_writes": 32,
+    "mean_support_surprise": 1.728682175388231,
+    "gpu_memory": {
+      "free_bytes": 32429309952,
+      "runtime_free_bytes": 32429309952,
+      "global_free_bytes": 32579256320,
+      "global_total_bytes": 34190917632,
+      "gpu_index": 0,
+      "global_source": "nvidia-smi",
+      "allocator_limit_bytes": 30064771072,
+      "peak_allocated_bytes": 11804101632
+    }
+  },
+  "capacity_probe": {
+    "protocol": "persona-episode-capacity-v1",
+    "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_foundation_corrected/uttt_1.584b_20261109_foundation_corrected.best.pt",
+    "checkpoint_step": 1000,
+    "episodes": "/root/uTTT/data/persona_memory_20261109_v1/train.jsonl",
+    "episodes_sha256": "561f3fb287efe0712d27f133e6b84fc7c07148578d5bdf45594825c27bb920ea",
+    "dataset_fingerprint": "8d83af154a52e36094760b4076179fee516b97bd5ca6a2de7db1c1c01a3dcb00",
+    "split": "train",
+    "selected_episodes": [
+      {
+        "index": 156,
+        "write_rounds": 2,
+        "write_tokens": [
+          31,
+          35
+        ],
+        "query_tokens": 35,
+        "padded_total_tokens": 384,
+        "actual_total_tokens": 101
+      },
+      {
+        "index": 13,
+        "write_rounds": 2,
+        "write_tokens": [
+          33,
+          36
+        ],
+        "query_tokens": 32,
+        "padded_total_tokens": 384,
+        "actual_total_tokens": 101
+      }
+    ],
+    "seq_len_per_call": 128,
+    "chunk_size": 128,
+    "max_padded_episode_tokens": 384,
+    "meta_checkpoint_layers": 4,
+    "meta_checkpoint_time_chunks": true,
+    "meta_checkpoint_reentrant": false,
+    "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+    "static_fp32_weights_grads_adam_bytes": 11685346368,
+    "persona_storage_ledger": {
+      "writer_parameters": 445818948,
+      "writer_parameter_tensors": 204,
+      "persona_W_fp32_bytes": 212336640,
+      "persona_S_fp32_bytes": 212336640,
+      "persona_LN_fp32_bytes": 20480,
+      "persona_master_fp32_bytes": 424693760,
+      "persona_bf16_read_cache_bytes": 106168320,
+      "persona_hot_master_plus_read_cache_bytes": 530862080,
+      "persona_hardlink_alias_logical_bytes": 849387520,
+      "persona_copy_alias_physical_tensor_bytes": 849387520,
+      "persona_atomic_hardlink_tensor_peak_bytes": 849387520,
+      "scope": "One B1 persona. Alias hardlinks share one physical payload; snapshots add another payload per tag. KV/temporary tensors and serialization overhead excluded."
+    },
+    "parameter_dtype": "float32",
+    "activation_dtype": "bfloat16",
+    "persona_master_dtype": "float32",
+    "status": "ok",
+    "weights_saved": false,
+    "useful_memory_quality_established": false,
+    "available_memory": {
+      "free_bytes": 32429309952,
+      "runtime_free_bytes": 32429309952,
+      "global_free_bytes": 32579256320,
+      "global_total_bytes": 34190917632,
+      "device_uuid": "GPU-755d989f-b38f-e7d8-1942-f5c0f796fc10",
+      "gpu_index": 0,
+      "global_source": "nvidia-smi"
+    },
+    "allocator_limit_bytes": 30064771072,
+    "parameter_scope": "writer",
+    "total": 1583879748,
+    "trainable": 445818948,
+    "frozen": 1138060800,
+    "requested_steps": 2,
+    "steps": [
+      {
+        "step": 1,
+        "seconds": 1.871758539986331,
+        "query_ce": 7.96875,
+        "support_surprise_monitor_only": 1.7259868383407593,
+        "grad_norm": 0.473757803440094,
+        "writer_parameter_tensors": 204,
+        "finite_nonzero_writer_gradients": 204,
+        "writer_grad_norm_min": 4.5299530029296875e-06,
+        "writer_grad_norm_max": 0.10263799875974655,
+        "memory": {
+          "allocated_bytes": 19871227904,
+          "reserved_bytes": 21816672256,
+          "peak_allocated_bytes": 21318731776,
+          "peak_reserved_bytes": 21816672256
+        }
+      },
+      {
+        "step": 2,
+        "seconds": 1.6149448340001982,
+        "query_ce": 4.970703125,
+        "support_surprise_monitor_only": 1.724825143814087,
+        "grad_norm": 0.42302206158638,
+        "writer_parameter_tensors": 204,
+        "finite_nonzero_writer_gradients": 204,
+        "writer_grad_norm_min": 3.719329833984375e-05,
+        "writer_grad_norm_max": 0.09112326800823212,
+        "memory": {
+          "allocated_bytes": 19880271872,
+          "reserved_bytes": 25990004736,
+          "peak_allocated_bytes": 24886702592,
+          "peak_reserved_bytes": 25990004736
+        }
+      }
+    ],
+    "checkpoint_optimizer_restored": false,
+    "step_timing_includes_writer_diagnostics": true,
+    "frozen_parameters_sha256_before": "648360a94c829c3a5fdba8ad63a44c4d638e14306c1873d46c3d9f3acd076330",
+    "query_calls_checked_no_KV_or_support_text": 2,
+    "frozen_parameters_sha256_after": "648360a94c829c3a5fdba8ad63a44c4d638e14306c1873d46c3d9f3acd076330",
+    "frozen_parameters_unchanged": true,
+    "no_write_logits_bitwise_unchanged": true,
+    "optimizer_state_parameters": 204,
+    "optimizer_state_elements": 445818948,
+    "optimizer_steps": [
+      2
+    ],
+    "optimizer_moments_fp32": true,
+    "finite": true,
+    "allocated_bytes": 8494074880,
+    "reserved_bytes": 25990004736,
+    "peak_allocated_bytes": 24886702592,
+    "peak_reserved_bytes": 25990004736
+  },
+  "data_manifest": {
+    "protocol": "persona_split_request_memory_v1",
+    "seed": 20261109,
+    "seq_len": 128,
+    "payload_length": 3,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "files": {
+      "train.jsonl": {
+        "rows": 288,
+        "sha256": "561f3fb287efe0712d27f133e6b84fc7c07148578d5bdf45594825c27bb920ea"
+      },
+      "test.jsonl": {
+        "rows": 32,
+        "sha256": "bbf5804fb90bca2841ac14143b492aa006de6d9dbd3dc222edc938dfe6969267"
+      }
+    },
+    "split_episodes": {
+      "train": 256,
+      "dev": 32,
+      "test": 32
+    },
+    "split_intersections": {
+      "train:dev": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      },
+      "train:test": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      },
+      "dev:test": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      }
+    },
+    "interference_writes": 0,
+    "split_tasks": {
+      "train": {
+        "recall": 192,
+        "correction": 32,
+        "reply_prefix": 32
+      },
+      "dev": {
+        "recall": 24,
+        "correction": 4,
+        "reply_prefix": 4
+      },
+      "test": {
+        "recall": 24,
+        "correction": 4,
+        "reply_prefix": 4
+      }
+    },
+    "notes": [
+      "Explicit train/dev splits share train.jsonl; test.jsonl must never be trained on.",
+      "Each support and the query are separate calls. Only fast weights/momentum may cross the boundary.",
+      "Exact free-generation recall, mismatch, isolation and save/reload are measured separately from teacher forcing.",
+      "Reply-prefix tasks check a minimal stored preference, not broad natural conversation quality."
+    ]
+  },
+  "actual_data_lengths": {
+    "maximum_support_tokens": 36,
+    "maximum_query_with_answer_tokens": 45,
+    "maximum_support_rounds": 2
+  },
+  "cpu_regression": {
+    "summary": [
+      "Ran 611 tests in 17.888s",
+      "OK (skipped=22)"
+    ],
+    "exit_code": 0
+  },
+  "training_plan": {
+    "stage": "meta",
+    "parameter_scope": "writer",
+    "objective": "episode_support_query_v1",
+    "steps": 512,
+    "outer_lr": 0.0001,
+    "seed": 20261113,
+    "initial_checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_foundation_corrected/uttt_1.584b_20261109_foundation_corrected.best.pt",
+    "initial_checkpoint_sha256": "f289fa44b107129f6463668b9ad66310a06a130f47c7cb123995d43482c05718",
+    "output_checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_persona_meta/uttt_1.584b_20261109_persona_meta.pt",
+    "full_checkpoint_tensor_bytes": 9902070576,
+    "best_checkpoint_tensor_bytes": 6335518992,
+    "atomic_peak_tensor_bytes": 26139660144,
+    "minimum_C_free_reserve_bytes": 100000000000,
+    "quality_success_not_yet_established": true
+  }
+}

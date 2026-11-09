@@ -157,7 +157,15 @@ class DualTrackCheckpointManager:
             else:
                 raise ValueError(f"Unsupported base checkpoint format: {self.base_checkpoint_path}")
 
-            model.to(device=self.device, dtype=self.dtype)
+            # Preserve the meta-training parameter/master precision, including
+            # residuals/norms and the tied embedding/head. AMP still runs GEMMs
+            # in self.dtype. Converting to BF16 first would round W0 forever.
+            preserve_masters = (
+                self.training_metadata.get("training_stage") == "meta"
+                and self.training_metadata.get("inner_loop_protocol") == model.INNER_LOOP_PROTOCOL
+                and self.dtype in (torch.float16, torch.bfloat16)
+            )
+            model.to(device=self.device, dtype=torch.float32 if preserve_masters else self.dtype)
             model.freeze_slow_weights()
             model.eval()
             print(
@@ -364,7 +372,7 @@ class DualTrackCheckpointManager:
                 fresh_state = self.model.init_fast_state(
                     batch_size=1,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=self.persona_dtype,
                     detach=True,
                 )
                 self._user_metadata[safe_uid] = {
@@ -374,6 +382,16 @@ class DualTrackCheckpointManager:
                 }
                 self._gpu_lru[safe_uid] = fresh_state
                 return fresh_state
+
+    @property
+    def persona_dtype(self) -> torch.dtype:
+        """Match the meta-training master precision, independently of AMP reads."""
+        metadata = getattr(self, "training_metadata", {})
+        if (self.dtype in (torch.float16, torch.bfloat16)
+                and metadata.get("training_stage") == "meta"
+                and metadata.get("inner_loop_protocol") == self.model.INNER_LOOP_PROTOCOL):
+            return torch.float32
+        return self.dtype
 
     def update_user_state(
         self,
@@ -518,7 +536,7 @@ class DualTrackCheckpointManager:
                 fresh_state = self.model.init_fast_state(
                     batch_size=1,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=self.persona_dtype,
                     detach=True,
                 )
                 previous_meta = self._user_metadata.get(safe_uid)
