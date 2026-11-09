@@ -17,6 +17,20 @@ except ImportError:
 
 @unittest.skipIf(Tokenizer is None, "Actual BPE tokenizers dependency required")
 class PersonaMemoryCurriculumTests(unittest.TestCase):
+    def test_counterfactual_pairs_share_query_without_sharing_the_answer(self):
+        output,report,rows=self.build('paired',train_episodes=16,dev_episodes=8,test_episodes=8,counterfactual_pairs=True)
+        self.assertEqual(report['split_episodes'],{'train':32,'dev':16,'test':16})
+        groups={}
+        for row in rows:groups.setdefault(row['family'],[]).append(row)
+        for family,pair in groups.items():
+            self.assertEqual(len(pair),2)
+            self.assertEqual(pair[0]['query_text'],pair[1]['query_text'])
+            self.assertNotEqual(pair[0]['answer'],pair[1]['answer'])
+            self.assertNotEqual(support_texts(pair[0]),support_texts(pair[1]))
+            self.assertTrue(all(row['memory_task']['counterfactual_pair']==family for row in pair))
+        checked,_,_=load_episodes(output/'test.jsonl',self.tokenizer,hashlib.sha256(self.path.read_bytes()).hexdigest())
+        self.assertEqual(len(checked),16)
+
     def setUp(self):
         cache = Path(__file__).resolve().parents[1] / '.cache'
         cache.mkdir(exist_ok=True)

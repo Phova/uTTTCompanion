@@ -126,6 +126,7 @@ def run_episode_steps(model, dataset, *, device, amp_dtype, steps=2, learning_ra
     original_forward = model.forward
     checked_queries = 0
     expected_query = None
+    nonzero_seen = set()
 
     def audited_forward(*args, **kwargs):
         nonlocal checked_queries
@@ -172,9 +173,11 @@ def run_episode_steps(model, dataset, *, device, amp_dtype, steps=2, learning_ra
                     nonfinite.append(name)
                 elif norm == 0:
                     zero.append(name)
-            if missing or zero or nonfinite:
+                else:
+                    nonzero_seen.add(name)
+            if missing or nonfinite:
                 result["incomplete_writer_gradients"] = {"missing": missing, "zero": zero, "nonfinite": nonfinite}
-                raise ValueError("A writer did not receive finite nonzero query CE gradients")
+                raise ValueError("A writer did not receive finite query CE gradients")
             if any(parameter.grad is not None for _, parameter in frozen):
                 raise ValueError("Frozen language parameters unexpectedly received gradients")
             grad_norm = torch.nn.utils.clip_grad_norm_([parameter for _, parameter in selected], 1., error_if_nonfinite=True)
@@ -184,7 +187,9 @@ def run_episode_steps(model, dataset, *, device, amp_dtype, steps=2, learning_ra
             entry = {"step": step, "seconds": time.perf_counter() - start,
                      "query_ce": float(output.ce_loss.detach()), "support_surprise_monitor_only": float(output.surprise_loss.detach()),
                      "grad_norm": float(grad_norm), "writer_parameter_tensors": len(selected),
-                     "finite_nonzero_writer_gradients": len(norms),
+                     "finite_writer_gradients": len(norms),
+                     "finite_nonzero_writer_gradients": sum(norm > 0 for norm in norms),
+                     "zero_writer_grad_names": zero,
                      "writer_grad_norm_min": min(norms), "writer_grad_norm_max": max(norms)}
             if memory_reporter is not None:
                 entry["memory"] = memory_reporter()
@@ -193,6 +198,11 @@ def run_episode_steps(model, dataset, *, device, amp_dtype, steps=2, learning_ra
             del output, batch
     finally:
         model.forward = original_forward
+    dormant = [name for name, _ in selected if name not in nonzero_seen]
+    result["writer_tensors_nonzero_at_least_once"] = len(nonzero_seen)
+    if dormant:
+        result["dormant_writer_gradients"] = dormant
+        raise ValueError("A writer never received nonzero query CE gradients across the probe")
     result["query_calls_checked_no_KV_or_support_text"] = checked_queries
     result["frozen_parameters_sha256_after"] = parameter_digest(frozen)
     result["frozen_parameters_unchanged"] = (result["frozen_parameters_sha256_before"] == result["frozen_parameters_sha256_after"])

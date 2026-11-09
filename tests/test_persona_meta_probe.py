@@ -34,6 +34,24 @@ class PersonaMetaProbeTests(unittest.TestCase):
                 self.assertTrue(report['frozen_parameters_unchanged'])
                 self.assertTrue(report['no_write_logits_bitwise_unchanged'])
                 self.assertEqual(report['query_calls_checked_no_KV_or_support_text'],2)
+                # Scalar gate derivatives may cancel on one example. Require
+                # a finite graph each time and nonzero signal across the run.
+                gate=dict(model.named_parameters())['layers.0.uttt.w_alpha.bias']
+                calls=[0]
+                def cancel_once(gradient):
+                    calls[0]+=1
+                    return torch.zeros_like(gradient) if calls[0]==2 else gradient
+                handle=gate.register_hook(cancel_once)
+                try:
+                    cancelled=run_episode_steps(model,dataset,device='cpu',amp_dtype=torch.float32,max_total_tokens=192)
+                    self.assertEqual(cancelled['writer_tensors_nonzero_at_least_once'],12)
+                    self.assertIn('layers.0.uttt.w_alpha.bias',cancelled['steps'][1]['zero_writer_grad_names'])
+                finally:handle.remove()
+                handle=gate.register_hook(torch.zeros_like)
+                try:
+                    with self.assertRaisesRegex(ValueError,'never received nonzero'):
+                        run_episode_steps(model,dataset,device='cpu',amp_dtype=torch.float32,max_total_tokens=192)
+                finally:handle.remove()
         finally:
             torch.set_num_threads(previous)
 

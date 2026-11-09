@@ -22,8 +22,8 @@ Quality is assessed after training; a successful capacity probe is not memory re
   and prompt families. Actual BPE lengths fit 128 tokens per request; cropping
   and packing are rejected. Recall, replacement and a narrow reply-prefix
   preference are included. No test examples are trained on.
-- Preserve FP32 meta parameters and FP32 persona W/S masters during serving;
-  CUDA GEMMs use BF16 autocast. Previously converting W0 to BF16 before cloning
+- Preserve FP32 W0/LN and persona W/S masters during serving; fixed CUDA
+  projections use BF16. Previously converting W0 to BF16 before cloning
   a new user irreversibly rounded the supposedly exact masters.
 - Expose explicit `server.app --enable-ttt` / `--disable-ttt` and a health flag.
   Enabling writes on an incompatible pretrain/SFT checkpoint raises an error.
@@ -83,3 +83,30 @@ python -m server.app --config configs/5090_persona_meta_20261109.yaml \
 
 Use a separate persona directory for each base model. Personal states carry the
 base fingerprint and incompatible states are not reused.
+
+## First-round results and continuation
+
+The first 512 steps completed with validation CE 6.5752 → 3.4847, against
+unchanged no-write CE 6.5689. Query-only dev generation remained 0/12 exact
+recall; wrong states often produced the same guessed codes. This established
+format learning and durable isolated state, not accurate content recall.
+
+The next curriculum uses counterfactual pairs: exactly the same user/query
+must produce two different answers after two separately written facts. Each
+entity's pair stays within one split. The paired preset runs 1024 further
+writer-only steps from a preserved complete stage-1 archive; new latest/best
+files reuse the existing C volume budget. Temporary evaluation personas use C
+to retain the D volume reserve. The untouched test split is evaluated only
+after model selection.
+
+On the actual 1.584B checkpoint, activation-precision projections reduced
+parameter storage from 6.34 GB to 3.27 GB. Two real writes produced bitwise
+identical W/S/LN and query logits to all-FP32 parameters under BF16 autocast.
+Standard generation improved from 51.5 to 60.0 token/s in a repeated 64-token
+benchmark. Optional graph decode reached 121.6 token/s but changed greedy
+tokens, so meta serving now defaults to standard generation. `--cuda-graph`
+explicitly opts in; `--no-cuda-graph` selects the standard path.
+
+Direct training launch must set `PYTORCH_ALLOC_CONF=expandable_segments:True`
+before importing Torch, as specified by the hardware preset. The trainer
+rejects a missing or mismatched allocator setting before any optimizer update.

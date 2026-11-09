@@ -105,14 +105,17 @@ class CUDAGraphDecoder:
     def is_supported(cls, model, fast_state, prefill_kv_caches, start_pos):
         if model.training or torch.is_inference_mode_enabled() or not isinstance(start_pos, int) or start_pos < 1:
             return False
-        parameters = list(model.parameters())
+        named_parameters = list(model.named_parameters())
+        parameters = [parameter for _, parameter in named_parameters]
         if not parameters:
             return False
         first = parameters[0]
         if first.device.type != "cuda" or first.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if any(parameter.requires_grad or parameter.device != first.device or parameter.dtype != first.dtype
-               or parameter.is_inference() for parameter in parameters):
+        if any(parameter.requires_grad or parameter.device != first.device or parameter.is_inference()
+               or (parameter.dtype != first.dtype
+                   and not (name.startswith("fast_weight_pool.") and parameter.dtype == torch.float32))
+               for name, parameter in named_parameters):
             return False
         if prefill_kv_caches is None or len(prefill_kv_caches) != len(model.layers):
             return False

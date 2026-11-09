@@ -157,15 +157,19 @@ class DualTrackCheckpointManager:
             else:
                 raise ValueError(f"Unsupported base checkpoint format: {self.base_checkpoint_path}")
 
-            # Preserve the meta-training parameter/master precision, including
-            # residuals/norms and the tied embedding/head. AMP still runs GEMMs
-            # in self.dtype. Converting to BF16 first would round W0 forever.
+            # Keep exact W0/LN masters before preparing activation-precision
+            # projections. Converting the whole model first rounds W0 forever.
             preserve_masters = (
                 self.training_metadata.get("training_stage") == "meta"
                 and self.training_metadata.get("inner_loop_protocol") == model.INNER_LOOP_PROTOCOL
                 and self.dtype in (torch.float16, torch.bfloat16)
             )
-            model.to(device=self.device, dtype=torch.float32 if preserve_masters else self.dtype)
+            if preserve_masters and self.device.type == "cuda":
+                model.to(device=self.device)
+                for name, child in model.named_children():
+                    child.to(dtype=torch.float32 if name == "fast_weight_pool" else self.dtype)
+            else:
+                model.to(device=self.device, dtype=torch.float32 if preserve_masters else self.dtype)
             model.freeze_slow_weights()
             model.eval()
             print(

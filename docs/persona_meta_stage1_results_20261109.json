@@ -1,0 +1,1750 @@
+{
+  "stage1_audit_archive": {
+    "step": 512,
+    "optimizer_parameters": 204,
+    "optimizer_steps": [
+      512
+    ],
+    "frozen_parameter_elements": 1138060800,
+    "frozen_parameters_sha256": "9b78ebbb72c2719b5a984d07b3f6cf945944a2812f51345006f3d9e58243c52a",
+    "frozen_parameters_match_parent": true,
+    "best_weights_match_latest": true,
+    "data_cursor": {
+      "version": 1,
+      "size": 256,
+      "seed": 20261113,
+      "epoch": 2,
+      "offset": 0
+    },
+    "rng_keys": [
+      "cpu",
+      "cuda"
+    ],
+    "metrics": {
+      "training_stage": "meta",
+      "parameter_scope": "writer",
+      "meta_objective": "episode_support_query_v1",
+      "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+      "code_revision": "dc74b329727320e80edbff45cc5f4b79b690a877",
+      "run_id": "20261109_persona_meta",
+      "dataset_fingerprint": "8d83af154a52e36094760b4076179fee516b97bd5ca6a2de7db1c1c01a3dcb00",
+      "tokens_seen": 34782,
+      "validation_ce": 3.4846946844687827,
+      "validation_frozen_ce": 6.568906270540678,
+      "validation_example_ce": 3.541709490120411,
+      "peak_vram_gb": 22.883909225463867
+    },
+    "checkpoint_bytes": {
+      "uttt_1.584b_20261109_persona_meta.best.pt": 6338144029,
+      "uttt_1.584b_20261109_persona_meta.pt": 9904882366
+    },
+    "archive": "/mnt/d/uTTT-artifacts/checkpoints/20261109_persona_meta_stage1/uttt_1.584b_20261109_persona_meta.pt",
+    "archive_sha256": "d036e38fcd3da27d45212667091ee6cf5e59d57d9a396845c5def410f21f1987",
+    "original_checkpoint_preserved": true,
+    "free_C": 112001966080,
+    "free_D": 15819137024
+  },
+  "stage1_dev_generation": {
+    "protocol": "persona_query_only_free_generation_v1",
+    "free_generation_accuracy_measured": true,
+    "teacher_forcing_used": false,
+    "support_text_or_kv_carried_to_query": false,
+    "summary": {
+      "episodes": 12,
+      "arms": {
+        "base_w0": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "no_write": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "mismatched_state": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "correct_write": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        },
+        "save_reload": {
+          "passes": 0,
+          "total": 12,
+          "accuracy": 0.0
+        }
+      },
+      "write_minus_no_write_accuracy": 0.0,
+      "write_minus_mismatch_accuracy": 0.0,
+      "state_changed_episodes": 12,
+      "isolation_failures": 0,
+      "persistence_failures": 0,
+      "no_write_state_failures": 0
+    },
+    "groups": {
+      "task": {
+        "correction": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "recall": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "reply_prefix": {
+          "episodes": 4,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 4,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 4,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        }
+      },
+      "language": {
+        "en": {
+          "episodes": 6,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 6,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        },
+        "zh": {
+          "episodes": 6,
+          "arms": {
+            "base_w0": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "no_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "mismatched_state": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "correct_write": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            },
+            "save_reload": {
+              "passes": 0,
+              "total": 6,
+              "accuracy": 0.0
+            }
+          },
+          "write_minus_no_write_accuracy": 0.0,
+          "write_minus_mismatch_accuracy": 0.0,
+          "state_changed_episodes": 6,
+          "isolation_failures": 0,
+          "persistence_failures": 0,
+          "no_write_state_failures": 0
+        }
+      }
+    },
+    "results": [
+      {
+        "episode_id": "dev-000028",
+        "task": "correction",
+        "language": "en",
+        "query_sha256": "56c57b5bf81fbe67b3939ed5800e045368d083daadebed40080cae56f299842a",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "JWF",
+        "replies": {
+          "base_w0": "True",
+          "no_write": "True",
+          "mismatched_state": "HQ",
+          "correct_write": "GQ",
+          "save_reload": "GQ"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000013",
+        "task": "correction",
+        "language": "zh",
+        "query_sha256": "1daeb3f8f905849a023dfdf3f5fdd7882a7161a75d80430241ca7d14ae8fdad2",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "D2B",
+        "replies": {
+          "base_w0": "MDSJ68EG",
+          "no_write": "MDSJ68EG",
+          "mismatched_state": "HZB",
+          "correct_write": "HZB",
+          "save_reload": "HZB"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000026",
+        "task": "recall",
+        "language": "en",
+        "query_sha256": "67ba7d4e8cdaf888b7fa42a3203e3f3b0ac9c4439ef028833adbeb7572dbf3a9",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "T66",
+        "replies": {
+          "base_w0": "10",
+          "no_write": "10",
+          "mismatched_state": "EPZ",
+          "correct_write": "EPZ",
+          "save_reload": "EPZ"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000003",
+        "task": "recall",
+        "language": "zh",
+        "query_sha256": "d9fbb286367fef35087aa44f05c8a4df4648911435f62c0654a7fa0054786b15",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "HS4",
+        "replies": {
+          "base_w0": "6",
+          "no_write": "6",
+          "mismatched_state": "8Z4",
+          "correct_write": "7EQ",
+          "save_reload": "7EQ"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000030",
+        "task": "reply_prefix",
+        "language": "en",
+        "query_sha256": "e8c86080097adaf2ec613ebe26206fa74e2bcafaf8166ebfd2fe12729d717488",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "5E8 READY",
+        "replies": {
+          "base_w0": "Apply profile-2RRSAFXH's stored response prefix",
+          "no_write": "Apply profile-2RRSAFXH's stored response prefix",
+          "mismatched_state": "6",
+          "correct_write": "6YS",
+          "save_reload": "6YS"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000015",
+        "task": "reply_prefix",
+        "language": "zh",
+        "query_sha256": "66854a2ff541bd890d3c7b56509253ab55aff8b17986ebfdcefcf087a595d6df",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "FNB READY",
+        "replies": {
+          "base_w0": "49M7CTJT",
+          "no_write": "49M7CTJT",
+          "mismatched_state": "TFEADY",
+          "correct_write": "TFEADY",
+          "save_reload": "TFEADY"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000012",
+        "task": "correction",
+        "language": "en",
+        "query_sha256": "522220ffb823c48ed73a1c1a371d3b17066ed6e790ef7ea7e27dbda8c8deeb59",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "S8P",
+        "replies": {
+          "base_w0": "10",
+          "no_write": "10",
+          "mismatched_state": "HP",
+          "correct_write": "HP",
+          "save_reload": "HP"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000029",
+        "task": "correction",
+        "language": "zh",
+        "query_sha256": "d616c92cb54e7096fb5f92d2b5060b5471a6936fa5bf3ed76c9235b85858c624",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "XDP",
+        "replies": {
+          "base_w0": "Profile-LYED3FW3",
+          "no_write": "Profile-LYED3FW3",
+          "mismatched_state": "HZB",
+          "correct_write": "HZB",
+          "save_reload": "HZB"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": {
+          "before_exact_old": false,
+          "after_exact_new": false,
+          "obsolete_recalled_after": false
+        }
+      },
+      {
+        "episode_id": "dev-000002",
+        "task": "recall",
+        "language": "en",
+        "query_sha256": "72702583d6ea235f640b04d0647ee517c9d03dfc373f8f7703c4f1b685b37d2f",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "5FZ",
+        "replies": {
+          "base_w0": "8",
+          "no_write": "8",
+          "mismatched_state": "8Z",
+          "correct_write": "6TKLEC4",
+          "save_reload": "6TKLEC4"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000025",
+        "task": "recall",
+        "language": "zh",
+        "query_sha256": "e7b55f42f6e7d91ff24dcfb9c490d81d7c005ee1f464cd560e39704cd9992fa9",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "XFJ",
+        "replies": {
+          "base_w0": "CMYCWNWNWPNW",
+          "no_write": "CMYCWNWNWPNW",
+          "mismatched_state": "MG5",
+          "correct_write": "CNE",
+          "save_reload": "CNE"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000014",
+        "task": "reply_prefix",
+        "language": "en",
+        "query_sha256": "6bcf1f607e99dacdc3bdc4b703122acddae66b45d6456763ee72693e8014f265",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "M2Z READY",
+        "replies": {
+          "base_w0": "10",
+          "no_write": "10",
+          "mismatched_state": "89DK242G",
+          "correct_write": "89DK242G",
+          "save_reload": "89DK242G"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      },
+      {
+        "episode_id": "dev-000031",
+        "task": "reply_prefix",
+        "language": "zh",
+        "query_sha256": "d73a52d06fa0d9eb7a4805aed215f3645ac0a801720adbc814377fde80ab7ff8",
+        "arms": {
+          "base_w0": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "no_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "mismatched_state": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "correct_write": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          },
+          "save_reload": {
+            "exact_match": false,
+            "mismatched_payload_recalled": false
+          }
+        },
+        "expected": "E99 READY",
+        "replies": {
+          "base_w0": "-76WV2KHN",
+          "no_write": "-76WV2KHN",
+          "mismatched_state": "89WV2KHN",
+          "correct_write": "89WV2KHN",
+          "save_reload": "89WV2KHN"
+        },
+        "correct_state_changed": true,
+        "no_write_state_unchanged": true,
+        "other_user_state_unchanged": true,
+        "other_user_reply_unchanged": true,
+        "save_reload_state_exact": true,
+        "save_reload_reply_exact": true,
+        "correction": null
+      }
+    ],
+    "notes": [
+      "Every read is query-only, starts at position zero and uses an independently cloned fast-weight/momentum state.",
+      "State changes or low surprise alone do not demonstrate useful memory; compare exact recall against both no-write and mismatch.",
+      "Isolation checks independent persona states and persistence, not concurrent HTTP session routing.",
+      "Reply-prefix exercises are narrow verifiable personalization, not a natural-conversation quality score."
+    ],
+    "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_persona_meta/uttt_1.584b_20261109_persona_meta.best.pt",
+    "checkpoint_sha256": "b0b1fe32a1b510aba3a0798f7a0065adfe15d4c9059d68877b01c09bbe03caf0",
+    "meta_trained": true,
+    "untrained_baseline": false,
+    "data_path": "/root/uTTT/data/persona_memory_20261109_v1/train.jsonl",
+    "data_sha256": "561f3fb287efe0712d27f133e6b84fc7c07148578d5bdf45594825c27bb920ea",
+    "manifest_sha256": "3f79bdedfb5cf86606f23cf0b5871a4a6f97989cb0f5d09f001ed1961f063dbc",
+    "split": "dev",
+    "verified_split_intersections": 0,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "max_new_tokens": 16,
+    "decoding": "raw_greedy",
+    "stability_guards_applied": false,
+    "write_mode": "raw_analytical_mechanism_probe",
+    "support_writes": 32,
+    "committed_support_writes": 32,
+    "mean_support_surprise": 1.450711020761553,
+    "gpu_memory": {
+      "free_bytes": 32429309952,
+      "runtime_free_bytes": 32429309952,
+      "global_free_bytes": 32516341760,
+      "global_total_bytes": 34190917632,
+      "gpu_index": 0,
+      "global_source": "nvidia-smi",
+      "allocator_limit_bytes": 30064771072,
+      "peak_allocated_bytes": 8558102528
+    }
+  },
+  "runtime_benchmark": {
+    "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_persona_meta/uttt_1.584b_20261109_persona_meta.best.pt",
+    "protocol": "meta_serving_projection_precision_v1",
+    "checkpoint_sha256": "b0b1fe32a1b510aba3a0798f7a0065adfe15d4c9059d68877b01c09bbe03caf0",
+    "checkpoint_step": 512,
+    "two_writes_all_W_S_LN_bitwise_equal": true,
+    "query_max_abs_logit_differences": [
+      0.0,
+      0.0
+    ],
+    "fp32_projection_eager": {
+      "runs": [
+        {
+          "seconds": 1.359486208006274,
+          "first_token_seconds": 0.023654299991903827,
+          "tokens": 64,
+          "tokens_per_second": 47.07660851805026,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        },
+        {
+          "seconds": 1.2005302069883328,
+          "first_token_seconds": 0.03009429998928681,
+          "tokens": 64,
+          "tokens_per_second": 53.3097789855295,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        },
+        {
+          "seconds": 1.2870472070062533,
+          "first_token_seconds": 0.021051099989563227,
+          "tokens": 64,
+          "tokens_per_second": 49.72622577602862,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        }
+      ],
+      "median_tokens_per_second": 51.51800238077906,
+      "graph_created": false
+    },
+    "bf16_projection_eager": {
+      "runs": [
+        {
+          "seconds": 0.8942199049924966,
+          "first_token_seconds": 0.01659839999047108,
+          "tokens": 64,
+          "tokens_per_second": 71.5707620046067,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        },
+        {
+          "seconds": 1.0618427050067112,
+          "first_token_seconds": 0.014674800011562183,
+          "tokens": 64,
+          "tokens_per_second": 60.27258057924455,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        },
+        {
+          "seconds": 1.072269705007784,
+          "first_token_seconds": 0.021018800005549565,
+          "tokens": 64,
+          "tokens_per_second": 59.68647598743396,
+          "token_ids": [
+            599,
+            53,
+            60,
+            63,
+            56,
+            54,
+            45,
+            63,
+            29,
+            54,
+            63,
+            56,
+            59,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50
+          ]
+        }
+      ],
+      "median_tokens_per_second": 59.97952828333925,
+      "graph_created": false
+    },
+    "bf16_projection_graph": {
+      "runs": [
+        {
+          "seconds": 0.7735024039866403,
+          "first_token_seconds": 0.014954399986891076,
+          "tokens": 64,
+          "tokens_per_second": 82.74053147106365,
+          "token_ids": [
+            599,
+            54,
+            63,
+            24,
+            51,
+            59,
+            54,
+            63,
+            29,
+            63,
+            56,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60
+          ]
+        },
+        {
+          "seconds": 0.5261137030029204,
+          "first_token_seconds": 0.0189883999992162,
+          "tokens": 64,
+          "tokens_per_second": 121.64670799240663,
+          "token_ids": [
+            599,
+            54,
+            63,
+            24,
+            51,
+            59,
+            54,
+            63,
+            29,
+            63,
+            56,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60
+          ]
+        },
+        {
+          "seconds": 0.5268750020186417,
+          "first_token_seconds": 0.017680400022072718,
+          "tokens": 64,
+          "tokens_per_second": 121.47093666390265,
+          "token_ids": [
+            599,
+            54,
+            63,
+            24,
+            51,
+            59,
+            54,
+            63,
+            29,
+            63,
+            56,
+            54,
+            50,
+            63,
+            42,
+            48,
+            56,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60,
+            50,
+            44,
+            60
+          ]
+        }
+      ],
+      "median_tokens_per_second": 121.55882232815463,
+      "graph_created": true
+    },
+    "eager_tokens_bitwise_same": true,
+    "graph_greedy_tokens_same": false,
+    "peak_allocated_bytes": 13322614784,
+    "model_parameter_bytes": 3273938056
+  },
+  "paired_capacity": {
+    "protocol": "persona-episode-capacity-v1",
+    "checkpoint": "/mnt/d/uTTT-artifacts/checkpoints/20261109_persona_meta_stage1/uttt_1.584b_20261109_persona_meta.pt",
+    "checkpoint_step": 512,
+    "episodes": "/root/uTTT/data/persona_memory_paired_20261109_v2/train.jsonl",
+    "episodes_sha256": "74e3b185bb61208f77f82e8b4096d5270adbe954afe74ac8a4bbdac134b7beb3",
+    "dataset_fingerprint": "caeea27aa4c62c8333e102837ecc6d8ba8312d87f1489dd47cadf45f45b8a738",
+    "split": "train",
+    "selected_episodes": [
+      {
+        "index": 154,
+        "write_rounds": 2,
+        "write_tokens": [
+          34,
+          36
+        ],
+        "query_tokens": 32,
+        "padded_total_tokens": 384,
+        "actual_total_tokens": 102
+      },
+      {
+        "index": 155,
+        "write_rounds": 2,
+        "write_tokens": [
+          34,
+          36
+        ],
+        "query_tokens": 32,
+        "padded_total_tokens": 384,
+        "actual_total_tokens": 102
+      }
+    ],
+    "seq_len_per_call": 128,
+    "chunk_size": 128,
+    "max_padded_episode_tokens": 384,
+    "meta_checkpoint_layers": 4,
+    "meta_checkpoint_time_chunks": true,
+    "meta_checkpoint_reentrant": false,
+    "inner_loop_protocol": "chunk_shared_fp32_exact_v2",
+    "static_fp32_weights_grads_adam_bytes": 11685346368,
+    "persona_storage_ledger": {
+      "writer_parameters": 445818948,
+      "writer_parameter_tensors": 204,
+      "persona_W_fp32_bytes": 212336640,
+      "persona_S_fp32_bytes": 212336640,
+      "persona_LN_fp32_bytes": 20480,
+      "persona_master_fp32_bytes": 424693760,
+      "persona_bf16_read_cache_bytes": 106168320,
+      "persona_hot_master_plus_read_cache_bytes": 530862080,
+      "persona_hardlink_alias_logical_bytes": 849387520,
+      "persona_copy_alias_physical_tensor_bytes": 849387520,
+      "persona_atomic_hardlink_tensor_peak_bytes": 849387520,
+      "scope": "One B1 persona. Alias hardlinks share one physical payload; snapshots add another payload per tag. KV/temporary tensors and serialization overhead excluded."
+    },
+    "parameter_dtype": "float32",
+    "activation_dtype": "bfloat16",
+    "persona_master_dtype": "float32",
+    "status": "ok",
+    "weights_saved": false,
+    "useful_memory_quality_established": false,
+    "available_memory": {
+      "free_bytes": 32429309952,
+      "runtime_free_bytes": 32429309952,
+      "global_free_bytes": 32516341760,
+      "global_total_bytes": 34190917632,
+      "device_uuid": "GPU-755d989f-b38f-e7d8-1942-f5c0f796fc10",
+      "gpu_index": 0,
+      "global_source": "nvidia-smi"
+    },
+    "allocator_limit_bytes": 30064771072,
+    "parameter_scope": "writer",
+    "total": 1583879748,
+    "trainable": 445818948,
+    "frozen": 1138060800,
+    "requested_steps": 2,
+    "steps": [
+      {
+        "step": 1,
+        "seconds": 1.9837148149963468,
+        "query_ce": 2.807373046875,
+        "support_surprise_monitor_only": 1.212181568145752,
+        "grad_norm": 0.7197657823562622,
+        "writer_parameter_tensors": 204,
+        "finite_writer_gradients": 204,
+        "finite_nonzero_writer_gradients": 204,
+        "zero_writer_grad_names": [],
+        "writer_grad_norm_min": 4.2438507080078125e-05,
+        "writer_grad_norm_max": 0.12500017881393433,
+        "memory": {
+          "allocated_bytes": 19871227904,
+          "reserved_bytes": 21816672256,
+          "peak_allocated_bytes": 21318731776,
+          "peak_reserved_bytes": 21816672256
+        }
+      },
+      {
+        "step": 2,
+        "seconds": 1.6255966739845462,
+        "query_ce": 2.9251708984375,
+        "support_surprise_monitor_only": 1.2127501964569092,
+        "grad_norm": 0.8041903972625732,
+        "writer_parameter_tensors": 204,
+        "finite_writer_gradients": 204,
+        "finite_nonzero_writer_gradients": 203,
+        "zero_writer_grad_names": [
+          "layers.4.uttt.w_alpha.bias"
+        ],
+        "writer_grad_norm_min": 0.0,
+        "writer_grad_norm_max": 0.1410033106803894,
+        "memory": {
+          "allocated_bytes": 19880271872,
+          "reserved_bytes": 25990004736,
+          "peak_allocated_bytes": 24886702592,
+          "peak_reserved_bytes": 25990004736
+        }
+      }
+    ],
+    "checkpoint_optimizer_restored": false,
+    "step_timing_includes_writer_diagnostics": true,
+    "frozen_parameters_sha256_before": "648360a94c829c3a5fdba8ad63a44c4d638e14306c1873d46c3d9f3acd076330",
+    "writer_tensors_nonzero_at_least_once": 204,
+    "query_calls_checked_no_KV_or_support_text": 2,
+    "frozen_parameters_sha256_after": "648360a94c829c3a5fdba8ad63a44c4d638e14306c1873d46c3d9f3acd076330",
+    "frozen_parameters_unchanged": true,
+    "no_write_logits_bitwise_unchanged": true,
+    "optimizer_state_parameters": 204,
+    "optimizer_state_elements": 445818948,
+    "optimizer_steps": [
+      2
+    ],
+    "optimizer_moments_fp32": true,
+    "finite": true,
+    "allocated_bytes": 8494074880,
+    "reserved_bytes": 25990004736,
+    "peak_allocated_bytes": 24886702592,
+    "peak_reserved_bytes": 25990004736
+  },
+  "paired_data_manifest": {
+    "protocol": "persona_split_request_memory_v1",
+    "seed": 20261115,
+    "seq_len": 128,
+    "payload_length": 3,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "files": {
+      "train.jsonl": {
+        "rows": 576,
+        "sha256": "74e3b185bb61208f77f82e8b4096d5270adbe954afe74ac8a4bbdac134b7beb3"
+      },
+      "test.jsonl": {
+        "rows": 64,
+        "sha256": "333fb65c83aaf7436c1aa6a5046fd1cfe4440ffe8f90a68c5aff8e31ca528b24"
+      }
+    },
+    "split_episodes": {
+      "train": 512,
+      "dev": 64,
+      "test": 64
+    },
+    "counterfactual_pairs": true,
+    "split_entity_groups": {
+      "train": 256,
+      "dev": 32,
+      "test": 32
+    },
+    "split_intersections": {
+      "train:dev": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      },
+      "train:test": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      },
+      "dev:test": {
+        "entities": 0,
+        "payloads": 0,
+        "prompt_families": 0
+      }
+    },
+    "interference_writes": 0,
+    "split_tasks": {
+      "train": {
+        "recall": 384,
+        "correction": 64,
+        "reply_prefix": 64
+      },
+      "dev": {
+        "recall": 48,
+        "correction": 8,
+        "reply_prefix": 8
+      },
+      "test": {
+        "recall": 48,
+        "correction": 8,
+        "reply_prefix": 8
+      }
+    },
+    "notes": [
+      "Explicit train/dev splits share train.jsonl; test.jsonl must never be trained on.",
+      "Each support and the query are separate calls. Only fast weights/momentum may cross the boundary.",
+      "Exact free-generation recall, mismatch, isolation and save/reload are measured separately from teacher forcing.",
+      "Reply-prefix tasks check a minimal stored preference, not broad natural conversation quality."
+    ]
+  },
+  "cpu_regression": {
+    "exit_code": 0,
+    "summary": [
+      "Ran 617 tests in 18.126s",
+      "OK (skipped=23)"
+    ]
+  },
+  "gpu_regression": {
+    "runtime_gpu_precision_v1": [
+      "Ran 4 tests in 1.016s",
+      "OK"
+    ],
+    "runtime_gpu_graph_v1": [
+      "Ran 9 tests in 0.965s",
+      "OK"
+    ],
+    "runtime_gpu_readcache_v1": [
+      "Ran 3 tests in 0.674s",
+      "OK"
+    ]
+  }
+}

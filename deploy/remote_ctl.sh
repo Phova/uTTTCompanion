@@ -86,6 +86,8 @@ Core Commands:
                           --surprise-threshold <f>   Override Surprise Gate threshold tau (default: 0.015)
                           --enable-ttt              Require meta-trained weights and enable online writes
                           --disable-ttt             Disable online writes for a read-only comparison
+                          --cuda-graph              Opt into faster graph decode with different BF16 reduction order
+                          --no-cuda-graph           Use standard generation (default for meta checkpoints)
                           --no-compile               Disable torch.compile kernel fusion on startup
                           --lightweight              Use lightweight fallback model when cold-starting
   status                Show remote RTX 5090 GPU utilization, tmux sessions, and checkpoint info

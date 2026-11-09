@@ -52,5 +52,16 @@ class PersonaMemoryEvaluationTests(unittest.TestCase):
         self.assertEqual(report['summary']['persistence_failures'],2)
         self.assertEqual(report['summary']['arms']['save_reload']['passes'],0)
 
+    def test_identical_query_must_follow_the_counterfactual_written_value(self):
+        rows=self.rows();paired=copy.deepcopy(rows[0])
+        paired['episode_id']='0-cf';paired['answer']='NEW3';paired['correction_text']='value=NEW3'
+        paired['memory_task']['payload']='NEW3';rows.append(paired)
+        report=evaluate_with_adapter(rows,MemoryAdapter(),max_samples=3)
+        controls=report['counterfactual_controls']
+        self.assertEqual(controls['total'],2)
+        self.assertEqual(controls['counterfactual_exact'],2)
+        self.assertEqual(controls['reply_changes_with_memory'],2)
+        self.assertEqual(controls['original_answer_leaked'],0)
+
 
 if __name__=='__main__':unittest.main()

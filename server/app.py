@@ -379,7 +379,8 @@ def main() -> None:
         default=None,
         help="Base checkpoint path (defaults to latest .pt in checkpoints/ or base_uttt.pt)",
     )
-    parser.add_argument("--personas-dir", type=str, default="personas", help="User persona fast-weight directory")
+    parser.add_argument("--personas-dir", type=str, default=None,
+                        help="User persona directory (defaults to the selected config, then personas)")
     parser.add_argument("--user-id", type=str, default="", help="Optional default user ID to pre-warm in GPU VRAM")
     parser.add_argument("--max-gpu-users", type=int, default=None, help="Override Tier-1 GPU VRAM LRU pool size")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Override default max generated tokens per turn")
@@ -390,6 +391,11 @@ def main() -> None:
                      help="Require compatible meta weights and enable per-user online writes")
     ttt.add_argument("--disable-ttt", dest="online_ttt", action="store_const", const=False,
                      help="Read the same model without per-turn online writes")
+    graphs = parser.add_mutually_exclusive_group()
+    graphs.add_argument("--cuda-graph", dest="cuda_graph", action="store_const", const=True, default=None,
+                        help="Opt into graph decode (BF16 attention reduction order can change token choices)")
+    graphs.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_const", const=False,
+                        help="Use standard autoregressive generation (default for meta checkpoints)")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile kernel fusion on startup")
     packing = parser.add_mutually_exclusive_group()
     packing.add_argument("--packed-projections", dest="packed_projections", action="store_const", const=True,
@@ -402,7 +408,8 @@ def main() -> None:
     os.environ["UTTT_CONFIG"] = args.config
     if args.base_ckpt:
         os.environ["UTTT_BASE_CKPT"] = args.base_ckpt
-    os.environ["UTTT_PERSONAS_DIR"] = args.personas_dir
+    if args.personas_dir is not None:
+        os.environ["UTTT_PERSONAS_DIR"] = args.personas_dir
     if args.user_id:
         os.environ["UTTT_DEFAULT_USER"] = args.user_id
     if args.max_gpu_users is not None:
@@ -415,6 +422,8 @@ def main() -> None:
         os.environ["UTTT_SURPRISE_THRESHOLD"] = str(args.surprise_threshold)
     if args.online_ttt is not None:
         os.environ["UTTT_ONLINE_TTT"] = "1" if args.online_ttt else "0"
+    if args.cuda_graph is not None:
+        os.environ["UTTT_CUDA_GRAPH"] = "1" if args.cuda_graph else "0"
     if args.no_compile:
         os.environ["UTTT_NO_COMPILE"] = "1"
     if args.packed_projections is not None:

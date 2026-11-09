@@ -6,6 +6,7 @@ are split-request memory exercises, not evidence that a trained model recalls.
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter
 import hashlib
 import json
@@ -114,7 +115,7 @@ def measure_episode(row, tokenizer, seq_len):
 
 
 def prepare(output, tokenizer_path, *, train_episodes=256, dev_episodes=32, test_episodes=32,
-            payload_length=3, seq_len=128, interference_writes=0, seed=20261109):
+            payload_length=3, seq_len=128, interference_writes=0, seed=20261109, counterfactual_pairs=False):
     output = Path(output)
     if output.exists():
         raise FileExistsError("Use a new persona-memory curriculum directory")
@@ -125,7 +126,9 @@ def prepare(output, tokenizer_path, *, train_episodes=256, dev_episodes=32, test
         raise ValueError("Use a payload length from 2 to 8 and a positive request token budget")
     if type(interference_writes) is not int or not 0 <= interference_writes <= 8:
         raise ValueError("interference_writes must be from 0 to 8")
-    payloads_needed = sum(count + sum(TASK_CYCLE[(index // 2) % len(TASK_CYCLE)] == "correction"
+    if type(counterfactual_pairs) is not bool:
+        raise ValueError("counterfactual_pairs must be boolean")
+    payloads_needed = sum(count * (2 if counterfactual_pairs else 1) + sum(TASK_CYCLE[(index // 2) % len(TASK_CYCLE)] == "correction"
                                       for index in range(count)) for count in counts.values())
     if payloads_needed > len(PAYLOAD_ALPHABET) ** payload_length:
         raise ValueError("Not enough distinct short payloads for all splits; increase payload_length")
@@ -167,6 +170,17 @@ def prepare(output, tokenizer_path, *, train_episodes=256, dev_episodes=32, test
                 raise ValueError("A generated payload accidentally occurs in its query; choose another seed")
             row["lengths"] = measure_episode(row, tokenizer, seq_len)
             rows.append(row)
+            if counterfactual_pairs:
+                replacement = fresh(used_payloads, payload_length, forbidden)
+                row["memory_task"]["counterfactual_pair"] = family
+                paired = copy.deepcopy(row)
+                paired["episode_id"] += "-cf"
+                paired["memory_task"]["payload"] = replacement
+                field = "correction_text" if old is not None else "write_text"
+                paired[field] = paired[field].replace(value, replacement, 1)
+                paired["answer"] = replacement + " READY" if task == "reply_prefix" else replacement
+                paired["lengths"] = measure_episode(paired, tokenizer, seq_len)
+                rows.append(paired)
     sets = {split: {"entities": {row["memory_task"]["entity"] for row in rows if row["memory_task"]["split"] == split},
                     "payloads": {value for row in rows if row["memory_task"]["split"] == split
                                  for value in (row["memory_task"]["payload"], row["memory_task"]["obsolete_payload"]) if value},
@@ -186,7 +200,9 @@ def prepare(output, tokenizer_path, *, train_episodes=256, dev_episodes=32, test
                 stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         files[name] = {"rows": len(selected), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     manifest = {"protocol": PROTOCOL, "seed": seed, "seq_len": seq_len, "payload_length": payload_length,
-                "tokenizer_sha256": tokenizer_hash, "files": files, "split_episodes": counts,
+                "tokenizer_sha256": tokenizer_hash, "files": files,
+                "split_episodes": {part: count * (2 if counterfactual_pairs else 1) for part, count in counts.items()},
+                "counterfactual_pairs": counterfactual_pairs, "split_entity_groups": counts,
                 "split_intersections": intersections, "interference_writes": interference_writes,
                 "split_tasks": {split: dict(Counter(row["memory_task"]["task"] for row in rows if row["memory_task"]["split"] == split)) for split in counts},
                 "notes": ["Explicit train/dev splits share train.jsonl; test.jsonl must never be trained on.",
@@ -208,11 +224,14 @@ def main():
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--interference-writes", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20261109)
+    parser.add_argument("--counterfactual-pairs", action="store_true",
+                        help="Double rows: each entity/query has two separately written answers")
     args = parser.parse_args()
     print(json.dumps(prepare(args.output, args.tokenizer, train_episodes=args.train_episodes,
                              dev_episodes=args.dev_episodes, test_episodes=args.test_episodes,
                              payload_length=args.payload_length, seq_len=args.seq_len,
-                             interference_writes=args.interference_writes, seed=args.seed), ensure_ascii=False))
+                             interference_writes=args.interference_writes, seed=args.seed,
+                             counterfactual_pairs=args.counterfactual_pairs), ensure_ascii=False))
 
 
 if __name__ == "__main__":

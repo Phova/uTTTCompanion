@@ -95,6 +95,7 @@ class uTTTPersonalizer:
     High-level engine orchestrating multi-user Test-Time Personalization on RTX 5090.
     """
     _online_ttt_disabled_reason = "memory writes require compatible meta-training"
+    _default_cuda_graph = "1"
 
     def __init__(
         self,
@@ -138,6 +139,9 @@ class uTTTPersonalizer:
         if enable_online_ttt is True and not compatible_meta:
             raise ValueError("Online TTT requires a compatible meta-trained checkpoint, not pretrain/SFT weights")
         self.online_updates_enabled = compatible_meta and enable_online_ttt is not False
+        # Ring-buffer attention can change BF16 reduction order. Keep the
+        # standard path for new meta checkpoints unless explicitly requested.
+        self._default_cuda_graph = "0" if compatible_meta else "1"
         self._online_ttt_disabled_reason = (
             "disabled by request" if compatible_meta and enable_online_ttt is False
             else "memory writes require compatible meta-training"
@@ -429,7 +433,7 @@ class uTTTPersonalizer:
                 temperature=temp,
                 top_p=tp,
                 eos_token_id=self.tokenizer.EOS_ID,
-                use_cuda_graph=os.environ.get("UTTT_CUDA_GRAPH", "1") != "0",
+                use_cuda_graph=os.environ.get("UTTT_CUDA_GRAPH", self._default_cuda_graph) != "0",
                 **sampling_options,
             )
             try:

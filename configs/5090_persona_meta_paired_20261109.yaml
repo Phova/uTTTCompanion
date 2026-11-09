@@ -1,0 +1,80 @@
+# Counterfactual continuation: identical queries require different stored values.
+# Frozen language/read weights retain the parent model's no-write behavior.
+hardware:
+  device: cuda
+  precision: bfloat16
+  tf32_matmul: true
+  torch_compile: false
+  vram_limit_gb: 28.0
+  enforce_vram_limit: true
+  cuda_allocator_conf: expandable_segments:True
+
+model:
+  name: uTTT-1.584B-Persona-Meta-Paired
+  vocab_size: 32000
+  d_model: 2560
+  n_layers: 34
+  n_heads: 20
+  n_kv_heads: 5
+  d_ff_fast: 6912
+  sliding_window_size: 512
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-5
+  dropout: 0.0
+  repetition_penalty: 1.0
+
+uttt:
+  chunk_size: 128
+  base_inner_lr: 0.015
+  base_weight_decay: 0.005
+  momentum_beta: 0.9
+  max_inner_grad_norm: 1.0
+  normalize_loss_by_dim: true
+  surprise_threshold: 0.015
+  elastic_anchor_lambda: 0.02
+  max_weight_drift_ratio: 0.35
+
+training:
+  stage: meta
+  parameter_scope: writer
+  meta_objective: episode_support_query_v1
+  expected_inner_loop_protocol: chunk_shared_fp32_exact_v2
+  tokenizer_path: data/pretrain_20261029/tokenized/tokenizer.json
+  seed: 20261115
+  micro_batch_size: 1
+  grad_accum_steps: 1
+  seq_len: 128
+  max_steps: 1024
+  warmup_steps: 20
+  outer_lr: 1.0e-4
+  meta_fast_lr: 1.0e-4
+  weight_decay: 0.0
+  max_outer_grad_norm: 1.0
+  surprise_aux_loss_weight: 0.0
+  gradient_checkpointing: true
+  gradient_checkpointing_every: 1
+  meta_checkpoint_layers: 4
+  meta_checkpoint_time_chunks: true
+  meta_checkpoint_reentrant: false
+  autocast_cache_across_accumulation: false
+  pack_sequences: false
+  validation_fraction: 0.0
+  validation_selection_metric: validation_ce
+  eval_interval: 128
+  eval_samples: 64
+  log_interval: 32
+  save_interval: 512
+  checkpoint_keep_previous: false
+  checkpoint_full_on_validation_improvement: false
+  checkpoint_save_initial_full: true
+  base_checkpoint_path: /mnt/c/uTTT-artifacts/checkpoints/20261109_persona_meta/uttt_1.584b_20261109_persona_meta.pt
+
+personalization:
+  personas_dir: /mnt/c/uTTT-artifacts/personas/meta_20261109
+  max_gpu_users: 2
+  max_cpu_users: 2
+  auto_save_every_turn: true
+  default_max_new_tokens: 128
+  temperature: 0.3
+  top_p: 0.9

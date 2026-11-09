@@ -93,6 +93,15 @@ def load_episodes(path, tokenizer, tokenizer_sha256, *, split="test", context_li
         if any(identities[left][key] & identities[right][key] for key in identities[left]):
             raise ValueError("Actual episode split identities overlap")
     selected = [row for row in all_rows if row["memory_task"]["split"] == split]
+    if manifest.get("counterfactual_pairs"):
+        pairs = defaultdict(list)
+        for row in all_rows:
+            pairs[row["family"]].append(row)
+        for family, pair in pairs.items():
+            if (len(pair) != 2 or pair[0]["query_text"] != pair[1]["query_text"]
+                    or pair[0]["answer"] == pair[1]["answer"]
+                    or any(row["memory_task"].get("counterfactual_pair") != family for row in pair)):
+                raise ValueError("Counterfactual pairs require one identical query and two distinct answers")
     if len(selected) < 2:
         raise ValueError("At least two heldout users are required for mismatched-state controls")
     return selected, manifest, {"data_sha256": file_hash(path), "manifest_sha256": file_hash(manifest_path),
@@ -175,6 +184,18 @@ def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
                       == (row["memory_task"]["task"], row["memory_task"]["language"])]
         other = (same_group or candidates)[0]
         results.append(evaluate_episode(adapter, row, other))
+        paired = [candidate for candidate in rows if candidate["memory_task"]["entity"] == row["memory_task"]["entity"]
+                  and candidate["answer"] != row["answer"] and candidate["query_text"] == row["query_text"]]
+        if paired:
+            state = adapter.base_state()
+            for text in support_texts(paired[0]):
+                state = adapter.write(state, text)
+            reply = adapter.read(adapter.clone(state), row["query_text"]).strip()
+            results[-1]["counterfactual_control"] = {
+                "same_query": True, "reply": reply, "expected_counterfactual": paired[0]["answer"],
+                "counterfactual_exact": reply == paired[0]["answer"],
+                "original_answer_leaked": reply == row["answer"],
+                "reply_changes_with_memory": reply != results[-1]["replies"]["correct_write"]}
         if progress is not None:
             progress({"episode": len(results), "episode_id": row["episode_id"],
                       "correct_write": results[-1]["arms"]["correct_write"]["exact_match"]})
@@ -192,9 +213,14 @@ def evaluate_with_adapter(rows, adapter, *, max_samples=64, progress=None):
                 "no_write_state_failures": sum(not row["no_write_state_unchanged"] for row in items)}
     groups = {field: {value: aggregate([row for row in results if row[field] == value])
                       for value in sorted({row[field] for row in results})} for field in ("task", "language")}
+    counterfactual = [row["counterfactual_control"] for row in results if "counterfactual_control" in row]
     return {"protocol": "persona_query_only_free_generation_v1", "free_generation_accuracy_measured": True,
             "teacher_forcing_used": False, "support_text_or_kv_carried_to_query": False,
             "summary": aggregate(results), "groups": groups, "results": results,
+            "counterfactual_controls": {"total": len(counterfactual),
+                "counterfactual_exact": sum(row["counterfactual_exact"] for row in counterfactual),
+                "reply_changes_with_memory": sum(row["reply_changes_with_memory"] for row in counterfactual),
+                "original_answer_leaked": sum(row["original_answer_leaked"] for row in counterfactual)},
             "notes": ["Every read is query-only, starts at position zero and uses an independently cloned fast-weight/momentum state.",
                       "State changes or low surprise alone do not demonstrate useful memory; compare exact recall against both no-write and mismatch.",
                       "Isolation checks independent persona states and persistence, not concurrent HTTP session routing.",
@@ -322,7 +348,7 @@ def evaluate_production_turns(manager, rows, *, maximum=2, max_new_tokens=32):
 
 
 def evaluate(checkpoint, data_path, output, *, split="test", max_samples=64, max_new_tokens=32,
-             device=None, apply_guards=False, allow_untrained_baseline=False, production_turns=0):
+             device=None, apply_guards=False, allow_untrained_baseline=False, production_turns=0, temp_dir=None):
     import torch
     from engine.checkpoint_manager import DualTrackCheckpointManager
     from model.uttt_model import uTTTModel
@@ -341,7 +367,9 @@ def evaluate(checkpoint, data_path, output, *, split="test", max_samples=64, max
         raise ValueError("Only CPU/CUDA evaluation is supported")
     gpu = guard_gpu(torch, device, checkpoint.stat().st_size) if device.type == "cuda" else None
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="persona-memory-eval-", dir=output.parent) as directory:
+    temporary_parent = Path(temp_dir).resolve() if temp_dir else output.parent
+    temporary_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="persona-memory-eval-", dir=temporary_parent) as directory:
         # Both arms retain original FP32 parameters and use BF16 CUDA GEMMs.
         # Compatible meta serving preserves masters even with BF16 activation
         # dtype. A language-stage diagnostic must explicitly request FP32 load.
@@ -406,10 +434,12 @@ def main():
     parser.add_argument("--apply-guards", action="store_true")
     parser.add_argument("--allow-untrained-baseline", action="store_true")
     parser.add_argument("--production-turns", type=int, default=0)
+    parser.add_argument("--temp-dir", type=Path, help="Scratch volume for temporary exact persona states")
     args = parser.parse_args()
     report = evaluate(args.checkpoint, args.data_path, args.output, split=args.split, max_samples=args.max_samples,
                       max_new_tokens=args.max_new_tokens, device=args.device, apply_guards=args.apply_guards,
-                      allow_untrained_baseline=args.allow_untrained_baseline, production_turns=args.production_turns)
+                      allow_untrained_baseline=args.allow_untrained_baseline, production_turns=args.production_turns,
+                      temp_dir=args.temp_dir)
     print(json.dumps(report["summary"], sort_keys=True))
 
 
