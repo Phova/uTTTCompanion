@@ -7,7 +7,7 @@ family-isolated and must never be passed back as training data.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import hashlib
 import json
 import math
@@ -120,10 +120,31 @@ def complete_prefix(text, turns, max_tokens, length_fn):
     return best
 
 
-def _select(pool, required, *, seed, split, min_multi_turn_fraction):
-    ranked = {category: sorted(pool[category], key=lambda row: (
+def _rank_candidates(rows, *, seed, split, category, balance_key):
+    ranked = sorted(rows, key=lambda row: (
         row.get("selection_priority", 0), stable_hash(f"selection:{seed}:{row['text_sha256']}")))
-              for category in CATEGORIES}
+    if balance_key is None:
+        return ranked
+    layers = defaultdict(lambda: defaultdict(deque))
+    for row in ranked:
+        layers[row.get("selection_priority", 0)][row[balance_key]].append(row)
+    balanced = []
+    for priority in sorted(layers):
+        strata = layers[priority]
+        active = deque(sorted(strata, key=lambda name: (
+            stable_hash(f"balance:{seed}:{split}:{category}:{priority}:{name}"), name)))
+        while active:
+            name = active.popleft()
+            balanced.append(strata[name].popleft())
+            if strata[name]:
+                active.append(name)
+    return balanced
+
+
+def _select(pool, required, *, seed, split, min_multi_turn_fraction, balance_key=None):
+    def rank(rows, category):
+        return _rank_candidates(rows, seed=seed, split=split, category=category, balance_key=balance_key)
+    ranked = {category: rank(pool[category], category) for category in CATEGORIES}
     available = {category: len(ranked[category]) for category in CATEGORIES}
     multi = {category: [row for row in ranked[category] if row["turns"] > 1] for category in CATEGORIES}
     if any(available[category] < required[category] for category in CATEGORIES):
@@ -139,17 +160,19 @@ def _select(pool, required, *, seed, split, min_multi_turn_fraction):
             {"split": split, "missing": target, "available": {key: len(value) for key, value in multi.items()}}))
     selected = []
     for category in CATEGORIES:
-        chosen = multi[category][:assigned[category]]
+        # Rank the multi-turn subset separately so single-turn rows cannot
+        # consume a stratum's turn in the required conversation quota.
+        chosen = rank(multi[category], category)[:assigned[category]]
         identities = {row["text_sha256"] for row in chosen}
-        chosen += [row for row in ranked[category] if row["text_sha256"] not in identities][
-            :required[category] - len(chosen)]
+        remaining = [row for row in ranked[category] if row["text_sha256"] not in identities]
+        chosen += rank(remaining, category)[:required[category] - len(chosen)]
         selected.extend(chosen)
     return selected
 
 
 def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, .2), seed=20261108,
             max_tokens=512, validation_fraction=.02, heldout_fraction=.1, heldout_count=None,
-            min_multi_turn_fraction=.25, exclusions=(), length_fn=None):
+            min_multi_turn_fraction=.25, exclusions=(), length_fn=None, balance_key=None):
     """Select exactly count mixed train/validation examples plus a separate heldout.
 
     Category labels are supplied by the upstream curator, never inferred from
@@ -158,10 +181,15 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
     manifest counts. Open-ended questions may have multiple reasonable answers.
     Optional selection_priority is a nonnegative integer: smaller values rank
     first within the existing split/category and multi-turn quota, default 0.
+    Optional balance_key names an explicit nonempty string stratum on every
+    candidate. Strata rotate fairly within each priority layer; exhausted strata
+    yield their remaining capacity to others without duplicating candidates.
     """
     if (type(count) is not int or count < 3 or max_tokens < 16 or not 0 < validation_fraction < .5
             or not 0 < heldout_fraction < .5 or not 0 <= min_multi_turn_fraction <= 1):
         raise ValueError("Invalid count, token budget, split fraction or multi-turn fraction")
+    if balance_key is not None and (not isinstance(balance_key, str) or not balance_key.strip()):
+        raise ValueError("balance_key must be a nonempty field name or None")
     if heldout_count is None:
         heldout_count = max(3, math.ceil(count * .05))
     if type(heldout_count) is not int or heldout_count < 1:
@@ -194,6 +222,8 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
         priority = original.get("selection_priority", 0)
         if type(priority) is not int or priority < 0:
             raise ValueError(f"Candidate {index} selection_priority must be a nonnegative integer")
+        if balance_key is not None and (not isinstance(original.get(balance_key), str) or not original[balance_key].strip()):
+            raise ValueError(f"Candidate {index} requires a nonempty string stratum for balance_key={balance_key!r}")
         if "deterministic_answer" in original and type(original["deterministic_answer"]) is not bool:
             raise ValueError(f"Candidate {index} deterministic_answer must be boolean")
         try:
@@ -288,7 +318,7 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
     selected = []
     for split, required in (("train", train_quotas), ("validation", val_quotas), ("heldout", external_quotas)):
         selected += _select(pools[split], required, seed=seed, split=split,
-                            min_multi_turn_fraction=min_multi_turn_fraction)
+                            min_multi_turn_fraction=min_multi_turn_fraction, balance_key=balance_key)
     grouping_stats = {"connected_components": len(members),
                       "largest_candidate_group": max(Counter(row["validation_group_id"] for row in clean).values(), default=0),
                       "initial_greeting_links_skipped": sum(len(row["_group_contexts"]) < len(row["_contexts"]) for row in clean)}
@@ -335,6 +365,18 @@ def prepare(candidates, output, *, tokenizer=None, count=12000, ratios=(.6, .2, 
                           "validation.jsonl is an inspection copy, not a second independent holdout.",
                           "heldout.jsonl is independently family isolated and excluded from train.jsonl.",
                           "No duplicate upsampling or fake EOS; long conversations retain only a complete prefix."]}
+    if balance_key is not None:
+        availability = {split: {category: dict(sorted(Counter(row[balance_key] for row in pool[category]).items()))
+                                for category in CATEGORIES} for split, pool in pools.items()}
+        distribution = {split: {category: dict(sorted(Counter(row[balance_key] for row in selected
+                                                              if row["split"] == split and row["category"] == category).items()))
+                                for category in CATEGORIES} for split in pools}
+        manifest["balance"] = {"key": balance_key, "unit": "distinct_rows", "available": availability, "selected": distribution,
+                               "saturated": {split: {category: [name for name, capacity in strata.items()
+                                                                 if distribution[split][category].get(name, 0) == capacity]
+                                                      for category, strata in categories.items()}
+                                             for split, categories in availability.items()},
+                               "scope": "Round-robin within priority layers and existing category/split/multi-turn quotas; finite capacity can prevent equal counts."}
     (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -352,13 +394,14 @@ def main():
     parser.add_argument("--heldout-fraction", type=float, default=.1)
     parser.add_argument("--heldout-count", type=int)
     parser.add_argument("--min-multi-turn-fraction", type=float, default=.25)
+    parser.add_argument("--balance-key", help="Candidate field containing an explicit string skill/stratum; optional")
     parser.add_argument("--exclude", type=Path, action="append", default=[])
     args = parser.parse_args()
     result = prepare(args.candidates, args.output, tokenizer=args.tokenizer, count=args.count,
                      ratios=args.ratios, seed=args.seed, max_tokens=args.max_tokens,
                      validation_fraction=args.validation_fraction, heldout_fraction=args.heldout_fraction,
                      heldout_count=args.heldout_count, min_multi_turn_fraction=args.min_multi_turn_fraction,
-                     exclusions=args.exclude)
+                     exclusions=args.exclude, balance_key=args.balance_key)
     print(json.dumps({"status": "complete", "output": str(args.output), "counts": result["all_mixture"]}, ensure_ascii=False))
 
 

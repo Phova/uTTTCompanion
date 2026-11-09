@@ -423,6 +423,7 @@ cd "$ROOT"
 mkdir -p logs personas/snapshots
 PYTHON=python3
 [[ ! -x "$ROOT/.venv/bin/python3" ]] || PYTHON="$ROOT/.venv/bin/python3"
+"$PYTHON" deploy/serve_guard.py --workspace "$ROOT"
 STOP_ARGS=(--workspace "$ROOT" --session "$SESSION" --pid-file "$ROOT/logs/$SESSION.pid" --kind serve)
 [[ "$DOCKER" != 1 ]] || STOP_ARGS+=(--container "$SESSION")
 "$PYTHON" deploy/stop_training.py "${STOP_ARGS[@]}"

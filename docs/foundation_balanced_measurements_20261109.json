@@ -1,0 +1,850 @@
+{
+  "protocol": "uttt-balanced-foundation-preparation-v1",
+  "date": "2026-11-09",
+  "status": "prepared_and_verified; outcome pending",
+  "run_id": "20261109_foundation_balanced",
+  "training_plan": {
+    "steps": 3000,
+    "seed": 20261112,
+    "fresh_optimizer": true,
+    "outer_lr": 1e-05,
+    "w0_lr": 5e-06,
+    "source_checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_foundation_corrected/uttt_1.584b_20261109_foundation_corrected.best.pt",
+    "source_checkpoint_sha256": "f289fa44b107129f6463668b9ad66310a06a130f47c7cb123995d43482c05718",
+    "parent_step": 1000,
+    "sample_ratios": {
+      "chat": 0.2,
+      "reasoning": 0.5,
+      "coding": 0.3
+    },
+    "full_save_steps": [
+      1,
+      1000,
+      2000,
+      3000
+    ],
+    "best_evaluation_interval": 500,
+    "C_minimum_planned_free_reserve_bytes": 100000000000,
+    "D_minimum_planned_free_reserve_bytes": 15000000000,
+    "estimated_checkpoint_steady_bytes": 21781000000,
+    "estimated_atomic_write_peak_bytes": 37223000000,
+    "automatic_meta_training": false,
+    "automatic_service_replacement": false
+  },
+  "course_changes": {
+    "balance_key": "foundation_skill",
+    "all_priorities_zero_for_this_course": true,
+    "coding_code_only": true,
+    "coding_name_variants_per_language": 8,
+    "coding_presentations_per_semantic_family": 16,
+    "top_three_coding_rows": 2480,
+    "total_coding_rows": 3780,
+    "top_three_coding_fraction": 0.656084656084656,
+    "fresh_cohort_is_same_domain_next_phase_exclusion_not_all_history_novelty": true
+  },
+  "data_parity": {
+    "train_rows": 11400,
+    "validation_rows": 600,
+    "heldout_rows": 600,
+    "train_fingerprint": "58d428e6af030b001610714be33a00a7f42bd4ccae56c18ac2564276a306c248",
+    "validation_fingerprint": "6d1ecba8a53ee5558b18ac8c4ff9856a42ec9a15c3a31b0e9c06b52f75d5088c",
+    "group_overlap": 0,
+    "audited_windows": 1024,
+    "bad_windows": 0,
+    "max_audited_length": 454,
+    "sample_actual_tokens": {
+      "reasoning": 20132,
+      "chat": 27869,
+      "coding": 23839
+    },
+    "sample_supervised_tokens": {
+      "reasoning": 4189,
+      "chat": 17909,
+      "coding": 6724
+    },
+    "human_quality_verified": false,
+    "verified_ability_rows": {
+      "coding_generated": 3780,
+      "reasoning_generated": 3481,
+      "grounded_dialogue_rows": 1053,
+      "prior_reference_replay": 2819
+    },
+    "category_language": {
+      "coding:en": 1879,
+      "reasoning:zh": 3134,
+      "chat:zh": 1993,
+      "reasoning:en": 3166,
+      "chat:en": 527,
+      "coding:zh": 1901
+    },
+    "operations": {
+      "clamp": 827,
+      "order": 403,
+      "subtract": 401,
+      "replay:copy": 403,
+      "length_test": 586,
+      "slice_text": 80,
+      "replay:extract": 403,
+      "replay:sort": 404,
+      "affine": 826,
+      "clock": 404,
+      "interval": 827,
+      "quantity": 402,
+      "add": 402,
+      "divide": 298,
+      "max": 402,
+      "mod_equals": 250,
+      "replay:length": 401,
+      "min": 403,
+      "replay:uppercase": 402,
+      "nth_default": 240,
+      "weekday": 144,
+      "boolean": 48,
+      "multiply": 174,
+      "replay:reverse": 403,
+      "replay:lowercase": 403,
+      "reverse_value": 32,
+      "lookup_default": 32,
+      "sort_items": 32,
+      "safe_divide": 32,
+      "repeat_text": 16
+    },
+    "selected_skills": {
+      "coding:clamp": 827,
+      "reasoning:order": 403,
+      "chat:correction": 320,
+      "reasoning:subtract": 401,
+      "replay:copy": 403,
+      "coding:length_test": 586,
+      "coding:slice_text": 80,
+      "chat:natural": 1467,
+      "replay:extract": 403,
+      "replay:sort": 404,
+      "coding:affine": 826,
+      "reasoning:clock": 404,
+      "coding:interval": 827,
+      "reasoning:quantity": 402,
+      "reasoning:add": 402,
+      "chat:available_day": 207,
+      "reasoning:divide": 298,
+      "reasoning:max": 402,
+      "coding:mod_equals": 250,
+      "replay:length": 401,
+      "chat:budget_choice": 309,
+      "chat:listed_ingredients": 217,
+      "reasoning:min": 403,
+      "replay:uppercase": 402,
+      "coding:nth_default": 240,
+      "reasoning:weekday": 144,
+      "reasoning:boolean": 48,
+      "reasoning:multiply": 174,
+      "replay:reverse": 403,
+      "replay:lowercase": 403,
+      "coding:reverse_value": 32,
+      "coding:lookup_default": 32,
+      "coding:sort_items": 32,
+      "coding:safe_divide": 32,
+      "coding:repeat_text": 16
+    },
+    "semantic_families": 6424,
+    "fresh_cohort_excluded": true
+  },
+  "data_manifest": {
+    "protocol": "uttt-chat-curriculum-v1",
+    "seed": 20261112,
+    "count_including_internal_validation": 12000,
+    "ratios": {
+      "chat": 0.2,
+      "reasoning": 0.5,
+      "coding": 0.3
+    },
+    "validation_fraction": 0.05,
+    "heldout_candidate_fraction": 0.1,
+    "max_tokens": 512,
+    "tokenizer_sha256": "97565bef97c157f221828e9619e9011a4533342a07697e2724389ee22439aee4",
+    "input_sha256": "cdb88a464050b8a786cb0c93334e535fdf21dd787fd8c04b88151f67481f2b4e",
+    "exclusion_files": {
+      "/root/uTTT/data/instruction_recovery_20261105/heldout.jsonl": "d9a86976fa8a1d2db851fd746be9d981607c4fed6e0af8809a83a6db5f1a4e4b",
+      "/root/uTTT/data/instruction_recovery_20261105/eval_tasks.jsonl": "b6c2b208cfc274e8473ddae83e7e05bc516dae439e559902b1c28949967b699d",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/docs/quality_diagnosis_20261108.json": "953f78836afdc72534d7a79c367ad0c44142638b8c1608dccf77c4570fd96860",
+      "/root/uTTT/data/chat_curriculum_20261108_final3/heldout.jsonl": "a43882e2f37e7ab3312c43eb6ef6e23d074f8b04b29d5356d0a30ceb621c7e0c",
+      "/root/uTTT/data/foundation_curriculum_20261108_v2/heldout.jsonl": "17a1c7803b14ae41073b2565ad3c1d1649c2a0547d0df685487c542c9776a3b4",
+      "/root/uTTT/data/foundation_curriculum_corrected_20261109/heldout.jsonl": "66fd55041340558b02d58d0fc5018d19c8b533fb06f4d75faf7184a858fe60ca",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_holdout_tasks_20261109.jsonl": "2d0fe7da1a8b0c2bc89a3159429eaf8414e2a25494933a543735df2f73f452f6",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/chat_development_tasks_20261108.jsonl": "d59806817a00f97702abe8dee9461be39a733a760c9e49fc12c2a58389de3868",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_development_tasks_20261108.jsonl": "6db4cf980459d0b5fe731c4c3cb35e84374229e6fafa084c435024295a9805e3",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_holdout_tasks_20261108.jsonl": "e1d6992b70affda652b0fedd40889ad6cd79134bcfa0b581b50300790356e78e"
+    },
+    "input_rows": 30993,
+    "rejected": {
+      "excluded_probe_or_family": 2949,
+      "duplicate_text": 0
+    },
+    "grouping": {
+      "connected_components": 11782,
+      "largest_candidate_group": 68,
+      "initial_greeting_links_skipped": 3
+    },
+    "available": {
+      "train": {
+        "chat": 6873,
+        "reasoning": 11995,
+        "coding": 4960
+      },
+      "validation": {
+        "chat": 353,
+        "reasoning": 680,
+        "coding": 272
+      },
+      "heldout": {
+        "chat": 818,
+        "reasoning": 1325,
+        "coding": 768
+      }
+    },
+    "training": {
+      "rows": 11400,
+      "category": {
+        "coding": 3420,
+        "reasoning": 5700,
+        "chat": 2280
+      },
+      "language": {
+        "en": 5023,
+        "zh": 6377
+      },
+      "multi_turn": 2279,
+      "groups": 5475,
+      "shortened_complete_prefixes": 1
+    },
+    "validation": {
+      "rows": 600,
+      "category": {
+        "coding": 180,
+        "reasoning": 300,
+        "chat": 120
+      },
+      "language": {
+        "zh": 339,
+        "en": 261
+      },
+      "multi_turn": 120,
+      "groups": 306,
+      "shortened_complete_prefixes": 0
+    },
+    "heldout": {
+      "rows": 600,
+      "category": {
+        "reasoning": 300,
+        "coding": 180,
+        "chat": 120
+      },
+      "language": {
+        "en": 288,
+        "zh": 312
+      },
+      "multi_turn": 120,
+      "groups": 334,
+      "shortened_complete_prefixes": 0
+    },
+    "all_mixture": {
+      "rows": 12000,
+      "category": {
+        "coding": 3600,
+        "reasoning": 6000,
+        "chat": 2400
+      },
+      "language": {
+        "en": 5284,
+        "zh": 6716
+      },
+      "multi_turn": 2399,
+      "groups": 5781,
+      "shortened_complete_prefixes": 1
+    },
+    "group_overlap": 0,
+    "files": {
+      "train.jsonl": {
+        "sha256": "b8d7b0e877da6d04689c4944482e393099a7d34ac80766c242152c87e3922228",
+        "rows": 12000
+      },
+      "validation.jsonl": {
+        "sha256": "d2df34c54dded2b97a9f201dc8c463469bee5f87ef3edf39d334183b0220c310",
+        "rows": 600
+      },
+      "heldout.jsonl": {
+        "sha256": "fdab917c64a92bfd8fd9cda1c6ddf507409db2f334848525b480ee5b220c502f",
+        "rows": 600
+      }
+    },
+    "notes": [
+      "Category labels come from the input curator, never keyword inference.",
+      "Alternate open-ended answers are retained; only deterministic_answer=true conflicts are rejected.",
+      "Generic initial greetings do not join unrelated topics; original families/full conversations/later contexts still bind.",
+      "train.jsonl includes internal validation: use the SAME seed, fraction and validation_group_id in the trainer.",
+      "validation.jsonl is an inspection copy, not a second independent holdout.",
+      "heldout.jsonl is independently family isolated and excluded from train.jsonl.",
+      "No duplicate upsampling or fake EOS; long conversations retain only a complete prefix."
+    ],
+    "balance": {
+      "key": "foundation_skill",
+      "unit": "distinct_rows",
+      "available": {
+        "train": {
+          "chat": {
+            "chat:available_day": 170,
+            "chat:budget_choice": 264,
+            "chat:correction": 300,
+            "chat:listed_ingredients": 180,
+            "chat:natural": 5959
+          },
+          "reasoning": {
+            "reasoning:add": 604,
+            "reasoning:boolean": 48,
+            "reasoning:clock": 2224,
+            "reasoning:divide": 272,
+            "reasoning:max": 548,
+            "reasoning:min": 628,
+            "reasoning:multiply": 144,
+            "reasoning:order": 2264,
+            "reasoning:quantity": 1128,
+            "reasoning:subtract": 584,
+            "reasoning:weekday": 120,
+            "replay:copy": 490,
+            "replay:extract": 478,
+            "replay:length": 485,
+            "replay:lowercase": 497,
+            "replay:reverse": 497,
+            "replay:sort": 498,
+            "replay:uppercase": 486
+          },
+          "coding": {
+            "coding:affine": 1328,
+            "coding:clamp": 1232,
+            "coding:interval": 1232,
+            "coding:length_test": 544,
+            "coding:lookup_default": 32,
+            "coding:mod_equals": 208,
+            "coding:nth_default": 224,
+            "coding:reverse_value": 32,
+            "coding:safe_divide": 16,
+            "coding:slice_text": 80,
+            "coding:sort_items": 32
+          }
+        },
+        "validation": {
+          "chat": {
+            "chat:available_day": 12,
+            "chat:budget_choice": 20,
+            "chat:listed_ingredients": 12,
+            "chat:natural": 309
+          },
+          "reasoning": {
+            "reasoning:add": 32,
+            "reasoning:clock": 128,
+            "reasoning:divide": 8,
+            "reasoning:max": 32,
+            "reasoning:min": 24,
+            "reasoning:multiply": 12,
+            "reasoning:order": 124,
+            "reasoning:quantity": 64,
+            "reasoning:subtract": 48,
+            "reasoning:weekday": 8,
+            "replay:copy": 23,
+            "replay:extract": 33,
+            "replay:length": 31,
+            "replay:lowercase": 23,
+            "replay:reverse": 26,
+            "replay:sort": 27,
+            "replay:uppercase": 37
+          },
+          "coding": {
+            "coding:affine": 64,
+            "coding:clamp": 64,
+            "coding:interval": 112,
+            "coding:length_test": 16,
+            "coding:mod_equals": 16
+          }
+        },
+        "heldout": {
+          "chat": {
+            "chat:available_day": 28,
+            "chat:budget_choice": 36,
+            "chat:correction": 20,
+            "chat:listed_ingredients": 32,
+            "chat:natural": 702
+          },
+          "reasoning": {
+            "reasoning:add": 48,
+            "reasoning:clock": 264,
+            "reasoning:divide": 32,
+            "reasoning:max": 80,
+            "reasoning:min": 56,
+            "reasoning:multiply": 20,
+            "reasoning:order": 228,
+            "reasoning:quantity": 116,
+            "reasoning:subtract": 96,
+            "reasoning:weekday": 16,
+            "replay:copy": 59,
+            "replay:extract": 61,
+            "replay:length": 56,
+            "replay:lowercase": 52,
+            "replay:reverse": 49,
+            "replay:sort": 45,
+            "replay:uppercase": 47
+          },
+          "coding": {
+            "coding:affine": 160,
+            "coding:clamp": 240,
+            "coding:interval": 192,
+            "coding:length_test": 80,
+            "coding:mod_equals": 48,
+            "coding:nth_default": 16,
+            "coding:repeat_text": 16,
+            "coding:safe_divide": 16
+          }
+        }
+      },
+      "selected": {
+        "train": {
+          "chat": {
+            "chat:available_day": 170,
+            "chat:budget_choice": 264,
+            "chat:correction": 300,
+            "chat:listed_ingredients": 180,
+            "chat:natural": 1366
+          },
+          "reasoning": {
+            "reasoning:add": 365,
+            "reasoning:boolean": 48,
+            "reasoning:clock": 366,
+            "reasoning:divide": 272,
+            "reasoning:max": 365,
+            "reasoning:min": 366,
+            "reasoning:multiply": 144,
+            "reasoning:order": 366,
+            "reasoning:quantity": 365,
+            "reasoning:subtract": 365,
+            "reasoning:weekday": 120,
+            "replay:copy": 365,
+            "replay:extract": 366,
+            "replay:length": 365,
+            "replay:lowercase": 365,
+            "replay:reverse": 365,
+            "replay:sort": 366,
+            "replay:uppercase": 366
+          },
+          "coding": {
+            "coding:affine": 750,
+            "coding:clamp": 751,
+            "coding:interval": 751,
+            "coding:length_test": 544,
+            "coding:lookup_default": 32,
+            "coding:mod_equals": 208,
+            "coding:nth_default": 224,
+            "coding:reverse_value": 32,
+            "coding:safe_divide": 16,
+            "coding:slice_text": 80,
+            "coding:sort_items": 32
+          }
+        },
+        "validation": {
+          "chat": {
+            "chat:available_day": 12,
+            "chat:budget_choice": 20,
+            "chat:listed_ingredients": 12,
+            "chat:natural": 76
+          },
+          "reasoning": {
+            "reasoning:add": 19,
+            "reasoning:clock": 20,
+            "reasoning:divide": 8,
+            "reasoning:max": 19,
+            "reasoning:min": 20,
+            "reasoning:multiply": 12,
+            "reasoning:order": 19,
+            "reasoning:quantity": 19,
+            "reasoning:subtract": 19,
+            "reasoning:weekday": 8,
+            "replay:copy": 20,
+            "replay:extract": 19,
+            "replay:length": 19,
+            "replay:lowercase": 20,
+            "replay:reverse": 20,
+            "replay:sort": 20,
+            "replay:uppercase": 19
+          },
+          "coding": {
+            "coding:affine": 49,
+            "coding:clamp": 50,
+            "coding:interval": 49,
+            "coding:length_test": 16,
+            "coding:mod_equals": 16
+          }
+        },
+        "heldout": {
+          "chat": {
+            "chat:available_day": 25,
+            "chat:budget_choice": 25,
+            "chat:correction": 20,
+            "chat:listed_ingredients": 25,
+            "chat:natural": 25
+          },
+          "reasoning": {
+            "reasoning:add": 18,
+            "reasoning:clock": 18,
+            "reasoning:divide": 18,
+            "reasoning:max": 18,
+            "reasoning:min": 17,
+            "reasoning:multiply": 18,
+            "reasoning:order": 18,
+            "reasoning:quantity": 18,
+            "reasoning:subtract": 17,
+            "reasoning:weekday": 16,
+            "replay:copy": 18,
+            "replay:extract": 18,
+            "replay:length": 17,
+            "replay:lowercase": 18,
+            "replay:reverse": 18,
+            "replay:sort": 18,
+            "replay:uppercase": 17
+          },
+          "coding": {
+            "coding:affine": 27,
+            "coding:clamp": 26,
+            "coding:interval": 27,
+            "coding:length_test": 26,
+            "coding:mod_equals": 26,
+            "coding:nth_default": 16,
+            "coding:repeat_text": 16,
+            "coding:safe_divide": 16
+          }
+        }
+      },
+      "saturated": {
+        "train": {
+          "chat": [
+            "chat:available_day",
+            "chat:budget_choice",
+            "chat:correction",
+            "chat:listed_ingredients"
+          ],
+          "reasoning": [
+            "reasoning:boolean",
+            "reasoning:divide",
+            "reasoning:multiply",
+            "reasoning:weekday"
+          ],
+          "coding": [
+            "coding:length_test",
+            "coding:lookup_default",
+            "coding:mod_equals",
+            "coding:nth_default",
+            "coding:reverse_value",
+            "coding:safe_divide",
+            "coding:slice_text",
+            "coding:sort_items"
+          ]
+        },
+        "validation": {
+          "chat": [
+            "chat:available_day",
+            "chat:budget_choice",
+            "chat:listed_ingredients"
+          ],
+          "reasoning": [
+            "reasoning:divide",
+            "reasoning:multiply",
+            "reasoning:weekday"
+          ],
+          "coding": [
+            "coding:length_test",
+            "coding:mod_equals"
+          ]
+        },
+        "heldout": {
+          "chat": [
+            "chat:correction"
+          ],
+          "reasoning": [
+            "reasoning:weekday"
+          ],
+          "coding": [
+            "coding:nth_default",
+            "coding:repeat_text",
+            "coding:safe_divide"
+          ]
+        }
+      },
+      "scope": "Round-robin within priority layers and existing category/split/multi-turn quotas; finite capacity can prevent equal counts."
+    }
+  },
+  "raw_source_manifest": {
+    "seed": 20261112,
+    "source_files": {
+      "/root/uTTT/data/foundation_sources_balanced_20261109_v2/abilities.jsonl": {
+        "rows": 20000,
+        "sha256": "a55b9d9726c86eddc100d7003e919ac5ce124fb363c8e9b80d96a22c01a209a5"
+      },
+      "/root/uTTT/data/foundation_sources_balanced_20261109_v2/grounded_dialogues.jsonl": {
+        "rows": 1074,
+        "sha256": "49a9a97ff7dcb32ff1746adbb8cdc84d90e74e717e92248e56770a919fc6f148"
+      },
+      "/root/uTTT/data/chat_sources_20261108/combined_final3.jsonl": {
+        "rows": 9919,
+        "sha256": "af1175a16074c215f492699442b7b073827d4325efafb25d50cf52362030f224"
+      }
+    },
+    "all_priorities_zero_for_balancing": true,
+    "balance_key": "foundation_skill",
+    "combined_sha256": "cdb88a464050b8a786cb0c93334e535fdf21dd787fd8c04b88151f67481f2b4e",
+    "fresh_cohort_sha256": "2d0fe7da1a8b0c2bc89a3159429eaf8414e2a25494933a543735df2f73f452f6"
+  },
+  "generator_manifest": {
+    "protocol": "uttt:foundation-curriculum-v1",
+    "seed": 20261112,
+    "rows": 20000,
+    "distinct_families": 5944,
+    "distinct_families_by_category": {
+      "reasoning": 5569,
+      "coding": 375
+    },
+    "coding_name_variants_per_language": 8,
+    "coding_presentations_per_family": 16,
+    "by_category": {
+      "coding": 6000,
+      "reasoning": 14000
+    },
+    "by_language": {
+      "zh": 10000,
+      "en": 10000
+    },
+    "reference_code_case_checks": 36288,
+    "rejected_families": {
+      "reasoning:excluded_family": 402,
+      "coding:excluded_family": 285,
+      "coding:matches_heldout_case_behavior": 922
+    },
+    "exclusion_files": {
+      "/root/uTTT/data/chat_curriculum_20261108_final3/heldout.jsonl": "a43882e2f37e7ab3312c43eb6ef6e23d074f8b04b29d5356d0a30ceb621c7e0c",
+      "/root/uTTT/data/foundation_curriculum_20261108_v2/heldout.jsonl": "17a1c7803b14ae41073b2565ad3c1d1649c2a0547d0df685487c542c9776a3b4",
+      "/root/uTTT/data/foundation_curriculum_corrected_20261109/heldout.jsonl": "66fd55041340558b02d58d0fc5018d19c8b533fb06f4d75faf7184a858fe60ca",
+      "/root/uTTT/data/instruction_recovery_20261105/eval_tasks.jsonl": "b6c2b208cfc274e8473ddae83e7e05bc516dae439e559902b1c28949967b699d",
+      "/root/uTTT/data/instruction_recovery_20261105/heldout.jsonl": "d9a86976fa8a1d2db851fd746be9d981607c4fed6e0af8809a83a6db5f1a4e4b",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/chat_development_tasks_20261108.jsonl": "d59806817a00f97702abe8dee9461be39a733a760c9e49fc12c2a58389de3868",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_development_tasks_20261108.jsonl": "6db4cf980459d0b5fe731c4c3cb35e84374229e6fafa084c435024295a9805e3",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_holdout_tasks_20261108.jsonl": "e1d6992b70affda652b0fedd40889ad6cd79134bcfa0b581b50300790356e78e",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/deploy/foundation_holdout_tasks_20261109.jsonl": "2d0fe7da1a8b0c2bc89a3159429eaf8414e2a25494933a543735df2f73f452f6",
+      "/root/uTTT/runs/20261109_foundation_balanced_prepare/docs/quality_diagnosis_20261108.json": "953f78836afdc72534d7a79c367ad0c44142638b8c1608dccf77c4570fd96860"
+    },
+    "available_families": {
+      "reasoning": {
+        "add": 171,
+        "subtract": 182,
+        "multiply": 44,
+        "divide": 78,
+        "max": 165,
+        "min": 177,
+        "quantity": 327,
+        "clock": 8593,
+        "weekday": 36,
+        "boolean": 12,
+        "order": 2615
+      },
+      "coding": {
+        "affine": 344,
+        "clamp": 531,
+        "interval": 243,
+        "mod_equals": 17,
+        "length_test": 40,
+        "nth_default": 15,
+        "slice_text": 5,
+        "safe_divide": 2,
+        "lookup_default": 2,
+        "repeat_text": 1,
+        "sort_items": 2,
+        "reverse_value": 2
+      }
+    },
+    "notes": [
+      "Candidates contain reasoning/coding in a 5:3 ratio; root adds chat to obtain 50/30/20 overall.",
+      "Every coding family binds two languages and 8 code-only interface presentations per language; reasoning retains four direct/explanatory variants. Interface names do not create new semantic families or algorithms.",
+      "There are 12 programming behaviors; parameter/boundary variations are not claimed as distinct algorithms.",
+      "Exclusions remove exact prompts and particular semantic families, never all individual small numbers.",
+      "Old 40-task arithmetic families are explicitly mapped; typed new evaluation metadata removes its complete families.",
+      "Code families observationally matching any heldout function cases are conservatively excluded without executing code.",
+      "This is a development curriculum; skill overlap and prior simple-capability replay are intentional, not blind-test novelty.",
+      "Optional verified prior instruction replay retains its original groups and may have fewer than four presentations."
+    ],
+    "coding_code_only": true,
+    "generated_ability_rows": 16000,
+    "generated_ability_by_operation_or_behavior": {
+      "affine": 1552,
+      "quantity": 1308,
+      "order": 2616,
+      "clock": 2616,
+      "min": 708,
+      "max": 660,
+      "add": 684,
+      "interval": 1536,
+      "slice_text": 80,
+      "clamp": 1536,
+      "length_test": 640,
+      "boolean": 48,
+      "mod_equals": 272,
+      "subtract": 728,
+      "divide": 312,
+      "nth_default": 240,
+      "multiply": 176,
+      "weekday": 144,
+      "repeat_text": 16,
+      "safe_divide": 32,
+      "lookup_default": 32,
+      "sort_items": 32,
+      "reverse_value": 32
+    },
+    "replay": {
+      "source": "/root/uTTT/data/instruction_expansion_20261107/train.jsonl",
+      "source_sha256": "bf1855dea665a72a86ce982f6cf3d2afe243be8642c267810c909148417ba1c9",
+      "rows": 4000,
+      "by_task": {
+        "copy": 572,
+        "extract": 572,
+        "length": 572,
+        "lowercase": 572,
+        "reverse": 572,
+        "sort": 570,
+        "uppercase": 570
+      },
+      "by_language": {
+        "en": 2000,
+        "zh": 2000
+      }
+    },
+    "sha256": "a55b9d9726c86eddc100d7003e919ac5ce124fb363c8e9b80d96a22c01a209a5"
+  },
+  "preparation_source": {
+    "base_revision": "4d826dbbbd8f8b5d1ed513e0a1631fed28fc08d6",
+    "prep_only": true,
+    "payload_sha256": {
+      "deploy/prepare_chat_curriculum.py": "4f4e12f688ff39f9c300ad2d1abf15eafa5ad7487dbf8866fdca0ce62f2cff78",
+      "deploy/prepare_foundation_curriculum.py": "0224b46a5aa354fe7d01309da189a911a81f211e97a5d7eb6f9c19d519c5dc42",
+      "deploy/prepare_grounded_dialogues.py": "164d057e3425aa7cb6eaf7fe61a98c292b44916411d7b334a2ae63065c83bd9c",
+      "configs/5090_foundation_balanced_20261109.yaml": "e13575ed437abfdc89f63152181598da9b29495d0b5d6e4a96be699947686718",
+      "deploy/foundation_balanced_development_20261109.jsonl": "dc4322b9dea894c31be9c5f4c25a92b751456c3937ee1a568e36ad3ca642339f",
+      "deploy/foundation_holdout_tasks_20261109.jsonl": "2d0fe7da1a8b0c2bc89a3159429eaf8414e2a25494933a543735df2f73f452f6",
+      "client_chat.py": "25564f36be5d503daa89f5035e7ee705c5bfb8df85b3d30cd8e8cc09ffc35b53",
+      "deploy/remote_ctl.sh": "4c4833bd51f76e45a01e8ec88b5fa14142c9ba6cfb241e920a908ec7bb7d8dd8",
+      "engine/__init__.py": "3cb8309bd32c8188bbcef9f269ed71d3cf952da1cd20334da70db19bcd4a747b",
+      "engine/personalizer.py": "957e8e41d882f25e5b5850fcabb9a4af2c1dd13af91962b14f3dc2dd1108a4dd",
+      "engine/prompting.py": "234b0e835a81bb65f7f5b353b07e9b996ecb9cb0c5f75fe5a19007d821f54262",
+      "server/app.py": "0fdf16bbcc127029afea886bff9e91c57780f59dabe5b861052cb5632b0aec93",
+      "tests/test_chat_curriculum.py": "01025feb7399ec818594f2927b3632b912b3df22a33da0f28bdea7232a6ae299",
+      "tests/test_foundation_curriculum.py": "51fd2f7806d6dfeebe26590d3e7b7781478ce8d841a4481cfc9e0c0f88b39b51",
+      "tests/test_prompt_budget.py": "406506e31f5fb04ecbc32ad5abfb4a18582ced11c86ba64fae2e5968857024ab",
+      "tests/test_request_seed_api.py": "8ce15c4c740280e52e36c74e7ea339b699a339f8de0725fa87341ca7e8621c00",
+      "deploy/serve_guard.py": "304c7fe00370c7f2e4df1e5a29734ace44707d146536a9bf50bae9b108a3f4e4",
+      "tests/test_chat_text_history.py": "ac9f1cd0392c6f4c29e3038177eb44f78fddd36e5ea0c8862d98c968799a4239",
+      "tests/test_foundation_balanced_holdout.py": "4a591a12f323b6c5dd5bf3248a8c6f194ca9bdc0f0c2ad0737e3939837641e5b",
+      "tests/test_grounded_dialogues.py": "f0094772e04e5d269075d4631dbb0246abdd77ba4b1cbd8677a997c9bbd21f9c",
+      "tests/test_serve_training_guard.py": "ac519b0e8472b029f5932fed7d727d4557ff01652ecf61b4128f311988914662"
+    }
+  },
+  "regression": {
+    "total": 590,
+    "passed": 568,
+    "skipped": 22,
+    "failed": 0,
+    "log_tail": [
+      "----------------------------------------------------------------------",
+      "Ran 590 tests in 17.024s",
+      "",
+      "OK (skipped=22)"
+    ]
+  },
+  "cache_cleanup": {
+    "at": "2026-11-09T00:18:17.479281+00:00",
+    "audit": {
+      "cache_path": "C:\\Users\\ErrorHU\\AppData\\Local\\pip\\Cache",
+      "http_path": "C:\\Users\\ErrorHU\\AppData\\Local\\pip\\Cache\\http-v2",
+      "logical_bytes": 13020384628,
+      "files": 2832,
+      "directories": 4305,
+      "tree_fingerprint": "cd5680fa5e78bd35032dc8a1ec26847a94ce4a998fa0681e16b33836d5a4acbf",
+      "reparse_points": 0,
+      "external_or_internal_hardlinks": 0,
+      "active_package_processes": 0,
+      "free_C_bytes": 136251006976
+    },
+    "native_cleanup": {
+      "status": "completed",
+      "removed_path": "C:\\Users\\ErrorHU\\AppData\\Local\\pip\\Cache\\http-v2",
+      "logical_bytes_removed": 13020384628,
+      "removed_files": 2832,
+      "removed_directories": 4305,
+      "audited_tree_fingerprint": "cd5680fa5e78bd35032dc8a1ec26847a94ce4a998fa0681e16b33836d5a4acbf",
+      "native_free_C_before": 136234237952,
+      "native_free_C_after": 149269180416,
+      "native_observed_free_space_increase": 13034942464,
+      "wheels_unchanged": true,
+      "active_package_processes": 0,
+      "reparse_points": 0,
+      "hardlinks": 0
+    },
+    "free_bytes_before": {
+      "C": 136234258432,
+      "D": 25724874752
+    },
+    "free_bytes_after": {
+      "C": 149269180416,
+      "D": 25724874752
+    },
+    "WSL_active_package_processes": 0,
+    "kept": [
+      "pip/wheels",
+      "uv cache",
+      "NVIDIA shader caches",
+      "all model checkpoints"
+    ],
+    "scope": "Removed only the resolved native Windows pip/http-v2 cache; installed packages and model files were not deletion targets.",
+    "observed_free_C_increase_bytes": 13034921984
+  },
+  "free_bytes_after_preparation": {
+    "C": 150159990784,
+    "D": 25724874752
+  },
+  "inference_changes": {
+    "explicit_completed_text_history": true,
+    "maximum_pairs": 8,
+    "maximum_message_characters": 4096,
+    "maximum_total_history_characters": 16384,
+    "oldest_whole_pairs_dropped_for_context_budget": true,
+    "TTT_updates_still_only_current_turn": true,
+    "missing_checkpoint_cold_initialization_allowed_in_server": false,
+    "same_workspace_Linux_training_startup_check": true,
+    "global_GPU_mutex": false,
+    "websocket_only_client_requires_torch": false
+  },
+  "live_service_smoke": {
+    "scope": "Live HTTP and WebSocket transport smoke, not response-quality or fast-weight-memory evidence",
+    "port": 18001,
+    "checkpoint": "/mnt/c/uTTT-artifacts/checkpoints/20261109_foundation_corrected/uttt_1.584b_20261109_foundation_corrected.best.pt",
+    "health": {
+      "status": "ok",
+      "model_name": "uTTT-1.584B-Foundation-Corrected",
+      "vram_allocated_gb": 3.025
+    },
+    "http": {
+      "completed": true,
+      "reply": "当然，周六。"
+    },
+    "websocket": {
+      "completed": true,
+      "streamed_text": " 当然，周六。",
+      "reply": "当然，周六。"
+    },
+    "temporary_server_exit_code": -15,
+    "checkpoint_file_identity_unchanged": true,
+    "gpu_released": true
+  }
+}

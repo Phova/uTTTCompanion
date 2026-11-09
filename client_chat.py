@@ -33,6 +33,41 @@ import sys
 from typing import List, Optional
 from urllib.parse import urlsplit, quote
 
+from engine.prompting import MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES, validate_chat_history
+
+
+class ConversationHistory:
+    """Explicit recent text, kept only by this client and only after completion."""
+    def __init__(self):
+        self.messages = []
+
+    def clear(self):
+        self.messages = []
+
+    def request_messages(self):
+        return [dict(message) for message in self.messages]
+
+    def completed(self, prompt, result):
+        if not isinstance(result, dict) or result.get("prompt") != prompt:
+            return
+        if result.get("is_command"):
+            if (prompt.strip().split()[0].lower() == "/reset" and result.get("command_name") == "/reset"
+                    and result.get("persona_saved") is True):
+                self.clear()
+            return
+        if prompt.lstrip().startswith("/") or result.get("is_command") is not False:
+            return
+        try:
+            pair = validate_chat_history([{"role": "user", "content": prompt},
+                                          {"role": "assistant", "content": result.get("reply")}])
+        except ValueError:
+            print("[Client] This turn could not be retained in recent text history.")
+            return
+        messages = self.messages + pair
+        while len(messages) > MAX_HISTORY_MESSAGES or sum(len(message["content"]) for message in messages) > MAX_HISTORY_CHARS:
+            messages = messages[2:]
+        self.messages = messages
+
 
 def format_ttt_status_bar(
     surprise_loss: float,
@@ -179,7 +214,7 @@ class _StdlibWebSocket:
 
 BANNER = """================================================================================
   uTTT Interactive Personalization Client (RTX 5090 Fast-Weight Shaping)
-  Commands: /save | /reset | /snapshot [tag] | /restore <tag> | /diff | /quit
+  Commands: /save | /reset | /clear | /snapshot [tag] | /restore <tag> | /diff | /quit
 ================================================================================"""
 
 
@@ -188,6 +223,7 @@ def print_help() -> None:
         "\nSupported Interactive Commands:\n"
         "  /save             Persist current personalized fast weights W_user to disk\n"
         "  /reset            Reset fast weights & momentum back to Base Checkpoint W_0\n"
+        "  /clear            Clear this client's recent text history for a new topic\n"
         "  /snapshot [tag]   Save an immutable snapshot of current persona state\n"
         "  /restore <tag>    Restore a previously saved persona snapshot\n"
         "  /diff             Inspect Frobenius norm drift ||W_user - W_0||_F per matrix\n"
@@ -206,6 +242,7 @@ async def run_websocket_session(
     """Connect to the remote/tunneled FastAPI WebSocket endpoint and stream chat + TTT updates."""
     endpoint = f"{ws_url.rstrip('/')}/ws/chat/{quote(user_id, safe='')}"
     print(BANNER)
+    history = ConversationHistory()
     print(f"[Client] Connecting to {endpoint} (user_id='{user_id}')...")
 
     try:
@@ -260,6 +297,10 @@ async def run_websocket_session(
             if user_input.lower() == "/help":
                 print_help()
                 continue
+            if user_input.lower() == "/clear":
+                history.clear()
+                print("[Client] Recent text history cleared.")
+                continue
 
             await ws.send(
                 json.dumps(
@@ -267,6 +308,7 @@ async def run_websocket_session(
                         "prompt": user_input,
                         "max_new_tokens": max_new_tokens,
                         "temperature": temperature,
+                        "history": history.request_messages(),
                     }
                 )
             )
@@ -281,6 +323,7 @@ async def run_websocket_session(
                     print(event.get("content", ""), end="", flush=True)
                 elif ev_type == "ttt_status":
                     res = event.get("result", {})
+                    history.completed(user_input, res)
                     status_bar = res.get("status_bar") or format_ttt_status_bar(
                         surprise_loss=float(res.get("surprise_loss", 0.0)),
                         weight_drift_pct=float(res.get("weight_drift_pct", 0.0)),
@@ -308,6 +351,7 @@ def run_local_session(
     from engine.personalizer import uTTTPersonalizer
 
     print(BANNER)
+    history = ConversationHistory()
     personalizer = uTTTPersonalizer(
         base_checkpoint_path=base_ckpt,
         personas_dir=personas_dir,
@@ -349,20 +393,32 @@ def run_local_session(
         if user_input.lower() == "/help":
             print_help()
             continue
+        if user_input.lower() == "/clear":
+            history.clear()
+            print("[Client] Recent text history cleared.")
+            continue
 
         print("Assistant > ", end="", flush=True)
-        for event in personalizer.stream_interact_and_evolve(
-            user_id=user_id,
-            prompt=user_input,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-        ):
-            ev_type = event.get("type")
-            if ev_type == "token":
-                print(event.get("content", ""), end="", flush=True)
-            elif ev_type == "ttt_status":
-                res = event["result"]
-                print(f"\n{res['status_bar']}", flush=True)
+        try:
+            for event in personalizer.stream_interact_and_evolve(
+                user_id=user_id,
+                prompt=user_input,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                history=history.request_messages(),
+            ):
+                ev_type = event.get("type")
+                if ev_type == "token":
+                    print(event.get("content", ""), end="", flush=True)
+                elif ev_type == "ttt_status":
+                    res = event["result"]
+                    history.completed(user_input, res)
+                    print(f"\n{res['status_bar']}", flush=True)
+                elif ev_type == "error":
+                    print(f"\n[Local Error] {event.get('message')}", flush=True)
+                    break
+        except (ValueError, OSError) as exc:
+            print(f"\n[Local Error] {exc}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:

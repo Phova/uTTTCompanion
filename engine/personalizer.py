@@ -359,6 +359,7 @@ class uTTTPersonalizer:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         seed: Optional[int] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Generator[Dict[str, Any], None, EvolutionResult]:
         """
         Streaming generator version of `interact_and_evolve` for WebSocket/CLI streaming:
@@ -391,7 +392,7 @@ class uTTTPersonalizer:
 
         # Validate the full template before loading or evicting a persona.
         prompt_ids = encode_chat_prompt(
-            self.tokenizer, prompt, self.config.max_seq_len - max_tokens,
+            self.tokenizer, prompt, self.config.max_seq_len - max_tokens, history=history,
         )
         user_state = self.ckpt_manager.get_user_state(user_id)
         input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
@@ -575,6 +576,7 @@ class uTTTPersonalizer:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         seed: Optional[int] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> EvolutionResult:
         """
         Execute the full 3-step Test-Time Personalization cycle for `(user_id, prompt)`:
@@ -589,6 +591,7 @@ class uTTTPersonalizer:
             temperature=temperature,
             top_p=top_p,
             seed=seed,
+            history=history,
         )
         final_result: Optional[EvolutionResult] = None
         try:

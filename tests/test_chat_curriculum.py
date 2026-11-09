@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from deploy.prepare_chat_curriculum import (
-    CATEGORIES, complete_prefix, contextual_prompts, is_initial_generic_greeting, prepare, quotas,
+    CATEGORIES, _select, complete_prefix, contextual_prompts, is_initial_generic_greeting, prepare, quotas,
     read_jsonl, render_turns, validation_group_split,
 )
 from deploy.prepare_recovery_curriculum import parse_conversation
@@ -89,6 +89,91 @@ class ChatCurriculumTests(unittest.TestCase):
         second, _ = self.build("two")
         for name in ("train.jsonl", "validation.jsonl", "heldout.jsonl"):
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+
+    def test_default_selection_retains_published_fixture_bytes(self):
+        output, report = self.build()
+        expected = {'train.jsonl': '1a6c225705338bff74f558e73340205198bb58c57e5ab99a2a83d36d3249fc34',
+                    'validation.jsonl': 'a1328f0b5ce2746a1b4bc1a46d450b3f028c449a4f37e9d99f34135dc8503dbf',
+                    'heldout.jsonl': 'af150187a638f842c074584297aaa89a5684e39e2c8baec02db9fbc9bce63e32'}
+        self.assertNotIn('balance', report)
+        for name, checksum in expected.items():
+            self.assertEqual(hashlib.sha256((output / name).read_bytes()).hexdigest(), checksum)
+
+    def test_balancing_reallocates_exhausted_strata_and_preserves_priority(self):
+        pool = {category: [] for category in CATEGORIES}
+        for skill, capacity in [('small', 2), ('large-a', 8), ('large-b', 8)]:
+            pool['coding'].extend({'foundation_skill': skill, 'selection_priority': 0, 'turns': 1,
+                                   'text_sha256': hashlib.sha256(f'{skill}:{index}'.encode()).hexdigest()}
+                                  for index in range(capacity))
+        required = {'chat': 0, 'reasoning': 0, 'coding': 14}
+        chosen = _select(pool, required, seed=12, split='train', min_multi_turn_fraction=0,
+                         balance_key='foundation_skill')
+        self.assertEqual(Counter(row['foundation_skill'] for row in chosen),
+                         {'small': 2, 'large-a': 6, 'large-b': 6})
+        self.assertEqual(len({row['text_sha256'] for row in chosen}), 14)
+        for row in pool['coding']:
+            row['selection_priority'] = 0 if row['foundation_skill'] == 'large-a' else 1
+        chosen = _select(pool, {**required, 'coding': 9}, seed=12, split='train',
+                         min_multi_turn_fraction=0, balance_key='foundation_skill')
+        self.assertEqual([row['selection_priority'] for row in chosen], [0] * 8 + [1])
+        # Required conversation rows still take precedence over single-turn
+        # priority, and balancing applies inside that separate quota as well.
+        for row in pool['coding']:
+            row['turns'] = 1 if row['foundation_skill'] == 'large-a' else 2
+        chosen = _select(pool, {**required, 'coding': 6}, seed=12, split='train',
+                         min_multi_turn_fraction=.5, balance_key='foundation_skill')
+        self.assertEqual(sum(row['turns'] > 1 for row in chosen), 3)
+        self.assertEqual(Counter(row['foundation_skill'] for row in chosen[:3]), {'small': 1, 'large-b': 2})
+        self.assertTrue(all(row['selection_priority'] == 0 for row in chosen[3:]))
+
+    def test_balancing_keeps_splits_category_and_multi_turn_quotas_and_reports_capacity(self):
+        from unittest.mock import patch
+        import deploy.prepare_chat_curriculum as builder
+        self.rows = [{**row, 'foundation_skill': f"{row['category']}:{index % 3}"}
+                     for index, row in enumerate(self.rows)]
+        self.write(self.candidates, self.rows)
+        original = builder._select
+        observed = {}
+        def select(pool, required, **options):
+            observed[options['split']] = [dict(row) for items in pool.values() for row in items]
+            return original(pool, required, **options)
+        with patch.object(builder, '_select', side_effect=select):
+            output, report = self.build('balanced', balance_key='foundation_skill')
+        _, old_report = self.build('unbalanced')
+        self.assertEqual(report['available'], old_report['available'])
+        self.assertEqual(report['grouping'], old_report['grouping'])
+        selected = read_jsonl(output / 'train.jsonl') + read_jsonl(output / 'heldout.jsonl')
+        self.assertEqual(report['group_overlap'], 0)
+        for split, name in [('train', 'training'), ('validation', 'validation'), ('heldout', 'heldout')]:
+            rows = [row for row in selected if row['split'] == split]
+            self.assertEqual(report[name]['category'], old_report[name]['category'])
+            self.assertGreaterEqual(sum(row['turns'] > 1 for row in rows), len(rows) * .25)
+            for category in CATEGORIES:
+                available = Counter(row['foundation_skill'] for row in observed[split] if row['category'] == category)
+                chosen = Counter(row['foundation_skill'] for row in rows if row['category'] == category)
+                self.assertEqual(report['balance']['available'][split][category], dict(available))
+                self.assertEqual(report['balance']['selected'][split][category], dict(chosen))
+                self.assertEqual(set(report['balance']['saturated'][split][category]),
+                                 {key for key, value in available.items() if chosen[key] == value})
+            for row in rows:
+                if split != 'heldout':
+                    self.assertEqual(validation_group_split(row['validation_group_id'], 92, .2), split)
+        self.write(self.candidates, list(reversed(self.rows)))
+        second, _ = self.build('balanced-reversed', balance_key='foundation_skill')
+        for name in ('train.jsonl', 'validation.jsonl', 'heldout.jsonl'):
+            self.assertEqual((output / name).read_bytes(), (second / name).read_bytes())
+
+    def test_balancing_rejects_missing_or_invalid_explicit_strata_and_keys(self):
+        for index, key in enumerate(('', '  ', 3, True, [])):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'balance_key'):
+                self.build(f'bad-key-{index}', balance_key=key)
+        for index, value in enumerate((None, '', '  ', 3, True, [])):
+            self.write(self.candidates, [{**row, 'foundation_skill': value} for row in self.rows])
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'string stratum'):
+                self.build(f'bad-stratum-{index}', balance_key='foundation_skill')
+        self.write(self.candidates, self.rows)
+        with self.assertRaisesRegex(ValueError, 'string stratum'):
+            self.build('missing-stratum', balance_key='foundation_skill')
 
     def test_real_eos_and_context_are_kept_when_only_a_complete_prefix_fits(self):
         turns = [("my initial condition", "acknowledged"), ("a follow-up question", "x" * 500)]

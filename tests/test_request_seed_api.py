@@ -56,3 +56,35 @@ class SeedEndpointTests(IsolatedAsyncioTestCase):
             events = [event async for event in service._stream_engine(engine, request)]
         self.assertEqual(events, [{"type": "token", "content": "ok"}])
         self.assertEqual(engine.stream_interact_and_evolve.call_args.kwargs["seed"], 123)
+
+
+class HistoryRequestTests(IsolatedAsyncioTestCase):
+    async def test_http_and_websocket_engine_receive_identical_explicit_history(self):
+        history = [{"role": "user", "content": "I cannot eat chili."},
+                   {"role": "assistant", "content": "Understood, no chili."}]
+        request = ChatRequest(user_id="alice", prompt="Suggest dinner.", history=history)
+        engine = SimpleNamespace(interact_and_evolve=Mock(),
+                                 stream_interact_and_evolve=Mock(return_value=(event for event in [])))
+        result = SimpleNamespace(to_dict=lambda: {"reply": "ok"})
+        with patch.object(service, "get_personalizer", return_value=engine), \
+                patch.object(service, "_run_engine", new=AsyncMock(return_value=result)) as run:
+            await service.chat_endpoint(request)
+            self.assertEqual(run.call_args.kwargs["history"], history)
+        async def direct(operation, *args, **kwargs):
+            return operation(*args, **kwargs)
+        with patch.object(service.app.state, "engine_lock", asyncio.Lock(), create=True), \
+                patch.object(service, "_on_engine_thread", side_effect=direct):
+            self.assertEqual([event async for event in service._stream_engine(engine, request)], [])
+        self.assertEqual(engine.stream_interact_and_evolve.call_args.kwargs["history"], history)
+
+    async def test_request_defaults_and_history_validation_are_shared(self):
+        first = ChatRequest(prompt="hello")
+        first.history.append({"role": "user", "content": "not a complete pair"})
+        self.assertEqual(ChatRequest(prompt="hello").history, [])
+        invalid = [None, [{"role": "user", "content": "incomplete"}],
+                   [{"role": "assistant", "content": "wrong role"}, {"role": "user", "content": "wrong role"}],
+                   [{"role": "user", "content": "ok"}, {"role": "assistant", "content": "<|eos|>"}],
+                   [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}] * 9]
+        for history in invalid:
+            with self.subTest(history=history), self.assertRaises(ValidationError):
+                ChatRequest(prompt="hello", history=history)

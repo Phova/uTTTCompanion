@@ -2,9 +2,9 @@
 
 This writes ability candidates and optional verified prior instructions. The caller adds chat and passes the
 combined file through prepare_chat_curriculum with ratios .2,.5,.3. Each actual
-operation/parameter or behavior/boundary family has exactly four presentations:
-English/Chinese, direct answer/brief explanation. Function names vary only within
-these four presentations; they do not add semantic families or rows.
+operation/parameter or behavior/boundary family normally has four presentations:
+English/Chinese, direct answer/brief explanation. Optional code-only interface
+practice uses more names within the same semantic family, never new algorithms.
 """
 from __future__ import annotations
 
@@ -404,6 +404,7 @@ def collect_reference_replay(path, count, seed=20261109, exclude_paths=()):
             buckets[row['task'], row['language']].append({**row, 'family': family, 'category': 'reasoning',
                 'source_file': str(path), 'reference_verified': True, 'deterministic_answer': True,
                 'selection_priority': 1,
+                'foundation_skill': 'replay:' + row['task'],
                 'reference_validation': 'Recomputed from original arguments; original family preserved',
                 'curriculum_component': 'prior_verified_instruction_replay'})
     for values in buckets.values():
@@ -421,9 +422,18 @@ def collect_reference_replay(path, count, seed=20261109, exclude_paths=()):
                       'by_language': dict(Counter(row['language'] for row in selected))}
 
 
-def generate(count=16000, seed=20261108, exclude_paths=()):
+def generate(count=16000, seed=20261108, exclude_paths=(), *, coding_code_only=False, coding_name_variants=2):
     if type(count) is not int or count < 32 or count % 32:
         raise ValueError("count must be a positive multiple of 32 for a 5:3 mix and complete four-row families")
+    if type(coding_code_only) is not bool:
+        raise ValueError("coding_code_only must be boolean")
+    if type(coding_name_variants) is not int or coding_name_variants not in (2, 4, 8):
+        raise ValueError("coding_name_variants must be 2, 4 or 8 per language")
+    if coding_name_variants > 2 and not coding_code_only:
+        raise ValueError("coding_name_variants above 2 requires coding_code_only")
+    coding_presentations = 2 * coding_name_variants
+    if (count * 3 // 8) % coding_presentations:
+        raise ValueError("coding row count must be divisible by twice coding_name_variants; refusing partial families")
     blocked, blocked_prompts, heldout_code_cases, exclusion_hashes = load_exclusions(exclude_paths)
     reasoning, coding = reasoning_specs(), coding_specs()
     rejected = Counter()
@@ -444,7 +454,7 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
                 kept.append(args)
             pools[operation] = kept
     selected = {"reasoning": _balanced_specs(reasoning, count * 5 // 8 // 4, seed, "reasoning"),
-                "coding": _balanced_specs(coding, count * 3 // 8 // 4, seed, "coding")}
+                "coding": _balanced_specs(coding, count * 3 // 8 // coding_presentations, seed, "coding")}
     rows, prompts, proof_cases = [], set(), 0
     for category, specifications in selected.items():
         for operation, args in specifications:
@@ -454,13 +464,18 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
             if lesson:
                 cases = [{"args": values, "expected": lesson["reference"](*values)} for values in lesson["inputs"]]
             for language in ("en", "zh"):
-                for explain in (False, True):
+                for presentation in range(coding_name_variants if lesson else 2):
+                    explain = presentation == 1
                     row = {"category": category, "language": language, "source": SOURCE, "copyright": COPYRIGHT,
                            "family": family, "validation_group_id": family, "semantic_key": key, "arguments": dict(args),
-                           "response_style": "brief_explanation" if explain else "direct", "reference_verified": True,
+                           "response_style": ("direct_alternate" if explain else "direct") if category == "coding" and coding_code_only
+                                             else ("brief_explanation" if explain else "direct"), "reference_verified": True,
                            "deterministic_answer": category == "reasoning", "task": operation,
+                           "foundation_skill": category + ":" + operation,
                            "selection_priority": 0 if category == "reasoning" and operation in ("add", "subtract", "multiply", "divide", "max", "min") else 1,
                            "difficulty": "elementary_python" if lesson else "small_number_reasoning"}
+                    if lesson and coding_name_variants > 2:
+                        row["response_style"] = f"code_only_interface_{presentation:02d}"
                     if category == "reasoning":
                         prompt, answer, final_answer = reasoning_lesson(operation, args, language, explain, seed)
                         row.update(foundation_operation=operation, final_answer=final_answer)
@@ -468,12 +483,17 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
                             row.update(accepted=[final_answer], match_mode="strict_text")
                     else:
                         variant = coding_lesson(operation, args, language=language, explain=explain)
+                        if coding_name_variants > 2:
+                            offset = int(digest(f"coding-names:{seed}:{key}:{language}")[:8], 16)
+                            name = CODE_FUNCTION_NAMES[(offset + presentation) % len(CODE_FUNCTION_NAMES)]
+                            variant["code"] = variant["code"].replace(f"def {variant['function']}(", f"def {name}(", 1)
+                            variant["function"] = name
                         verification = restricted_python_check(variant["code"], variant["function"], cases)
                         if not verification["passed"]:
                             raise RuntimeError("Known code variant failed reference checks: " + str((operation, args, language, explain, verification)))
                         proof_cases += len(cases)
                         signature = variant["code"].splitlines()[0].removeprefix("def ").removesuffix(":")
-                        if explain:
+                        if explain and not coding_code_only:
                             prompt = (f"先用一句话说明，再给出完整Python函数{signature}。" if language == "zh"
                                       else f"Explain in one sentence, then provide the complete Python function {signature}. ")
                             answer = lesson["description"][language] + "\n```python\n" + variant["code"] + "\n```"
@@ -485,7 +505,7 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
                         prompt += ("不要导入模块或添加调用示例，可以使用Python内置函数。" if language == "zh"
                                    else " Do not import modules or include invocation examples; Python builtins are allowed.")
                         row.update(foundation_behavior=operation,
-                                   requested_format="explanation_and_code" if explain else "code_only",
+                                   requested_format="explanation_and_code" if explain and not coding_code_only else "code_only",
                                    code_check={"protocol": "bounded_python_ast_v1", "function": variant["function"], "cases": cases},
                                    reference_validation="Python reference and bounded AST interpretation; no exec")
                     normalized = normalized_prompt(prompt)
@@ -497,7 +517,13 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
                         raise RuntimeError("Malformed generated role/EOS boundary")
                     rows.append(row)
     rows.sort(key=lambda row: digest(f"shuffle:{seed}:{row['family']}:{row['language']}:{row['response_style']}"))
-    report = {"protocol": SOURCE, "seed": seed, "rows": len(rows), "distinct_families": len(rows) // 4,
+    if len(rows) != count:
+        raise RuntimeError("Generated curriculum row count differs from requested count")
+    report = {"protocol": SOURCE, "seed": seed, "rows": len(rows), "distinct_families": len({row["family"] for row in rows}),
+              "distinct_families_by_category": {category: len({row["family"] for row in rows if row["category"] == category})
+                                                for category in ("reasoning", "coding")},
+              "coding_name_variants_per_language": coding_name_variants,
+              "coding_presentations_per_family": coding_presentations,
               "by_category": dict(Counter(row["category"] for row in rows)),
               "by_language": dict(Counter(row["language"] for row in rows)),
               "by_operation_or_behavior": dict(Counter((row.get("foundation_operation") or row.get("foundation_behavior")) for row in rows)),
@@ -505,12 +531,15 @@ def generate(count=16000, seed=20261108, exclude_paths=()):
               "available_families": {"reasoning": {name: len(items) for name, items in reasoning.items()},
                                      "coding": {name: len(items) for name, items in coding.items()}},
               "notes": ["Candidates contain reasoning/coding in a 5:3 ratio; root adds chat to obtain 50/30/20 overall.",
-                        "Every semantic family binds two languages and direct/explanatory variants; four variants are not four novel cases.",
+                        (f"Every coding family binds two languages and {coding_name_variants} code-only interface presentations per language; reasoning retains four direct/explanatory variants. Interface names do not create new semantic families or algorithms."
+                         if coding_code_only else "Every semantic family binds two languages and direct/explanatory variants; four variants are not four novel cases."),
                         "There are 12 programming behaviors; parameter/boundary variations are not claimed as distinct algorithms.",
                         "Exclusions remove exact prompts and particular semantic families, never all individual small numbers.",
                         "Old 40-task arithmetic families are explicitly mapped; typed new evaluation metadata removes its complete families.",
                         "Code families observationally matching any heldout function cases are conservatively excluded without executing code.",
                         "This is a development curriculum; skill overlap and prior simple-capability replay are intentional, not blind-test novelty."]}
+    if coding_code_only:
+        report["coding_code_only"] = True
     return rows, report
 
 
@@ -520,19 +549,25 @@ def main():
     parser.add_argument("--count", type=int, default=16000)
     parser.add_argument("--seed", type=int, default=20261108)
     parser.add_argument("--exclude", action="append", type=Path, default=[])
+    parser.add_argument("--coding-code-only", action="store_true", help="Make every coding presentation complete Python code only")
+    parser.add_argument("--coding-name-variants", type=int, choices=(2, 4, 8), default=2,
+                        help="Interface names per language, still bound to one semantic family; above 2 requires --coding-code-only")
     parser.add_argument('--replay-from', type=Path, help='Existing verified instruction file; only text-reference tasks are replayed')
     parser.add_argument('--replay-count', type=int, default=4000)
     args = parser.parse_args()
     manifest = args.output.with_suffix(".manifest.json")
     if args.output.exists() or manifest.exists():
         raise FileExistsError("Refusing to replace an existing curriculum")
-    rows, report = generate(args.count, args.seed, args.exclude)
+    rows, report = generate(args.count, args.seed, args.exclude, coding_code_only=args.coding_code_only,
+                            coding_name_variants=args.coding_name_variants)
     if args.replay_from:
         replay, proof = collect_reference_replay(args.replay_from, args.replay_count, args.seed, args.exclude)
         report['generated_ability_rows'] = len(rows)
         report['generated_ability_by_operation_or_behavior'] = report.pop('by_operation_or_behavior')
         rows.extend(replay)
         report.update(replay=proof, rows=len(rows), distinct_families=len({row['family'] for row in rows}),
+                      distinct_families_by_category={category: len({row['family'] for row in rows if row['category'] == category})
+                                                    for category in ('reasoning', 'coding')},
                       by_category=dict(Counter(row['category'] for row in rows)),
                       by_language=dict(Counter(row['language'] for row in rows)))
         report['notes'].append('Optional verified prior instruction replay retains its original groups and may have fewer than four presentations.')

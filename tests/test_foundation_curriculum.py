@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 import ast
 import datetime
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -14,6 +15,7 @@ from deploy.prepare_foundation_curriculum import (
     load_exclusions, reasoning_lesson, reasoning_reference,
 )
 from deploy.prepare_recovery_curriculum import parse_conversation
+from deploy.prepare_chat_curriculum import prepare, read_jsonl
 
 
 class FoundationCurriculumTests(unittest.TestCase):
@@ -146,6 +148,119 @@ class FoundationCurriculumTests(unittest.TestCase):
             elementary = row['category'] == 'reasoning' and row['task'] in {'add', 'subtract', 'multiply', 'divide', 'max', 'min'}
             self.assertEqual(row['selection_priority'], 0 if elementary else 1)
             self.assertEqual(row['family'], 'foundation:' + canonical_key(row['category'], row['task'], row['arguments']))
+            self.assertEqual(row['foundation_skill'], row['category'] + ':' + row['task'])
+
+    def test_default_lesson_content_retains_previous_checksum_apart_from_skill_metadata(self):
+        previous_rows = [{key: value for key, value in row.items() if key != 'foundation_skill'} for row in self.rows]
+        payload = json.dumps(previous_rows, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(payload).hexdigest(),
+                         '28c2c7e77080fd13a448d50acea0016d0a52187903740e351efb2420cd5b69cd')
+
+    def test_optional_code_only_mode_keeps_four_distinct_verified_presentations_per_family(self):
+        rows, report = generate(count=512, seed=20261109, coding_code_only=True)
+        self.assertTrue(report['coding_code_only'])
+        self.assertEqual(report['rows'], self.report['rows'])
+        self.assertEqual(report['distinct_families'], self.report['distinct_families'])
+        self.assertEqual({row['semantic_key'] for row in rows}, {row['semantic_key'] for row in self.rows})
+        self.assertEqual([row for row in rows if row['category'] == 'reasoning'],
+                         [row for row in self.rows if row['category'] == 'reasoning'])
+        families = defaultdict(list)
+        for row in rows:
+            if row['category'] != 'coding':
+                continue
+            families[row['family']].append(row)
+            self.assertEqual(row['requested_format'], 'code_only')
+            self.assertNotIn('```', row['answer'])
+            self.assertTrue(row['answer'].startswith('def '))
+            definition = ast.parse(row['answer']).body[0]
+            self.assertEqual(definition.name, row['code_check']['function'])
+            self.assertIn(row['answer'].splitlines()[0][4:-1], row['prompt'])
+            self.assertIn('只输出Python代码' if row['language'] == 'zh' else 'Return Python code only', row['prompt'])
+            self.assertNotIn('先用一句话说明', row['prompt'])
+            self.assertNotIn('Explain in one sentence', row['prompt'])
+            check = row['code_check']
+            result = restricted_python_check(row['answer'], check['function'], check['cases'])
+            self.assertTrue(result['passed'], result)
+            self.assertFalse(result['generated_code_executed'])
+            base = coding_lesson(row['task'], row['arguments'])
+            self.assertEqual(check['cases'], [{'args': values, 'expected': base['reference'](*values)} for values in base['inputs']])
+        for family_rows in families.values():
+            self.assertEqual(len(family_rows), 4)
+            self.assertEqual(len({row['prompt'] for row in family_rows}), 4)
+            self.assertEqual(len({row['code_check']['function'] for row in family_rows}), 4)
+            self.assertEqual({row['language'] for row in family_rows}, {'en', 'zh'})
+            self.assertEqual({row['response_style'] for row in family_rows}, {'direct', 'direct_alternate'})
+        with self.assertRaisesRegex(ValueError, 'must be boolean'):
+            generate(count=512, coding_code_only=1)
+
+    def test_more_interface_names_keep_exact_counts_and_single_semantic_families(self):
+        for count, variants in ((256, 4), (512, 8)):
+            rows, report = generate(count=count, seed=20261109, coding_code_only=True, coding_name_variants=variants)
+            self.assertEqual(len(rows), count)
+            self.assertEqual(Counter(row['category'] for row in rows), {'reasoning': count * 5 // 8, 'coding': count * 3 // 8})
+            self.assertEqual(report['coding_presentations_per_family'], variants * 2)
+            self.assertEqual(report['coding_name_variants_per_language'], variants)
+            self.assertEqual(report['distinct_families_by_category']['coding'], count * 3 // 8 // (variants * 2))
+            self.assertEqual(report['distinct_families'], len({row['family'] for row in rows}))
+            families = defaultdict(list)
+            for row in rows:
+                families[row['family']].append(row)
+                if row['category'] != 'coding':
+                    continue
+                self.assertEqual(row['requested_format'], 'code_only')
+                definition = ast.parse(row['answer']).body[0]
+                self.assertEqual(definition.name, row['code_check']['function'])
+                self.assertIn(row['answer'].splitlines()[0][4:-1], row['prompt'])
+                base_definition = ast.parse(coding_lesson(row['task'], row['arguments'])['code']).body[0]
+                definition.name = base_definition.name
+                self.assertEqual(ast.dump(definition), ast.dump(base_definition))
+                check = row['code_check']
+                result = restricted_python_check(row['answer'], check['function'], check['cases'])
+                self.assertTrue(result['passed'], result)
+                self.assertFalse(result['generated_code_executed'])
+            for items in families.values():
+                expected = variants * 2 if items[0]['category'] == 'coding' else 4
+                self.assertEqual(len(items), expected)
+                self.assertEqual(len({row['semantic_key'] for row in items}), 1)
+                if items[0]['category'] != 'coding':
+                    continue
+                self.assertEqual(len({row['prompt'] for row in items}), expected)
+                self.assertEqual(len({(row['language'], row['response_style']) for row in items}), expected)
+                for language in ('en', 'zh'):
+                    names = {row['code_check']['function'] for row in items if row['language'] == language}
+                    self.assertEqual(len(names), variants)
+                self.assertEqual(len({json.dumps(row['code_check']['cases'], sort_keys=True) for row in items}), 1)
+            repeated, repeated_report = generate(count=count, seed=20261109, coding_code_only=True, coding_name_variants=variants)
+            self.assertEqual(rows, repeated)
+            self.assertEqual(report, repeated_report)
+        explicit_default, _ = generate(count=512, seed=20261109, coding_name_variants=2)
+        self.assertEqual(explicit_default, self.rows)
+        for variants in (0, 1, 3, 16, True):
+            with self.subTest(variants=variants), self.assertRaisesRegex(ValueError, 'must be 2, 4 or 8'):
+                generate(count=128, coding_code_only=True, coding_name_variants=variants)
+        with self.assertRaisesRegex(ValueError, 'requires coding_code_only'):
+            generate(count=128, coding_name_variants=8)
+        with self.assertRaisesRegex(ValueError, 'divisible.*partial families'):
+            generate(count=160, coding_code_only=True, coding_name_variants=8)
+
+    def test_all_sixteen_interface_presentations_remain_in_one_actual_builder_partition(self):
+        rows, _ = generate(count=512, seed=20261109, coding_code_only=True, coding_name_variants=8)
+        cache = Path(__file__).resolve().parents[1] / '.cache'
+        cache.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as directory:
+            root = Path(directory)
+            candidates = root / 'candidates.jsonl'
+            candidates.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in rows), encoding='utf-8')
+            report = prepare(candidates, root / 'selected', count=128, ratios=(0, 5, 3), seed=92,
+                             validation_fraction=.2, heldout_fraction=.25, heldout_count=32,
+                             min_multi_turn_fraction=0, balance_key='foundation_skill', length_fn=lambda text: 16)
+            selected = read_jsonl(root / 'selected/train.jsonl') + read_jsonl(root / 'selected/heldout.jsonl')
+            self.assertEqual(report['group_overlap'], 0)
+            partitions = defaultdict(set)
+            for row in selected:
+                partitions[row['family']].add(row['split'])
+            self.assertTrue(all(len(splits) == 1 for splits in partitions.values()))
+            self.assertEqual({row['split'] for row in selected}, {'train', 'validation', 'heldout'})
 
     def test_typed_and_legacy_exclusions_remove_whole_parameter_families(self):
         cache = Path(__file__).resolve().parents[1] / '.cache'
@@ -201,6 +316,7 @@ class FoundationCurriculumTests(unittest.TestCase):
             self.assertEqual(replay[0]['text'], row['text'])
             self.assertTrue(replay[0]['reference_verified'])
             self.assertEqual(replay[0]['selection_priority'], 1)
+            self.assertEqual(replay[0]['foundation_skill'], 'replay:uppercase')
             self.assertEqual(proof['rows'], 1)
             with self.assertRaisesRegex(ValueError, 'Insufficient'):
                 collect_reference_replay(path, 2)

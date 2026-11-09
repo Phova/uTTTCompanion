@@ -26,10 +26,12 @@ from typing import Any, Dict, Optional
 
 import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from engine.checkpoint_manager import DualTrackCheckpointManager
 from engine.personalizer import uTTTPersonalizer
+from engine.prompting import MAX_HISTORY_MESSAGES, validate_chat_history
+from deploy.serve_guard import assert_serving_available
 
 
 # ==============================================================================
@@ -43,6 +45,12 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     seed: Optional[int] = Field(default=None, strict=True, ge=0, lt=2 ** 63)
+    history: list[Dict[str, str]] = Field(default_factory=list, max_length=MAX_HISTORY_MESSAGES)
+
+    @field_validator("history", mode="before")
+    @classmethod
+    def validate_history(cls, value):
+        return validate_chat_history(value)
 
 
 class CommandRequest(BaseModel):
@@ -60,6 +68,7 @@ _personalizer: Optional[uTTTPersonalizer] = None
 def get_personalizer() -> uTTTPersonalizer:
     global _personalizer
     if _personalizer is None:
+        assert_serving_available()
         config_path = os.environ.get("UTTT_CONFIG", "configs/5090_config.yaml")
         base_ckpt = os.environ.get("UTTT_BASE_CKPT", "checkpoints/base_uttt.pt")
         personas_dir = os.environ.get("UTTT_PERSONAS_DIR", "personas")
@@ -121,7 +130,7 @@ def get_personalizer() -> uTTTPersonalizer:
             config_path=config_path,
             max_gpu_users=max_gpu_users,
             max_cpu_users=max_cpu_users,
-            auto_create_base_if_missing=True,
+            auto_create_base_if_missing=False,
             lightweight_fallback=lightweight,
         )
         _personalizer = uTTTPersonalizer(
@@ -251,6 +260,7 @@ async def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
             temperature=req.temperature,
             top_p=req.top_p,
             seed=req.seed,
+            history=req.history,
         )
         return result.to_dict()
     except ValueError as exc:

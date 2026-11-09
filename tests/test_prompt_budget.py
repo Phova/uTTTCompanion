@@ -95,6 +95,34 @@ class PromptBudgetTests(unittest.TestCase):
                     self.assertEqual(streamed, text)
                     self.assertEqual(events[-1]["result"]["reply"], text.strip())
 
+    def test_history_influences_read_context_but_is_not_rewritten_by_ttt(self):
+        engine = self.engine()
+        engine.online_updates_enabled = True
+        engine._ttt_stream = None
+        engine.auto_save_every_turn = False
+        engine.config.chunk_size = 4
+        engine.model.test_time_update.return_value = (Mock(), 0.0, [0.0])
+        history = [{"role": "user", "content": "OLD_H"}, {"role": "assistant", "content": "OLD_A"}]
+        engine.interact_and_evolve("alice", "hello", history=history)
+        read_ids = engine.model.stream_generate.call_args.kwargs["input_ids"][0]
+        write_ids = engine.model.test_time_update.call_args.kwargs["interaction_ids"][0]
+        read_text = engine.tokenizer.decode(read_ids, skip_special_tokens=False)
+        write_text = engine.tokenizer.decode(write_ids, skip_special_tokens=False)
+        self.assertIn("OLD_H", read_text)
+        self.assertIn("OLD_A", read_text)
+        self.assertIn("hello", write_text)
+        self.assertIn("ok", write_text)
+        self.assertNotIn("OLD_H", write_text)
+        self.assertNotIn("OLD_A", write_text)
+
+    def test_bad_history_is_rejected_before_persona_load_or_generation(self):
+        engine = self.engine()
+        with self.assertRaises(ValueError):
+            list(engine.stream_interact_and_evolve("alice", "hello",
+                                                  history=[{"role": "assistant", "content": "invalid"}]))
+        engine.ckpt_manager.get_user_state.assert_not_called()
+        engine.model.stream_generate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
